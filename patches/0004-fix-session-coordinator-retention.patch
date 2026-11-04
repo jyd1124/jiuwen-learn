@@ -1,0 +1,171 @@
+fix(runtime/session): bound closed-Session retention in RuntimeSessionCoordinator
+
+Problem (runbook #8, appendix A F4/F5): close_session() only flips the record to
+CLOSED; RuntimeSessionCoordinator._sessions and ._generations are never popped,
+so every Session id ever registered stays in memory for the process lifetime
+(~1.1 MB / 1000 sessions of steady-state growth in scripts_diag s2). The
+execution registry (terminal_capacity=512, ttl=900s) and the work scheduler
+(lane popped on close) were already bounded; only the coordinator leaked.
+
+Fix: when close_session() reaches CLOSED (no timed-out executions left), the
+record is appended to a bounded recently-closed LRU (`closed_session_capacity`,
+default 512, mirroring the registry's terminal history). Beyond the cap the
+oldest CLOSED record is evicted from _sessions together with its _generations
+entry; a record that somehow still owns live executions is never dropped.
+Re-registering an id removes it from the LRU.
+
+Why not pop on close immediately: callers and tests read snapshot_session()
+after close (e.g. test_close_session_cancels_goal_stream expects the CLOSED
+snapshot with the CANCELLED execution history), so recent CLOSED records stay
+inspectable.
+
+_generations semantics: the per-id generation is the fence that rejects stale
+close_session(generation=old), stale scheduler lanes and stale registry handles
+(registry history still keyed by (session_id, generation)) after a re-register.
+Dropping it naively would restart an evicted id at generation 1 and let stale
+work match the new generation. Instead the coordinator keeps a single
+monotonic `_generation_floor` = max generation ever evicted, and a brand-new or
+evicted id starts at floor + 1. So every generation handed out for an id is
+strictly greater than any it had before (O(1) memory, no tombstone map).
+Ids that never had evictions in between keep exact per-id numbering
+(1, 2, ...), so existing tests are unchanged. Visible behaviour change only
+for ids evicted from history: snapshot_session() returns None (callers already
+treat None like CLOSED) and close_session(generation=old) returns existed=False
+(stop_session_for_archive already treats that as "already closed/replaced").
+
+diff --git a/jiuwenswarm/jiuwenswarm/runtime/session/coordinator.py b/jiuwenswarm/jiuwenswarm/runtime/session/coordinator.py
+index 35bd77a..3938738 100644
+--- a/jiuwenswarm/jiuwenswarm/runtime/session/coordinator.py
++++ b/jiuwenswarm/jiuwenswarm/runtime/session/coordinator.py
+@@ -7,6 +7,7 @@ from __future__ import annotations
+ import asyncio
+ import inspect
+ import uuid
++from collections import OrderedDict
+ from contextlib import aclosing
+ from dataclasses import dataclass, field
+ from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
+@@ -80,13 +81,25 @@ class RuntimeSessionCoordinator:
+         scheduler: SessionWorkScheduler | None = None,
+         cancel_timeout: float = 5.0,
+         stream_buffer_size: int = 64,
++        closed_session_capacity: int = 512,
+     ) -> None:
++        if closed_session_capacity < 0:
++            raise ValueError("closed_session_capacity must be non-negative")
+         self._registry = registry or SessionExecutionRegistry()
+         self._scheduler = scheduler or SessionWorkScheduler()
+         self._cancel_timeout = cancel_timeout
+         self._stream_buffer_size = max(1, stream_buffer_size)
+         self._sessions: dict[str, _SessionRecord] = {}
+         self._generations: dict[str, int] = {}
++        # CLOSED records stay inspectable (snapshot_session) as bounded,
++        # recently-closed history, like the registry's terminal history. Once
++        # evicted, both the record and its per-Session generation counter are
++        # dropped; ``_generation_floor`` keeps the highest generation ever
++        # evicted so a re-registered Session id can never reuse a generation
++        # number that stale handles, lanes or callers may still hold.
++        self._closed_session_capacity = closed_session_capacity
++        self._closed_sessions: OrderedDict[str, None] = OrderedDict()
++        self._generation_floor = 0
+         self._accepting = True
+         self._lock = asyncio.Lock()
+ 
+@@ -104,7 +117,10 @@ class RuntimeSessionCoordinator:
+                 raise RuntimeError("session coordinator is closed")
+             current = self._sessions.get(normalized)
+             if current is None or current.state is RuntimeSessionState.CLOSED:
+-                generation = self._generations.get(normalized, 0) + 1
++                self._closed_sessions.pop(normalized, None)
++                generation = (
++                    self._generations.get(normalized, self._generation_floor) + 1
++                )
+                 self._generations[normalized] = generation
+                 current = _SessionRecord(
+                     session_id=normalized,
+@@ -925,6 +941,7 @@ class RuntimeSessionCoordinator:
+             )
+         if self._sessions.get(session_id) is record:
+             record.state = RuntimeSessionState.CLOSED
++            self._retire_closed_session(record)
+         return CloseSessionResult(session_id, target_generation, True)
+ 
+     async def quiesce_session(
+@@ -1032,6 +1049,31 @@ class RuntimeSessionCoordinator:
+         if errors:
+             raise errors[0]
+ 
++    def _retire_closed_session(self, record: _SessionRecord) -> None:
++        """Move a CLOSED record into bounded history and evict the oldest."""
++        self._closed_sessions.pop(record.session_id, None)
++        self._closed_sessions[record.session_id] = None
++        # Bounded scan: a record that still owns live executions (defensive;
++        # close_session only marks CLOSED once none are left) is skipped and
++        # retried on a later close instead of being dropped.
++        attempts = len(self._closed_sessions)
++        while len(self._closed_sessions) > self._closed_session_capacity and attempts > 0:
++            attempts -= 1
++            session_id, _ = self._closed_sessions.popitem(last=False)
++            current = self._sessions.get(session_id)
++            if current is None or current.state is not RuntimeSessionState.CLOSED:
++                continue
++            if self._registry.select(
++                session_id=session_id,
++                generation=current.generation,
++                active_only=True,
++            ):
++                self._closed_sessions[session_id] = None
++                continue
++            self._sessions.pop(session_id, None)
++            evicted = self._generations.pop(session_id, current.generation)
++            self._generation_floor = max(self._generation_floor, evicted)
++
+     def _require_open_session(self, session_id: str) -> _SessionRecord:
+         from jiuwenswarm.server.runtime.session.lifecycle import guard
+         guard(session_id)
+diff --git a/jiuwenswarm/tests/unit_tests/runtime/test_runtime_session_coordinator.py b/jiuwenswarm/tests/unit_tests/runtime/test_runtime_session_coordinator.py
+index db07485..20b692b 100644
+--- a/jiuwenswarm/tests/unit_tests/runtime/test_runtime_session_coordinator.py
++++ b/jiuwenswarm/tests/unit_tests/runtime/test_runtime_session_coordinator.py
+@@ -1412,3 +1412,41 @@ async def test_quiesced_admission_rejects_every_new_team_input() -> None:
+     with pytest.raises(RuntimeError, match="quiescing"):
+         await admission.begin_session_message("session-a", "message-run")
+     assert await admission.try_begin_heartbeat("session-a", "heartbeat-run") is False
++
++
++@pytest.mark.asyncio
++async def test_closed_sessions_are_bounded_and_generations_stay_monotonic() -> None:
++    coordinator = RuntimeSessionCoordinator(closed_session_capacity=2)
++    for index in range(5):
++        session_id = f"bounded-{index}"
++        await _register(coordinator, session_id)
++        assert await coordinator.run_unary(
++            session_id, "r", SessionWorkKind.CHAT_UNARY, lambda: asyncio.sleep(0, "ok")
++        ) == "ok"
++        assert not (await coordinator.close_session(session_id)).timed_out
++
++    # Only the most recently closed Sessions stay inspectable.
++    assert len(coordinator._sessions) == 2
++    assert len(coordinator._generations) == 2
++    assert coordinator.snapshot_session("bounded-0") is None
++    recent = coordinator.snapshot_session("bounded-4")
++    assert recent is not None and recent.state is RuntimeSessionState.CLOSED
++
++    # An evicted id never reuses an old generation, and a stale close is rejected.
++    reopened = await coordinator.register_session(
++        "bounded-0", "process", SessionPersistencePolicy.PERSISTENT
++    )
++    assert reopened.generation > 1
++    stale = await coordinator.close_session("bounded-0", generation=1)
++    assert stale.existed is False
++    current = coordinator.snapshot_session("bounded-0")
++    assert current is not None
++    assert current.generation == reopened.generation
++    assert current.state is RuntimeSessionState.READY
++
++    # Re-registering a still-retained closed id keeps per-id numbering.
++    again = await coordinator.register_session(
++        "bounded-4", "process", SessionPersistencePolicy.PERSISTENT
++    )
++    assert again.generation == recent.generation + 1
++    await coordinator.close()
