@@ -1,0 +1,143 @@
+diff --git a/agent-core/openjiuwen/agent_teams/agent/coordination/handlers/message.py b/agent-core/openjiuwen/agent_teams/agent/coordination/handlers/message.py
+index 861bdc5..d5b6314 100644
+--- a/agent-core/openjiuwen/agent_teams/agent/coordination/handlers/message.py
++++ b/agent-core/openjiuwen/agent_teams/agent/coordination/handlers/message.py
+@@ -259,13 +259,26 @@ class MessageHandler(BaseCoordinationHandler):
+                         # all other messages are deferred until the interrupt clears.
+                         approval_data = self._try_parse_approval_payload(msg)
+                         if approval_data is not None:
++                            resume_input = self._approval_to_interactive_input(approval_data)
++                            if resume_input is None:
++                                # Malformed (no tool_call_id): it can never answer an
++                                # interrupt, so consume it instead of re-reading it forever.
++                                team_logger.warning(
++                                    "[{}] discarding approval message {} without tool_call_id",
++                                    member_name,
++                                    msg.message_id,
++                                )
++                                await self._infra.message_manager.mark_message_read(msg.message_id, member_name)
++                                continue
+                             team_logger.info(
+                                 "[{}] admitting approval message {} to resume interrupt",
+                                 member_name,
+                                 msg.message_id,
+                             )
++                            # Resume first: if it raises, the row stays unread and the
++                            # next mailbox poll retries the fallback delivery.
++                            await self._round.resume_interrupt(resume_input)
+                             await self._infra.message_manager.mark_message_read(msg.message_id, member_name)
+-                            await self._round.resume_interrupt(approval_data)
+                             continue
+                         team_logger.info(
+                             "[{}] deferring mailbox message {} until pending interrupt is resolved",
+@@ -728,6 +741,31 @@ class MessageHandler(BaseCoordinationHandler):
+             note_text=note_text,
+         )
+ 
++    @staticmethod
++    def _approval_to_interactive_input(data: dict) -> Any:
++        """Build the ``InteractiveInput`` a tool-approval payload resumes with.
++
++        Mirrors ``AgentLifecycleHandler.on_tool_approval_result`` so the mailbox
++        fallback and the pub-sub event resume the interrupt identically (the
++        harness only accepts an ``InteractiveInput``). Returns ``None`` when the
++        payload carries no ``tool_call_id``.
++        """
++        tool_call_id = data.get("tool_call_id")
++        if not tool_call_id or not isinstance(tool_call_id, str):
++            return None
++        from openjiuwen.core.session import InteractiveInput
++
++        interactive_input = InteractiveInput()
++        interactive_input.update(
++            tool_call_id,
++            {
++                "approved": bool(data.get("approved", False)),
++                "feedback": data.get("feedback") or "",
++                "auto_confirm": bool(data.get("auto_confirm", False)),
++            },
++        )
++        return interactive_input
++
+     @staticmethod
+     def _try_parse_approval_payload(msg: Any) -> dict | None:
+         """Try to parse a tool-approval result from a message.
+diff --git a/agent-core/tests/unit_tests/agent_teams/test_message_handler_approval_fallback.py b/agent-core/tests/unit_tests/agent_teams/test_message_handler_approval_fallback.py
+new file mode 100644
+index 0000000..6722b64
+--- /dev/null
++++ b/agent-core/tests/unit_tests/agent_teams/test_message_handler_approval_fallback.py
+@@ -0,0 +1,73 @@
++# coding: utf-8
++# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
++"""Mailbox fallback for tool-approval results resumes with an InteractiveInput."""
++
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from openjiuwen.agent_teams.agent.coordination.handlers.message import MessageHandler
++from openjiuwen.agent_teams.schema.team import TeamRole
++from openjiuwen.core.session import InteractiveInput
++
++
++def _handler(content: str):
++    msg = SimpleNamespace(message_id="m1", protocol="json", content=content, timestamp=1,
++                          from_member_name="leader-1", broadcast=False)
++    host = MagicMock()
++    host.has_pending_interrupt.return_value = True
++    host.resume_interrupt = AsyncMock()
++    host.deliver_input = AsyncMock()
++    mm = MagicMock()
++    mm.get_messages = AsyncMock(side_effect=[[msg], []])
++    mm.get_broadcast_messages = AsyncMock(return_value=[])
++    mm.mark_message_read = AsyncMock(return_value=True)
++    mm.mark_messages_read = AsyncMock(return_value=0)
++    infra = SimpleNamespace(message_manager=mm, team_backend=None)
++    blueprint = SimpleNamespace(member_name="dev-1", role=TeamRole.TEAMMATE)
++    return MessageHandler(host, blueprint, infra, MagicMock()), host, mm
++
++
++@pytest.mark.asyncio
++@pytest.mark.level0
++async def test_approval_message_resumes_with_interactive_input():
++    payload = json.dumps({"type": "tool_approval_result", "tool_call_id": "call-1",
++                          "approved": True, "feedback": "ok", "auto_confirm": True})
++    handler, host, mm = _handler(payload)
++
++    await handler._process_unread_messages("dev-1")
++
++    host.resume_interrupt.assert_awaited_once()
++    resume_input = host.resume_interrupt.await_args.args[0]
++    assert isinstance(resume_input, InteractiveInput)
++    assert resume_input.user_inputs["call-1"] == {"approved": True, "feedback": "ok", "auto_confirm": True}
++    mm.mark_message_read.assert_awaited_once_with("m1", "dev-1")
++    host.deliver_input.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.level0
++async def test_approval_message_stays_unread_when_resume_raises():
++    payload = json.dumps({"type": "tool_approval_result", "tool_call_id": "call-1", "approved": True})
++    handler, host, mm = _handler(payload)
++    host.resume_interrupt.side_effect = RuntimeError("boom")
++
++    with pytest.raises(RuntimeError):
++        await handler._process_unread_messages("dev-1")
++
++    mm.mark_message_read.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.level0
++async def test_approval_message_without_tool_call_id_is_consumed_not_resumed():
++    handler, host, mm = _handler(json.dumps({"type": "tool_approval_result", "approved": True}))
++
++    await handler._process_unread_messages("dev-1")
++
++    host.resume_interrupt.assert_not_awaited()
++    mm.mark_message_read.assert_awaited_once_with("m1", "dev-1")

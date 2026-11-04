@@ -1,0 +1,165 @@
+diff --git a/agent-core/openjiuwen/core/runner/callback/framework.py b/agent-core/openjiuwen/core/runner/callback/framework.py
+index f3a1a59..2a3994e 100644
+--- a/agent-core/openjiuwen/core/runner/callback/framework.py
++++ b/agent-core/openjiuwen/core/runner/callback/framework.py
+@@ -448,6 +448,7 @@ class AsyncCallbackFramework:
+             retry_delay: float = 0.0,
+             timeout: Optional[float] = None,
+             callback_type: str = "",
++            fail_close: bool = False,
+     ) -> 'CallbackInfo':
+         """Synchronous registration method for decorator use.
+ 
+@@ -467,6 +468,7 @@ class AsyncCallbackFramework:
+             retry_delay=retry_delay,
+             timeout=timeout,
+             callback_type=callback_type,
++            fail_close=fail_close,
+         )
+ 
+         self._callbacks[event].append(callback_info)
+@@ -882,6 +884,7 @@ class AsyncCallbackFramework:
+             retry_delay: float = 0.0,
+             timeout: Optional[float] = None,
+             callback_type: str = "",
++            fail_close: bool = False,
+     ) -> CallbackInfo:
+         """Register a callback for an event.
+ 
+@@ -897,8 +900,11 @@ class AsyncCallbackFramework:
+             error_handler: Function to call on error
+             max_retries: Maximum retry attempts
+             retry_delay: Delay between retries in seconds
+-            timeout: Execution timeout in seconds
++            timeout: Execution timeout in seconds (honored by trigger() and
++                trigger_parallel())
+             callback_type:
++            fail_close: On timeout in trigger(), raise instead of skipping
++                the callback and continuing the chain
+         """
+         async with self._locks["registration"]:
+             return self.register_sync(
+@@ -915,6 +921,7 @@ class AsyncCallbackFramework:
+                 retry_delay=retry_delay,
+                 timeout=timeout,
+                 callback_type=callback_type,
++                fail_close=fail_close,
+             )
+ 
+     def unregister_sync(self, event: str, callback: Callable) -> None:
+@@ -1124,6 +1131,28 @@ class AsyncCallbackFramework:
+                 if inspect.isasyncgen(callback_result):
+                     # Don't await async generators, return them directly
+                     result = callback_result
++                elif callback_info.timeout and inspect.isawaitable(callback_result):
++                    # Honor the registered timeout here too, not only in
++                    # trigger_parallel: one hung hook must not stall the chain.
++                    try:
++                        result = await asyncio.wait_for(callback_result, callback_info.timeout)
++                    except asyncio.TimeoutError as timeout_exc:
++                        timed_out = TimeoutError(
++                            f"callback {getattr(callback, '__qualname__', callback.__name__)} "
++                            f"timed out after {callback_info.timeout}s on event '{event}'"
++                        )
++                        runner_logger.warning(
++                            "[RailChain] callback timeout: event=%s callback=%s timeout_s=%s policy=%s",
++                            event,
++                            getattr(callback, "__qualname__", None) or callback.__name__,
++                            callback_info.timeout,
++                            "fail_close" if callback_info.fail_close else "fail_open",
++                        )
++                        if callback_info.fail_close:
++                            raise AbortError(str(timed_out), cause=timed_out) from timeout_exc
++                        # Fail-open: handled like any other callback failure
++                        # (metrics, breaker, ERROR hooks), then the chain goes on.
++                        raise timed_out from timeout_exc
+                 else:
+                     # It's a coroutine, await it
+                     result = await callback_result
+diff --git a/agent-core/openjiuwen/core/runner/callback/models.py b/agent-core/openjiuwen/core/runner/callback/models.py
+index 2c23cea..bc53979 100644
+--- a/agent-core/openjiuwen/core/runner/callback/models.py
++++ b/agent-core/openjiuwen/core/runner/callback/models.py
+@@ -213,6 +213,9 @@ class CallbackInfo:
+         created_at: Timestamp when callback was registered
+         wrapper: Optional wrapper function returned by decorator (for unregistering)
+         callback_type: Semantic type marker, e.g. "transform"
++        fail_close: When ``timeout`` expires in a serial ``trigger()``, abort
++            the event (raise ``TimeoutError``) instead of logging and
++            continuing with the next callback (fail-open, the default)
+     """
+     callback: Callable[..., Awaitable[Any]]
+     priority: int
+@@ -226,6 +229,7 @@ class CallbackInfo:
+     created_at: float = field(default_factory=time.time)
+     wrapper: Optional[Callable[..., Awaitable[Any]]] = None
+     callback_type: str = ""
++    fail_close: bool = False
+ 
+     def __hash__(self) -> int:
+         """Hash based on callback identity.
+diff --git a/agent-core/tests/unit_tests/core/runner/callback/test_framework_serial_timeout.py b/agent-core/tests/unit_tests/core/runner/callback/test_framework_serial_timeout.py
+new file mode 100644
+index 0000000..78c3a24
+--- /dev/null
++++ b/agent-core/tests/unit_tests/core/runner/callback/test_framework_serial_timeout.py
+@@ -0,0 +1,59 @@
++# -*- coding: UTF-8 -*-
++# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
++
++"""Serial trigger() honors the timeout a callback was registered with."""
++
++import asyncio
++import time
++
++import pytest
++
++
++@pytest.mark.asyncio
++async def test_serial_trigger_times_out_hung_callback_and_continues(framework):
++    ran = []
++
++    async def hung(*args, **kwargs):
++        await asyncio.sleep(1e6)
++
++    async def after(*args, **kwargs):
++        ran.append(True)
++        return "after"
++
++    await framework.register("evt", hung, priority=10, timeout=0.1)
++    await framework.register("evt", after, priority=0)
++
++    start = time.perf_counter()
++    results = await asyncio.wait_for(framework.trigger("evt"), timeout=5)
++
++    assert time.perf_counter() - start < 2
++    assert results == ["after"]
++    assert ran == [True]
++
++
++@pytest.mark.asyncio
++async def test_serial_trigger_fail_close_timeout_raises_and_stops_chain(framework):
++    ran = []
++
++    async def hung(*args, **kwargs):
++        await asyncio.sleep(1e6)
++
++    async def after(*args, **kwargs):
++        ran.append(True)
++
++    await framework.register("evt", hung, priority=10, timeout=0.1, fail_close=True)
++    await framework.register("evt", after, priority=0)
++
++    with pytest.raises(TimeoutError):
++        await asyncio.wait_for(framework.trigger("evt"), timeout=5)
++    assert ran == []
++
++
++@pytest.mark.asyncio
++async def test_serial_trigger_fast_callback_with_timeout_returns_result(framework):
++    async def fast(*args, **kwargs):
++        return 42
++
++    await framework.register("evt", fast, timeout=1.0)
++
++    assert await framework.trigger("evt") == [42]
