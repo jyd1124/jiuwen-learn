@@ -1,0 +1,232 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Reliability rail: collects member-internal lifecycle signals.
+
+One rail per member. Each lifecycle hook converts its callback context into a
+``Signal``, feeds it to the member's ``ReliabilityMonitor`` (which detects and
+reports anomalies), and applies reversible local self-steering for any
+returned anomaly via the optional ``LocalAutoRemediator``. The rail never
+alters tool args, model calls, or the agent loop — the only effect it can have
+is a non-destructive steering nudge — so it carries a low priority and runs
+after the behavior-shaping rails.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Awaitable, Callable
+
+from openjiuwen.agent_teams.reliability.anomaly import Anomaly
+from openjiuwen.agent_teams.reliability.monitor import ReliabilityMonitor
+from openjiuwen.agent_teams.reliability.remediation.local import LocalAutoRemediator
+from openjiuwen.agent_teams.reliability.reporter import LocalAnomalyReporter
+from openjiuwen.agent_teams.reliability.signals import Signal, SignalKind
+from openjiuwen.core.common.logging import team_logger
+from openjiuwen.core.single_agent.rail.base import AgentCallbackContext
+from openjiuwen.harness.rails.base import DeepAgentRail
+
+
+def _error_text(exc: Exception | None) -> str:
+    """Render an exception into a stable short error string."""
+    return str(exc) if exc is not None else "error"
+
+
+_MODEL_FAILURE_FIELDS = ("route_case", "reason", "pinned_model", "failures", "usable", "user_action_required")
+
+
+def _model_failure(exc: BaseException | None) -> dict[str, Any] | None:
+    """Extract the routing verdict a model-group client attached to ``exc``.
+
+    Walks the cause chain and returns the first ``details`` carrying
+    ``route_case``; None for errors from other model clients.
+    """
+    seen: set[int] = set()
+    current = exc
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        details = getattr(current, "details", None)
+        if isinstance(details, dict) and details.get("route_case"):
+            return {key: details.get(key) for key in _MODEL_FAILURE_FIELDS}
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _args_as_dict(tool_args: Any) -> dict[str, Any] | None:
+    """Normalize dict or JSON-object tool args for stable hashing."""
+    if isinstance(tool_args, dict):
+        return tool_args
+    if isinstance(tool_args, str):
+        try:
+            parsed = json.loads(tool_args)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _measure_response(response: Any) -> tuple[int | None, int | None]:
+    """Best-effort extraction of output text / thinking lengths.
+
+    Returns ``(text_len, thinking_len)``, each None when the response does not
+    carry that field as a string. Tolerant of the various response shapes the
+    underlying LLM layer may produce.
+    """
+    if response is None:
+        return None, None
+    content = getattr(response, "content", None)
+    text_len = len(content) if isinstance(content, str) else None
+    reasoning = getattr(response, "reasoning_content", None) or getattr(response, "thinking", None)
+    thinking_len = len(reasoning) if isinstance(reasoning, str) else None
+    return text_len, thinking_len
+
+
+class ReliabilityRail(DeepAgentRail):
+    """Capture member-internal signals and apply reversible local steering."""
+
+    priority = 5
+
+    def __init__(
+        self,
+        *,
+        monitor: ReliabilityMonitor,
+        member_name: str,
+        auto_remediator: LocalAutoRemediator | None = None,
+        local_reporter: LocalAnomalyReporter | None = None,
+    ) -> None:
+        super().__init__()
+        self._monitor = monitor
+        self._member = member_name
+        self._auto = auto_remediator
+        self._local_reporter = local_reporter
+
+    def bind_local_sink(self, sink: Callable[[Anomaly], Awaitable[None]]) -> None:
+        """Bind the leader's in-process anomaly sink (no-op for non-leader rails).
+
+        Leader self-monitoring routes anomalies straight to the in-process
+        handler instead of publishing an event the leader's own messager
+        self-filter would drop. Called once after the dispatcher is built (see
+        ``TeamAgent._register_reliability_local_sink``).
+        """
+        if self._local_reporter is not None:
+            self._local_reporter.bind(sink)
+
+    def bind_route_notice_source(self, source: Callable[[], list[str]]) -> None:
+        """Bind the leader's pending route-notice drain (no-op for non-leader rails).
+
+        The leader's own route notices wait for its next admitted input instead
+        of steering one in: a call that already answered on the backup model
+        must not have its answer replaced by a notice round. The binding lives
+        on the shared reporter so rail rebuilds keep it.
+        """
+        if self._local_reporter is not None:
+            self._local_reporter.bind_route_notice_source(source)
+
+    async def on_user_message(self, ctx: AgentCallbackContext) -> None:
+        """Prepend the leader's own pending route notices to this input."""
+        if self._local_reporter is None:
+            return
+        parts = getattr(getattr(ctx, "inputs", None), "parts", None)
+        if not isinstance(parts, list) or not parts:
+            return
+        notices = self._local_reporter.take_route_notices()
+        if not notices:
+            return
+        try:
+            parts[0:0] = notices
+        except Exception:  # noqa: BLE001 - delivery must never break the input
+            # The notices are already taken, so this log line is their only
+            # trace; the next notice (if any) rides the input after this one.
+            team_logger.warning("route notices not delivered: {}", notices, exc_info=True)
+
+    async def _emit(self, signal: Signal, ctx: AgentCallbackContext) -> None:
+        """Feed the signal, then steer locally for any returned anomaly."""
+        anomalies = await self._monitor.feed(signal)
+        if self._auto is None:
+            return
+        for anomaly in anomalies:
+            message = self._auto.steer_message(anomaly)
+            if message:
+                ctx.push_steering(message)
+
+    async def before_tool_call(self, ctx: AgentCallbackContext) -> None:
+        """Capture the tool name + args before a tool runs."""
+        inputs = ctx.inputs
+        await self._emit(
+            Signal(
+                kind=SignalKind.BEFORE_TOOL_CALL,
+                member_name=self._member,
+                tool_name=getattr(inputs, "tool_name", "") or "",
+                tool_args=_args_as_dict(getattr(inputs, "tool_args", None)),
+            ),
+            ctx,
+        )
+
+    async def after_tool_call(self, ctx: AgentCallbackContext) -> None:
+        """Mark a successful tool completion."""
+        if ctx.exception is not None:
+            # after_tool_call also runs after a failure (reported by
+            # on_tool_exception) and for a paused call (no result yet); neither
+            # is a success, and a success signal would reset the error streak.
+            return
+        inputs = ctx.inputs
+        await self._emit(
+            Signal(
+                kind=SignalKind.AFTER_TOOL_CALL,
+                member_name=self._member,
+                tool_name=getattr(inputs, "tool_name", "") or "",
+                tool_result=getattr(inputs, "tool_result", None),
+            ),
+            ctx,
+        )
+
+    async def on_tool_exception(self, ctx: AgentCallbackContext) -> None:
+        """Capture a tool failure."""
+        inputs = ctx.inputs
+        await self._emit(
+            Signal(
+                kind=SignalKind.TOOL_EXCEPTION,
+                member_name=self._member,
+                tool_name=getattr(inputs, "tool_name", "") or "",
+                error=_error_text(ctx.exception),
+            ),
+            ctx,
+        )
+
+    async def on_model_exception(self, ctx: AgentCallbackContext) -> None:
+        """Capture a model-call failure."""
+        await self._emit(
+            Signal(
+                kind=SignalKind.MODEL_EXCEPTION,
+                member_name=self._member,
+                error=_error_text(ctx.exception),
+                model_failure=_model_failure(ctx.exception),
+            ),
+            ctx,
+        )
+
+    async def before_model_call(self, ctx: AgentCallbackContext) -> None:
+        """Capture the current context message count (compaction hint)."""
+        messages = getattr(ctx.inputs, "messages", None)
+        count = len(messages) if isinstance(messages, list) else None
+        await self._emit(
+            Signal(
+                kind=SignalKind.BEFORE_MODEL_CALL,
+                member_name=self._member,
+                message_count=count,
+            ),
+            ctx,
+        )
+
+    async def after_model_call(self, ctx: AgentCallbackContext) -> None:
+        """Capture output text / thinking lengths from the response."""
+        text_len, thinking_len = _measure_response(getattr(ctx.inputs, "response", None))
+        await self._emit(
+            Signal(
+                kind=SignalKind.AFTER_MODEL_CALL,
+                member_name=self._member,
+                text_len=text_len,
+                thinking_len=thinking_len,
+            ),
+            ctx,
+        )

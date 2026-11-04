@@ -1,0 +1,167 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
+
+from typing import Union, List, Optional, Any, Dict
+from pydantic import BaseModel, Field, model_validator
+
+from openjiuwen.core.foundation.llm.schema.tool_call import ToolCall
+
+
+OPENJIUWEN_MESSAGE_PROVENANCE_METADATA = "_openjiuwen_message_provenance"
+OPENJIUWEN_MESSAGE_ORIGIN_METADATA = "_openjiuwen_message_origin"
+OPENJIUWEN_MESSAGE_SOURCE_KIND_METADATA = "_openjiuwen_message_source_kind"
+OPENJIUWEN_MESSAGE_ORIGIN_EXTERNAL_USER = "external_user"
+OPENJIUWEN_MESSAGE_ORIGIN_HARNESS_INTERNAL = "harness_internal"
+
+
+class UsageMetadata(BaseModel):
+    code: int = 0
+    err_msg: str = ""
+    prompt: str = ""
+    task_id: str = ""
+    model_name: str = ""
+    #: 本次调用总耗时，单位**秒**（与 `ttft_seconds` 同口径）。同一 `llm_usage` 帧里的
+    #: `inter_token_latency_ms` / `reasoning_duration_ms` 是毫秒，两者不可混用。
+    total_latency: float = 0.
+    first_token_time: str = ""
+    request_start_time: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cache_tokens: int = 0
+    cache_read_tokens: Optional[int] = None
+    cache_miss_tokens: Optional[int] = None
+    cache_write_tokens: Optional[int] = None
+    cache_status: Optional[str] = None
+    cache_source: Optional[str] = None
+    cache_authoritative: bool = False
+    cache_creation_input_tokens: Optional[int] = None
+    reasoning_tokens: int = 0
+    input_cost: float = 0.
+    output_cost: float = 0.
+    total_cost: float = 0.
+    # Stream latency metrics, backfilled by streaming producers (ReAct engine
+    # stamps TTFT / inter-token latency per call); tracer_otel reads these
+    # keys to stamp span attributes (#1833).
+    inter_token_latency_ms: Optional[float] = None
+    reasoning_duration_ms: Optional[float] = None
+    #: 首 chunk 的**相对延迟**（秒）。与 `first_token_time` 是两种东西：后者是「首 token
+    #: 时刻」（与 `request_start_time` 同族的时刻字符串），这里是「等了多久」。分开之后
+    #: OTel 侧与按字段名理解的下游不会对同一字段给出两种解释。
+    ttft_seconds: Optional[float] = None
+
+
+class BaseMessage(BaseModel):
+    role: str
+    content: Union[str, List[Union[str, dict]]] = ""
+    name: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AssistantMessage(BaseMessage):
+    role: str = "assistant"
+    tool_calls: Optional[List[ToolCall]] = None
+    usage_metadata: Optional[UsageMetadata] = None
+    finish_reason: str = "null"
+    parser_content: Optional[Any] = None
+    reasoning_content: Optional[str] = None
+    # Optional token-level fields populated when the provider returns them
+    # (e.g. vLLM with return_token_ids=True / logprobs=True). Used by RL
+    # trajectory collection to skip re-tokenization.
+    prompt_token_ids: Optional[List[int]] = None
+    completion_token_ids: Optional[List[int]] = None
+    logprobs: Optional[Any] = None
+    response_id: Optional[str] = None
+    response_model: Optional[str] = None
+    provider_metadata: Dict[str, Any] = Field(default_factory=dict)
+    provider_content: Optional[Any] = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def convert_openai_tool_calls_format(cls, data: Any) -> Any:
+        """Convert OpenAI API format tool_calls to flat ToolCall format.
+
+        OpenAI API format has nested 'function' object:
+        {"id": "xxx", "type": "function", "function": {"name": "...", "arguments": "..."}}
+
+        ToolCall model expects flat format:
+        {"id": "xxx", "type": "function", "name": "...", "arguments": "..."}
+        """
+        if isinstance(data, dict) and 'tool_calls' in data and data['tool_calls']:
+            converted_tool_calls = []
+            for tc in data['tool_calls']:
+                if isinstance(tc, dict) and 'function' in tc and isinstance(tc['function'], dict):
+                    # OpenAI format - convert to flat format
+                    converted_tc = {
+                        'id': tc.get('id'),
+                        'type': tc.get('type', 'function'),
+                        'name': tc['function'].get('name', ''),
+                        'arguments': tc['function'].get('arguments', ''),
+                        'index': tc.get('index'),
+                        'response_item_id': tc.get('response_item_id'),
+                    }
+                    converted_tool_calls.append(converted_tc)
+                else:
+                    # Already flat format or ToolCall instance
+                    converted_tool_calls.append(tc)
+            data['tool_calls'] = converted_tool_calls
+        return data
+
+    def model_dump(self, **kwargs) -> dict[str, Any]:
+        result = {
+            "role": self.role,
+            "content": self.content,
+        }
+        if self.name is not None:
+            result["name"] = self.name
+        if self.metadata:
+            result["metadata"] = self.metadata
+        if self.tool_calls:
+            tool_calls = []
+            for call in self.tool_calls:
+                tool_calls.append({
+                    "id": call.id,
+                    "type": call.type,
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments
+                    }
+                })
+                if call.response_item_id is not None:
+                    tool_calls[-1]["response_item_id"] = call.response_item_id
+            result["tool_calls"] = tool_calls
+        if self.usage_metadata is not None:
+            result["usage_metadata"] = self.usage_metadata.model_dump(**kwargs)
+        if self.finish_reason is not None:
+            result["finish_reason"] = self.finish_reason
+        if self.parser_content is not None:
+            result["parser_content"] = self.parser_content
+        if self.reasoning_content is not None:
+            result["reasoning_content"] = self.reasoning_content
+        if self.prompt_token_ids is not None:
+            result["prompt_token_ids"] = self.prompt_token_ids
+        if self.completion_token_ids is not None:
+            result["completion_token_ids"] = self.completion_token_ids
+        if self.logprobs is not None:
+            result["logprobs"] = self.logprobs
+        if self.response_id is not None:
+            result["response_id"] = self.response_id
+        if self.response_model is not None:
+            result["response_model"] = self.response_model
+        if self.provider_metadata:
+            result["provider_metadata"] = self.provider_metadata
+        if self.provider_content is not None:
+            result["provider_content"] = self.provider_content
+        return result
+
+
+class UserMessage(BaseMessage):
+    role: str = "user"
+
+class SystemMessage(BaseMessage):
+    role: str = "system"
+
+
+class ToolMessage(BaseMessage):
+    role: str = "tool"
+    tool_call_id: str

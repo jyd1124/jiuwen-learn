@@ -1,0 +1,559 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Factory function that assembles role-filtered tool lists for team agents."""
+
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Callable
+
+from openjiuwen.agent_teams import constants
+from openjiuwen.agent_teams.tools.team import TeamBackend
+from openjiuwen.agent_teams.tools.tool_async import (
+    AsyncTaskCancelTool,
+    AsyncTaskOutputTool,
+    AsyncTasksListTool,
+)
+from openjiuwen.agent_teams.tools.tool_member import (
+    ApprovePlanTool,
+    ApproveToolCallTool,
+    CheckpointTool,
+    ListCheckpointsTool,
+    SetMemberModelTool,
+    ShutdownMemberTool,
+    SpawnBridgeAgentTool,
+    SpawnHumanAgentTool,
+    SpawnPassiveHumanTool,
+    SpawnTeammateTool,
+)
+from openjiuwen.agent_teams.tools.tool_message import (
+    ReportToLeaderTool,
+    ScheduledPeerMessageTool,
+    SendMessageTool,
+)
+from openjiuwen.agent_teams.tools.tool_permissions import (
+    EXPERT_TOOLS,
+    HUMAN_AGENT_TOOLS,
+    LEADER_TOOLS,
+    MEMBER_TOOLS_BY_DISPATCH,
+)
+from openjiuwen.agent_teams.tools.tool_task import (
+    ClaimTaskTool,
+    MemberCompleteTaskTool,
+    MemberSubtaskCreateTool,
+    MemberSubtaskUpdateTool,
+    ScheduledTaskCreateTool,
+    SubmitPlanTool,
+    TaskCreateTool,
+    UpdateTaskTool,
+    VerifyTaskTool,
+    ViewTaskToolV2,
+)
+from openjiuwen.agent_teams.tools.tool_team import BuildTeamTool, CleanTeamTool
+from openjiuwen.core.foundation.tool.base import Tool
+from openjiuwen.harness.tools.base_tool import ToolOutput
+
+if TYPE_CHECKING:
+    from openjiuwen.agent_teams.experts.catalog import ExpertCatalog
+    from openjiuwen.agent_teams.models.allocator import Allocation
+    from openjiuwen.agent_teams.rails.team_context import ExpertBinding
+
+
+# ========== Tool Variants ==========
+#
+# A tool "variant" keeps its ``ToolCard.id`` / ``name`` and swaps schema,
+# description, and behaviour. Variant selection happens here, while
+# ``all_tools`` is being constructed — never inside ``invoke``. Downstream
+# (permission sets, ``exclude_tools``, prompts, MCP) stays unaware.
+#
+# These are closed sets, so they are literal tables rather than a registry:
+# a missing combination raises KeyError instead of silently falling back.
+
+# Keyed by (dispatch_mode, "leader" | "member"). Scheduled members split
+# their own task into subtasks (F_128); the autonomous member cell exists only
+# so every role can be assembled — autonomous members are never granted
+# ``create_task`` by the permission sets.
+_CREATE_TASK_CLASS: dict[tuple[str, str], type] = {
+    ("autonomous", "leader"): TaskCreateTool,
+    ("autonomous", "member"): TaskCreateTool,
+    ("scheduled", "leader"): ScheduledTaskCreateTool,
+    ("scheduled", "member"): MemberSubtaskCreateTool,
+}
+
+# Keyed by (dispatch_mode, "leader" | "member"), like ``_CREATE_TASK_CLASS``:
+# a scheduled member edits, confirms or cancels the subtasks of its own task
+# (F_129). The autonomous member cell exists only for assembly.
+_UPDATE_TASK_CLASS: dict[tuple[str, str], type] = {
+    ("autonomous", "leader"): UpdateTaskTool,
+    ("autonomous", "member"): UpdateTaskTool,
+    ("scheduled", "leader"): UpdateTaskTool,
+    ("scheduled", "member"): MemberSubtaskUpdateTool,
+}
+
+# Keyed by (dispatch_mode, "leader" | "member" | "member_peers"). Under
+# scheduled dispatch the leader still fans out (broadcast / multicast /
+# auto-start), so only the member side collapses to the report-to-leader form
+# — unless the team opened peer messaging (F_126), which gives members back
+# the full reach while keeping the ``"leader"`` role word.
+_SEND_MESSAGE_CLASS: dict[tuple[str, str], type] = {
+    ("autonomous", "leader"): SendMessageTool,
+    ("autonomous", "member"): SendMessageTool,
+    ("scheduled", "leader"): SendMessageTool,
+    ("scheduled", "member"): ReportToLeaderTool,
+    ("scheduled", "member_peers"): ScheduledPeerMessageTool,
+}
+
+
+def _send_message_reach(role: str, dispatch_mode: str, agent_team: TeamBackend) -> str:
+    """Pick the ``send_message`` table column for one member.
+
+    Peer messaging is a scheduled-only gate: autonomous members reach their
+    peers anyway, so the flag never widens that column.
+    """
+    if role == "leader":
+        return "leader"
+    if dispatch_mode == "scheduled" and agent_team.member_messaging_enabled() is True:
+        return "member_peers"
+    return "member"
+
+# ``member_complete_task`` behaves identically in both modes — only the prose
+# changes (a scheduled member has no claim path to contrast against), so the
+# variant is a description key rather than a class.
+_MEMBER_COMPLETE_DESC_KEY: dict[str, str] = {
+    "autonomous": "member_complete_task",
+    "scheduled": "member_complete_task_scheduled",
+}
+
+# ``verify_task`` shares one schema and one invoke; the verdict *policy*
+# (first-verdict-wins vs. vote recorded for the scheduler to settle, F_62)
+# lives in the manager, so the variant is a description key — the prose must
+# match the policy the caller will actually experience.
+_VERIFY_TASK_DESC_KEY: dict[str, str] = {
+    "autonomous": "verify_task",
+    "scheduled": "verify_task_scheduled",
+}
+
+# ``view_task`` reads the same board either way; only the "teammate
+# workflow" prose differs — the autonomous claim loop has no place in a
+# scheduled member's description (no ``claim_task``, no hunting for work).
+_VIEW_TASK_DESC_KEY: dict[str, str] = {
+    "autonomous": "view_task",
+    "scheduled": "view_task_scheduled",
+}
+
+# Construction-time keyword arguments per ``create_task`` variant. The
+# scheduled form can declare a task's owner inline (F_118): that needs the
+# model allocator ``spawn_teammate`` uses and the predefined-roster gate.
+# The autonomous and member-subtask forms take nothing extra; the table keeps
+# the call site branch-free.
+
+
+def _create_task_kwargs(
+    create_task_cls: type,
+    *,
+    team_mode: str,
+    model_config_allocator: Any,
+    expert_resolver: Any = None,
+) -> dict[str, Any]:
+    if create_task_cls is ScheduledTaskCreateTool:
+        return {
+            "inline_member_enabled": constants.INLINE_TASK_MEMBER_ENABLED and team_mode != "predefined",
+            "model_config_allocator": model_config_allocator,
+            "expert_resolver": expert_resolver,
+        }
+    return {}
+
+
+def _expert_resolver(catalog: "ExpertCatalog | None", binding: "ExpertBinding | None", *, language: str) -> Any:
+    """One expert template resolver for spawn_expert and scheduled create_task's inline member."""
+    if catalog is None:
+        return None
+    from openjiuwen.agent_teams.tools.tool_expert import ExpertTemplateResolver
+
+    return ExpertTemplateResolver(
+        catalog=catalog,
+        language=language,
+        bound_group=binding.bound_group if binding is not None else None,
+        persona_workspace=binding.persona_workspace if binding is not None else None,
+        persona_language=binding.persona_language if binding is not None else None,
+    )
+
+
+# ========== Tool Factory ==========
+
+
+def create_team_tools(
+    *,
+    role: str,
+    agent_team: TeamBackend,
+    teammate_mode: str = "build_mode",
+    dispatch_mode: str = "autonomous",
+    lifecycle: str = "temporary",
+    team_mode: str = "default",
+    bootstrap_mode: str = "leader",
+    model_config_allocator: Callable[[str | None], "Allocation | None"] | None = None,
+    exclude_tools: set[str] | None = None,
+    lang: str = "cn",
+    parent_agent: Any = None,
+    messager: Any = None,
+    team_name: str = "default",
+    swarmflow_model_resolver: Callable[[str], Any] | None = None,
+    swarmflow_worker_base_spec: Any = None,
+    swarmflow_human_base_spec: Any = None,
+    concurrency_governor: Any = None,
+    swarmflow_budget: Any = None,
+    team_permissions_enabled: bool = False,
+    expert_catalog: "ExpertCatalog | None" = None,
+    expert_binding: "ExpertBinding | None" = None,
+) -> list[Tool]:
+    """Create role-appropriate tool instances filtered by permission sets.
+
+    Args:
+        role: "leader" or "teammate".
+        agent_team: AgentTeam instance providing task/message/db/messager.
+            Also carries the capability gates the toolset is filtered on:
+            ``hitt_enabled`` / ``bridge_enabled`` select the spawn tools,
+            ``external_cli_kinds`` adds ``spawn_teammate``'s ``cli_agent`` /
+            ``external_cli`` properties, and ``fork_enabled``
+            (``TeamAgentSpec.enable_fork``) drops the ``checkpoint`` tool
+            plus ``spawn_teammate``'s fork properties and the description
+            section documenting them. The team's resident
+            ``WorkspaceCache`` is read off ``agent_team.workspace_cache``
+            — it delegates to the workspace manager the way every other
+            consumer does, so no separate cache argument is threaded here.
+        teammate_mode: Execution mode for teammates — "build_mode" or
+            "plan_mode". Leader's approval tools (approve_plan / approve_tool)
+            are only wired when teammate_mode == "plan_mode", since that's the
+            only mode where teammates submit plans and tool calls can be held
+            for leader sign-off.
+        dispatch_mode: How tasks reach members — "autonomous" (members claim
+            from a shared board) or "scheduled" (the leader assigns every
+            task). Selects the ``create_task`` / ``send_message`` variants and
+            the member tool set; unknown values raise KeyError.
+        lifecycle: Team lifecycle — "temporary" or "persistent". The
+            ``clean_team`` tool is only wired for temporary teams; persistent
+            teams are torn down through operator-level SDK facades
+            (``delete_agent_team`` etc.), so exposing a leader-callable
+            tear-down tool inside a round would race the pool invariants.
+        team_mode: Team operating mode — "default" / "predefined" / "hybrid".
+            Selects the workflow variant disclosed in the ``build_team``
+            result; it does not change any tool's shape.
+        bootstrap_mode: Who materializes the team — "leader" (the leader
+            calls ``build_team``) or "framework" (the coordination kernel
+            builds the team on start, F_122). Under "framework" the leader's
+            ``build_team`` is dropped: the team already exists and the policy
+            that tool would disclose reaches the leader as a
+            ``<team-policy>`` context block instead.
+        model_config_allocator: Callback that returns the next
+            ``Allocation`` for teammate allocation. Receives an
+            optional ``model_name`` hint forwarded from the spawn site;
+            ``RoundRobinModelAllocator`` ignores the hint while
+            ``ByModelNameAllocator`` requires it.
+        exclude_tools: Tool names to exclude from the allowed set.
+        lang: Locale code ("cn" or "en") for tool descriptions.
+        parent_agent: The owning ``NativeHarness`` (a ``DeepAgent``) that the
+            async ``swarmflow`` tool launches background work on. Supplied at
+            rail-init time; None for callers without a harness (e.g. external
+            CLI members), which never get ``swarmflow`` anyway.
+        messager: The member's messager — the ``swarmflow`` tool uses it to
+            publish phase-progress events for the spectator leader.
+        team_name: Team name used for swarmflow event routing / worker ids.
+        swarmflow_model_resolver: Resolves an ``agent(model=...)`` name hint to a
+            worker ``Model``. Non-None only for a member whose swarmflow handles
+            are wired (the leader that constructed them, or an in-process
+            teammate that received the share); when None the ``swarmflow`` tool
+            is gated out.
+        swarmflow_budget: The team's shared ``BudgetLedger`` capping the tokens
+            its swarmflow runs may burn. Non-None only for a member whose
+            swarmflow handles are wired (same gate as the resolver).
+        expert_catalog: The host's expert locating protocol. Non-None only for
+            a leader whose host injected one; when None the expert tools
+            (``view_experts`` / ``view_expert_groups`` / ``spawn_expert``) are
+            gated out together.
+        expert_binding: Team-spec data ``spawn_expert`` works with (the bound
+            AgentGroup and the persona workspace); passed with ``expert_catalog``.
+    """
+    from openjiuwen.agent_teams.prompts.loader import make_template_loader
+    from openjiuwen.agent_teams.tools.locales import make_translator
+    from openjiuwen.agent_teams.workflow.tool_swarmflow import SwarmflowTool
+
+    # One translator closure bound to the team's resident WorkspaceCache —
+    # tool descriptions consult the evolved ``prompts/tool/`` files first,
+    # framework defaults otherwise. The cache is taken from the backend
+    # (which delegates to the workspace manager) — the single source every
+    # other consumer uses.
+    # ``None`` (no manager attached yet / evolution disabled / unit tests)
+    # → identical to the pre-evolvable ``make_translator`` closure.
+    cache = agent_team.workspace_cache
+    t = make_translator(lang, ws_cache=cache)
+    loader = make_template_loader(cache)
+    task_mgr = agent_team.task_manager
+    msg_mgr = agent_team.message_manager
+    # Variant selection is a construction-time table lookup: every tool below
+    # still has a flat schema and a branch-free ``invoke``.
+    role_column = "leader" if role == "leader" else "member"
+    create_task_cls = _CREATE_TASK_CLASS[(dispatch_mode, role_column)]
+    update_task_cls = _UPDATE_TASK_CLASS[(dispatch_mode, role_column)]
+    expert_resolver = _expert_resolver(expert_catalog, expert_binding, language=lang)
+    send_message_cls = _SEND_MESSAGE_CLASS[(dispatch_mode, _send_message_reach(role, dispatch_mode, agent_team))]
+
+    all_tools = {
+        # Team management. ``build_team`` carries the leader's collaboration
+        # policy in its result (F_76), so it needs the same assembly parameters
+        # the policy rail used to consume.
+        "build_team": BuildTeamTool(
+            agent_team,
+            t,
+            language=lang,
+            lifecycle=lifecycle,
+            teammate_mode=teammate_mode,
+            team_mode=team_mode,
+            dispatch_mode=dispatch_mode,
+            loader=loader,
+        ),
+        "clean_team": CleanTeamTool(agent_team, t),
+        # Member management — one tool per kind of member: AI teammate (local
+        # or on an external CLI), human, bridge (flat schema, no role branching)
+        "spawn_teammate": SpawnTeammateTool(
+            agent_team,
+            t,
+            model_config_allocator=model_config_allocator,
+            fork_enabled=agent_team.fork_enabled(),
+        ),
+        "checkpoint": CheckpointTool(agent_team, t),
+        "list_checkpoints": ListCheckpointsTool(agent_team, t),
+        "spawn_human_agent": SpawnHumanAgentTool(agent_team, t),
+        "spawn_passive_human": SpawnPassiveHumanTool(agent_team, t),
+        "spawn_bridge_agent": SpawnBridgeAgentTool(agent_team, t),
+        "shutdown_member": ShutdownMemberTool(agent_team, t, dispatch_mode=dispatch_mode),
+        "set_member_model": SetMemberModelTool(agent_team, t),
+        "approve_plan": ApprovePlanTool(agent_team, t),
+        "approve_tool": ApproveToolCallTool(agent_team, t),
+        # Task management
+        "create_task": create_task_cls(
+            agent_team,
+            t,
+            **_create_task_kwargs(
+                create_task_cls,
+                team_mode=team_mode,
+                model_config_allocator=model_config_allocator,
+                expert_resolver=expert_resolver,
+            ),
+        ),
+        "update_task": (
+            UpdateTaskTool(agent_team, t, dispatch_mode=dispatch_mode)
+            if update_task_cls is UpdateTaskTool
+            else update_task_cls(agent_team, t)
+        ),
+        "view_task": ViewTaskToolV2(task_mgr, t, desc_key=_VIEW_TASK_DESC_KEY[dispatch_mode]),
+        "claim_task": ClaimTaskTool(task_mgr, t),
+        "submit_plan": SubmitPlanTool(task_mgr, t),
+        "verify_task": VerifyTaskTool(task_mgr, t, desc_key=_VERIFY_TASK_DESC_KEY[dispatch_mode]),
+        "member_complete_task": MemberCompleteTaskTool(task_mgr, t, desc_key=_MEMBER_COMPLETE_DESC_KEY[dispatch_mode]),
+        # Messaging
+        "send_message": send_message_cls(msg_mgr, t, team=agent_team),
+        # Swarmflow orchestration. The name is in SHARED_TOOLS; the tool is
+        # wired only when the caller supplied a worker-model resolver (the
+        # leader that constructed the handles, or an in-process teammate that
+        # received them). Both roles share the same description.
+        "swarmflow": SwarmflowTool(
+            parent_agent=parent_agent,
+            messager=messager,
+            team_name=team_name,
+            model_resolver=swarmflow_model_resolver,
+            worker_base_spec=swarmflow_worker_base_spec,
+            human_base_spec=swarmflow_human_base_spec,
+            concurrency_governor=concurrency_governor,
+            budget=swarmflow_budget,
+            t=t,
+            language=lang,
+            team_backend=agent_team,
+        ),
+        # Async-tool control tools (list / output / cancel background tasks).
+        # Leader-only (in LEADER_ONLY_TOOLS); always wired — harmless when the
+        # registry is empty. ``parent_agent`` is the harness whose runtime they
+        # query; None for harness-less callers (filtered out by role anyway).
+        "async_tasks_list": AsyncTasksListTool(parent_agent, t, language=lang),
+        "async_task_output": AsyncTaskOutputTool(parent_agent, t, language=lang),
+        "async_task_cancel": AsyncTaskCancelTool(parent_agent, t, language=lang),
+    }
+
+    if expert_catalog is not None:
+        all_tools.update(
+            _expert_tools(
+                agent_team,
+                t,
+                catalog=expert_catalog,
+                binding=expert_binding,
+                language=lang,
+                dispatch_mode=dispatch_mode,
+                model_config_allocator=model_config_allocator,
+                resolver=expert_resolver,
+            )
+        )
+
+    org_task_manager = getattr(agent_team, "org_task_manager", None)
+    if org_task_manager is not None:
+        from openjiuwen.agent_teams.organization.message_service import OrgMessageService
+        from openjiuwen.agent_teams.organization.tools import create_org_leader_tools
+
+        leader_id = agent_team.leader_member_name or agent_team.member_name
+        org_message_service = getattr(agent_team, "org_message_service", None)
+        if org_message_service is None:
+            org_message_service = OrgMessageService(
+                db=org_task_manager.db,
+                organization_id=org_task_manager.organization_id,
+                session_id=org_task_manager.session_id,
+                messager=getattr(agent_team, "messager", None),
+                db_context=org_task_manager.db_context,
+            )
+        org_tools = create_org_leader_tools(
+            manager=org_task_manager,
+            message_service=org_message_service,
+            team_id=agent_team.team_name,
+            leader_id=leader_id,
+        )
+        all_tools.update({tool.card.name: tool for tool in org_tools})
+
+    if role == "human_agent":
+        allowed = HUMAN_AGENT_TOOLS
+    elif role == "leader":
+        allowed = LEADER_TOOLS
+    else:
+        allowed = MEMBER_TOOLS_BY_DISPATCH[dispatch_mode]
+    # Plan tools only make sense in plan_mode.
+    if teammate_mode != "plan_mode":
+        excluded = {"approve_plan", "submit_plan"}
+        # Leader must keep approve_tool when team permissions are on,
+        # so it can resolve teammate ASK interrupts.
+        if not team_permissions_enabled:
+            excluded.add("approve_tool")
+        allowed = allowed - excluded
+    # clean_team is a temporary-team primitive only. Persistent teams are
+    # torn down by the operator through SDK facades (delete_agent_team etc.);
+    # letting the leader LLM call clean_team mid-round would race the runtime
+    # pool invariants and silently de-register a team the operator still considers
+    # live. Temporary teams keep the tool — they have no external operator;
+    # the leader is the only one who can wind them down.
+    if lifecycle == "persistent":
+        allowed = allowed - {"clean_team"}
+    # A framework-built team (F_122) already exists when the leader starts,
+    # and the policy ``build_team`` would disclose reaches the leader as a
+    # ``<team-policy>`` context block instead. A tool that is present gets
+    # called, so it is removed rather than left as a no-op.
+    if bootstrap_mode == "framework":
+        allowed = allowed - {"build_team"}
+    # Capability gating for the non-teammate spawn tools: a spawn tool the
+    # backend would reject is simply never shown to the LLM. spawn_teammate is
+    # always available; running it on an external CLI is gated per attribute
+    # inside SpawnTeammateTool. Symmetric to the plan_mode / persistent gates above.
+    # Unconditional set subtraction is idempotent — teammate / human_agent
+    # ``allowed`` sets don't contain these leader-only tools anyway.
+    if getattr(agent_team, "conversation_mode", "team") != "group_chat":
+        allowed = allowed - {"spawn_passive_human"}
+    if not agent_team.hitt_enabled():
+        allowed = allowed - {"spawn_human_agent", "spawn_passive_human"}
+    if not agent_team.bridge_enabled():
+        allowed = allowed - {"spawn_bridge_agent"}
+    # Switching a member's built-in model needs a declared catalog to pick from.
+    if not agent_team.builtin_models_enabled():
+        allowed = allowed - {"set_member_model"}
+    # Context inheritance (F_75). One flag gates the whole capability:
+    # ``checkpoint`` / ``list_checkpoints`` disappear here, and
+    # ``SpawnTeammateTool`` reads the same ``fork_enabled()`` above to drop
+    # its fork properties and the matching section of its description. A
+    # checkpoint nobody can fork from is dead weight in every member's tool
+    # list.
+    if not agent_team.fork_enabled():
+        allowed = allowed - {"checkpoint", "list_checkpoints"}
+    # Member subtasks (F_128 / F_129): a scheduled member's ``create_task`` and
+    # ``update_task`` exist only when the team allows splitting. The leader's
+    # are never gated by it.
+    if role != "leader" and agent_team.member_subtasks_enabled() is not True:
+        allowed = allowed - {"create_task", "update_task"}
+    # Swarmflow is wired only when the host supplied a worker-model resolver
+    # (leader + enable_swarmflow). Same idempotent-subtraction gate as the
+    # spawn tools.
+    if swarmflow_model_resolver is None:
+        allowed = allowed - {"swarmflow"}
+    # Expert tools exist only when the host injected an expert catalog — all
+    # three together, so a leader never gets spawn_expert without the views.
+    if expert_catalog is None:
+        allowed = allowed - EXPERT_TOOLS
+    if role != "human_agent" and getattr(agent_team, "conversation_mode", "team") == "group_chat":
+        from openjiuwen.agent_teams.group_chat.tools import GroupSendMessageTool
+
+        tool = GroupSendMessageTool(agent_team, t)
+        all_tools[tool.card.name] = tool
+        allowed = allowed | {tool.card.name}
+    if exclude_tools:
+        allowed = allowed - exclude_tools
+    tools = [tool for name, tool in all_tools.items() if name in allowed]
+
+    for tool in tools:
+        _wrap_invoke_with_logging(tool)
+
+    return tools
+
+
+def _expert_tools(
+    agent_team: TeamBackend,
+    t: Any,
+    *,
+    catalog: "ExpertCatalog",
+    binding: "ExpertBinding | None",
+    language: str,
+    dispatch_mode: str,
+    model_config_allocator: Any,
+    resolver: Any,
+) -> dict[str, Tool]:
+    """Build the three expert tools over one catalog."""
+    from openjiuwen.agent_teams.tools.tool_expert import SpawnExpertTool, ViewExpertGroupsTool, ViewExpertsTool
+
+    bound_group = binding.bound_group if binding is not None else None
+    return {
+        "view_experts": ViewExpertsTool(
+            catalog,
+            t,
+            language=language,
+            bound_group=bound_group,
+            dispatch_mode=dispatch_mode,
+            declared_cli_kinds=agent_team.external_cli_kinds(),
+        ),
+        "view_expert_groups": ViewExpertGroupsTool(
+            catalog,
+            t,
+            language=language,
+            bound_group=bound_group,
+            declared_cli_kinds=agent_team.external_cli_kinds(),
+        ),
+        "spawn_expert": SpawnExpertTool(
+            agent_team,
+            t,
+            catalog=catalog,
+            language=language,
+            bound_group=bound_group,
+            model_config_allocator=model_config_allocator,
+            resolver=resolver,
+        ),
+    }
+
+
+def _wrap_invoke_with_logging(tool: Tool) -> None:
+    """Wrap a tool's invoke method with debug logging.
+
+    The structured result passes through unchanged; the model-facing text is
+    produced later by the tool's own ``render_for_llm``.
+    """
+    from openjiuwen.core.common.logging import team_logger
+
+    original_invoke = tool.invoke
+    tool_name = tool.card.name
+
+    @wraps(original_invoke)
+    async def logged_invoke(inputs: dict[str, Any], **kwargs: Any) -> ToolOutput:
+        team_logger.debug(f"[{tool_name}] invoke start, inputs={inputs}")
+        result = await original_invoke(inputs, **kwargs)
+        team_logger.debug(f"[{tool_name}] invoke end, output={result}")
+        return result
+
+    tool.invoke = logged_invoke

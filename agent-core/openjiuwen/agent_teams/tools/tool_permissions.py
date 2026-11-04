@@ -1,0 +1,168 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Permission sets and member-name validation pattern for team tools."""
+
+import re
+
+# ========== Tool Permission Sets ==========
+
+# Tools that only the leader can use
+LEADER_ONLY_TOOLS: set[str] = {
+    "build_team",  # Create a new team
+    "clean_team",  # Clean up a team
+    "spawn_teammate",  # Spawn an AI teammate (local LLM, or a third-party CLI agent)
+    "spawn_human_agent",  # Spawn a human member with an avatar (HITT)
+    "spawn_passive_human",  # Spawn a passive human member, no avatar (HITT)
+    "spawn_bridge_agent",  # Spawn a bridge to a remote agent
+    "set_member_model",  # Switch an external CLI member's built-in model / effort
+    "spawn_expert",  # Spawn a teammate from an installed expert template (gated by an expert catalog)
+    "view_experts",  # Browse installed single experts (gated by an expert catalog)
+    "view_expert_groups",  # Browse installed expert groups and their members (gated by an expert catalog)
+    "shutdown_member",  # Shutdown a team member
+    "approve_plan",  # Approve or reject a member's plan
+    "approve_tool",  # Approve or reject a teammate tool call
+    "list_checkpoints",  # List named checkpoints available for fork inheritance
+    "create_task",  # Create tasks (batch / with deps)
+    "update_task",  # Update task content / cancel tasks
+    # Async-tool control — inspect / fetch / cancel background async tasks
+    "async_tasks_list",
+    "async_task_output",
+    "async_task_cancel",
+    # Organization bootstrap controls are available to every running leader.
+    "org_create_organization",
+    "org_invite_team",
+    "org_view_organization",
+    # Organization-level collaboration tools (gated by organization_id).
+    "org_view_tasks",
+    "org_create_task",
+    "org_claim_task",
+    "org_delegate_task",
+    "org_update_task",
+    "org_send_leader_message",
+    "org_get_leader_message",
+    "org_list_leader_messages",
+    "org_ack_leader_message",
+    "org_view_child_tasks",
+    "org_view_pending_reviews",
+    "org_review_task",
+    # Root Leader creates a Summary Execution after accepted sources are ready.
+    "org_create_summary_execution",
+}
+
+# Leader tools over the host's expert catalog; registered together, only when
+# the host injected a catalog (``create_team_tools(expert_catalog=...)``).
+EXPERT_TOOLS: frozenset[str] = frozenset({"view_experts", "view_expert_groups", "spawn_expert"})
+
+# Tools that only members can use
+MEMBER_ONLY_TOOLS: set[str] = {
+    "claim_task",  # Claim or complete a task
+    "submit_plan",  # Submit a plan before executing in plan_mode
+    "verify_task",  # Pass/fail a task in the verify gate (reviewer-guarded)
+    # Worktree tools — members work in isolated worktrees
+    # "enter_worktree",          # Enter an isolated git worktree
+    # "exit_worktree",           # Exit the current worktree session
+}
+
+# Tools that both leader and members can use
+SHARED_TOOLS: set[str] = {
+    # Query tools
+    # "get_team_info",           # Get team information
+    # "get_member",              # Get member information
+    "view_task",  # View tasks (unified - supports get/list/claimable)
+    # Messaging tools
+    "send_message",  # Send a message (point-to-point or broadcast)
+    "workspace_meta",  # Workspace lock management and version history
+    "checkpoint",  # Snapshot conversation context for fork (gated by enable_fork)
+    # Orchestration script runner. The NAME is shared, the TOOL is wired per
+    # member by the factory's resolver gate: an in-process teammate that
+    # received the shared swarmflow handles (enable_swarmflow team) gets it,
+    # a member without them (subprocess / external CLI) has it dropped from
+    # its tool set. Members control their runs through the tool's own
+    # resume_id + action surface, so the async_task_* tools stay leader-only.
+    "swarmflow",
+}
+
+# Member-only tools under scheduled dispatch. The leader assigns every task,
+# so ``claim_task`` — the autonomous-claim path — has no meaning and is not
+# registered; members close out their work with the self-only
+# ``member_complete_task`` instead, exactly as ``human_agent`` already does.
+# ``submit_plan`` stays: plan_mode members still submit plans for approval.
+MEMBER_ONLY_TOOLS_SCHEDULED: set[str] = {
+    "member_complete_task",  # Complete a task assigned to you
+    "submit_plan",  # Submit a plan before executing in plan_mode
+    "verify_task",  # Pass/fail a task in the verify gate (reviewer-guarded)
+    "create_task",  # Split your executing task into subtasks (gated by max_subtask_depth, F_128)
+    "update_task",  # Edit / confirm / cancel the subtasks of your own task (same gate, F_129)
+}
+
+# All tools available to leader. Dispatch-invariant: the leader's tool *names*
+# do not change with dispatch mode (``create_task`` gains an ``assignee``
+# property, but it is the same tool).
+LEADER_TOOLS: set[str] = LEADER_ONLY_TOOLS | SHARED_TOOLS
+
+# All tools available to members, keyed by dispatch mode. Unknown keys raise
+# KeyError at the factory — a silent fallback would hand a scheduled member
+# the autonomous claim path.
+MEMBER_TOOLS_BY_DISPATCH: dict[str, set[str]] = {
+    "autonomous": MEMBER_ONLY_TOOLS | SHARED_TOOLS,
+    "scheduled": MEMBER_ONLY_TOOLS_SCHEDULED | SHARED_TOOLS,
+}
+
+# All tools available to members (autonomous dispatch — the default).
+MEMBER_TOOLS: set[str] = MEMBER_TOOLS_BY_DISPATCH["autonomous"]
+
+# Tools available to the reserved ``human_agent`` role. The human
+# agent acts on its corresponding external user's behalf, so it gets
+# read access to tasks, a self-only completion tool, and the shared
+# ``send_message`` tool so the user can ask the avatar to relay a
+# message to other members ("tell the leader I'm in a meeting").
+# The behavioural constraint — that the avatar must **not** speak on
+# its own initiative and may only send when the user explicitly
+# instructs a relay — is enforced in the HITT system prompt section,
+# not in the tool's ``invoke``. The user's own voice still flows
+# through ``HumanAgentInbox`` with explicit ``@target`` routing; this
+# tool is a complementary path for user-driven outbound speech.
+#
+# ``claim_task`` is intentionally absent — autonomous claiming is a
+# teammate behavior; the user's avatar must wait for explicit leader
+# assignment via ``update_task(assignee=...)`` instead.
+#
+# Workspace lock/version (``workspace_meta``) is attached separately
+# by ``TeamToolRail`` whenever a workspace_manager is configured —
+# same path leader/teammate use — so this set doesn't list it.
+HUMAN_AGENT_TOOLS: set[str] = {
+    "view_task",
+    "member_complete_task",
+    "verify_task",  # A human member can be assigned as a reviewer (reviewer-guarded)
+    "send_message",
+}
+
+# Tools a passive human member may drive through the tool-call passthrough
+# (``HumanAgentToolCall``). This is NOT a ``create_team_tools`` role set — a
+# passive member has no harness, so no tool list is ever built for an LLM;
+# the passthrough executor consults this constant directly when the runtime
+# executes an externally relayed tool call under the member's identity.
+#
+# The base surface matches ``HUMAN_AGENT_TOOLS``: the passive role is the
+# avatar-free flavor of the same human member, so it inherits the human tool
+# face verbatim. ``claim_task`` is the one deliberate delta — the avatar
+# refrains from autonomous claiming as an LLM-behavior guard, but a passive
+# human IS the operator: an explicit claim relayed through the external
+# protocol is as intentional as ``member_complete_task``. Under scheduled
+# dispatch the executor subtracts ``claim_task`` and swaps ``send_message``
+# for its report-to-leader form, aligning with the
+# ``MEMBER_ONLY_TOOLS_SCHEDULED`` convention that the leader assigns all work.
+PASSIVE_HUMAN_TOOLS: set[str] = HUMAN_AGENT_TOOLS | {"claim_task"}
+
+
+# ``member_name`` is used verbatim as a primary key, a message routing
+# token, and a path segment under ``team_home``. Allowing non-ASCII
+# (e.g. CJK) or shell-significant characters in any of those positions
+# silently breaks routing on some transports and produces unreadable
+# directory layouts on disk. Restrict to the DNS-label-style alphabet
+# used everywhere else in the ecosystem (k8s pods, docker containers):
+# lowercase ASCII letters, digits, and hyphen, with a leading letter so
+# the name is never a bare number or starts with a separator. Enforced
+# at the only LLM-facing entry point (``spawn_member``).
+_MEMBER_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")

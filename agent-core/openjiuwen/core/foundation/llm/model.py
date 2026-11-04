@@ -1,0 +1,729 @@
+# -*- coding: UTF-8 -*-
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
+import asyncio
+import time
+from typing import Union, List, Optional, AsyncIterator
+
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import build_error
+from openjiuwen.core.common.logging import llm_logger, LogEventType
+from openjiuwen.core.foundation.llm.call_scope import LlmCallScope
+from openjiuwen.core.foundation.llm.model_clients import create_model_client
+from openjiuwen.core.foundation.llm.schema.message import BaseMessage, AssistantMessage, UserMessage
+from openjiuwen.core.foundation.llm.schema.message_chunk import AssistantMessageChunk
+from openjiuwen.core.foundation.tool import ToolInfo
+from openjiuwen.core.foundation.llm.schema.config import ModelRequestConfig, ModelClientConfig
+from openjiuwen.core.foundation.llm.output_parsers.output_parser import BaseOutputParser
+from openjiuwen.core.foundation.llm.schema.generation_response import (
+    ImageGenerationResponse,
+    AudioGenerationResponse,
+    VideoGenerationResponse
+)
+from openjiuwen.core.foundation.llm.model_clients.base_model_client import BaseModelClient
+from openjiuwen.core.runner.callback import trigger
+from openjiuwen.core.kv_cache.kv_cache_model_hook import KVCacheModelHook
+
+
+_llm_route_stream_writer_framework_id: Optional[int] = None
+
+
+def _ensure_llm_route_stream_writer_registered() -> None:
+    """Register the default frontend stream bridge for LLM route events."""
+    from openjiuwen.core.runner import Runner
+    from openjiuwen.core.runner.callback.events import LLMCallEvents
+    from openjiuwen.core.session.stream import OutputSchema
+
+    global _llm_route_stream_writer_framework_id
+    framework = Runner.callback_framework
+    framework_id = id(framework)
+    if _llm_route_stream_writer_framework_id == framework_id:
+        return
+
+    async def write_llm_route(route_metadata: dict | None = None, session=None, **kwargs) -> None:
+        if not route_metadata or session is None or not hasattr(session, "write_stream"):
+            return
+        payload = dict(route_metadata)
+        payload.setdefault("result_type", "answer")
+        await session.write_stream(OutputSchema(type="llm_route", index=0, payload=payload))
+
+    framework.register_sync(
+        LLMCallEvents.LLM_ROUTE,
+        write_llm_route,
+        namespace="core_llm_route_stream_writer",
+    )
+    _llm_route_stream_writer_framework_id = framework_id
+
+
+class Model:
+    """Unified LLM invocation entry point
+
+    Responsibilities:
+    1. Get/create ModelClient instance based on client_id or configuration
+    2. Delegate to ModelClient to execute actual LLM calls
+    3. Provide unified interface (ainvoke, astream)
+
+    Usage:
+
+    Method 1: Dynamic creation (pass configuration)
+        model = Model(model_config, client_config)
+        response = await model.ainvoke("Hello")
+    """
+
+    def __init__(
+            self,
+            model_client_config: Optional[ModelClientConfig],
+            model_config: ModelRequestConfig = None,
+    ):
+        """Initialize Model instance
+
+        Args:
+            model_config: Model parameter configuration
+            model_client_config: Client configuration
+        """
+        self.model_config = model_config
+        self.model_client_config = model_client_config
+        self._client: Optional[BaseModelClient] = None
+
+        if model_client_config is not None:
+            self._client = create_model_client(client_config=model_client_config, model_config=self.model_config)
+        else:
+            raise build_error(StatusCode.MODEL_SERVICE_CONFIG_ERROR,
+                              error_msg="model client config is none")
+
+        from openjiuwen.core.runner import Runner
+        from openjiuwen.core.runner.callback.events import LLMCallEvents
+        _ensure_llm_route_stream_writer_registered()
+        _fw = Runner.callback_framework
+        _extra = {
+            "model_config": model_config,
+            "model_client_config": model_client_config,
+        }
+
+        fn = self._client.invoke
+        fn = _fw.emit_before(LLMCallEvents.LLM_INVOKE_INPUT, extra_kwargs=_extra)(fn)
+        fn = _fw.transform_io(
+            input_event=LLMCallEvents.LLM_INVOKE_INPUT,
+            output_event=LLMCallEvents.LLM_INVOKE_OUTPUT,
+        )(fn)
+        fn = _fw.emit_after(LLMCallEvents.LLM_INVOKE_OUTPUT, extra_kwargs=_extra)(fn)
+        self._client.invoke = fn
+
+        fn = self._client.stream
+        fn = _fw.emit_before(LLMCallEvents.LLM_STREAM_INPUT, extra_kwargs=_extra)(fn)
+        fn = _fw.transform_io(
+            input_event=LLMCallEvents.LLM_STREAM_INPUT,
+            output_event=LLMCallEvents.LLM_STREAM_OUTPUT,
+        )(fn)
+        fn = _fw.emit_after(LLMCallEvents.LLM_STREAM_OUTPUT, item_key="result",
+                            extra_kwargs=_extra)(fn)
+        self._client.stream = fn
+
+    def _resolve_stream_timeout(self, name: str) -> Optional[float]:
+        """Resolve a stream timeout option from the client config."""
+        return getattr(self.model_client_config, name, None) if self.model_client_config is not None else None
+
+    async def invoke(
+            self,
+            messages: Union[str, List[BaseMessage], List[dict]],
+            *,
+            tools: Union[List[ToolInfo], List[dict], None] = None,
+            temperature: Optional[float] = None,
+            top_p: Optional[float] = None,
+            max_tokens: Optional[int] = None,
+            stop: Union[Optional[str], None] = None,
+            model: str = None,
+            output_parser: Optional[BaseOutputParser] = None,
+            timeout: float = None,
+            **kwargs
+    ) -> AssistantMessage:
+        """Asynchronous LLM invocation
+
+        Args:
+            :param output_parser:
+            :param model:
+            :param stop:
+            :param temperature:
+            :param tools:
+            :param messages:
+            :param top_p:
+            :param max_tokens:
+            :param timeout:
+            **kwargs: Other parameters
+
+        Returns:
+            AssistantMessage
+        """
+        from openjiuwen.core.context_engine.context.compression_scope import (
+            stamp_context_compression_model_kwargs,
+        )
+
+        stamp_context_compression_model_kwargs(kwargs)
+
+        # Identify this request for the whole callback chain (input event,
+        # the client's own LLM_OUTPUT trigger, output event, error event) so
+        # observers can attribute what they receive to this call and not to
+        # another one running concurrently. See ``call_scope``.
+        with LlmCallScope(unified_completion=True):
+            model_config = getattr(self, "model_config", None)
+            runtime_lease = await KVCacheModelHook.begin(
+                self,
+                kwargs,
+                model or getattr(model_config, "model_name", None),
+            )
+            succeeded = False
+            try:
+                result = await self._client.invoke(
+                    messages=messages,
+                    stop=stop,
+                    model=model,
+                    tools=tools,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    output_parser=output_parser,
+                    timeout=timeout,
+                    **kwargs
+                )
+                succeeded = True
+                return result
+            finally:
+                await KVCacheModelHook.end(runtime_lease, succeeded=succeeded)
+
+    async def stream(
+            self,
+            messages: Union[str, List[BaseMessage], List[dict]],
+            *,
+            tools: Union[List[ToolInfo], List[dict], None] = None,
+            temperature: Optional[float] = None,
+            top_p: Optional[float] = None,
+            max_tokens: Optional[int] = None,
+            stop: Union[Optional[str], None] = None,
+            model: str = None,
+            output_parser: Optional[BaseOutputParser] = None,
+            timeout: float = None,
+            **kwargs
+    ) -> AsyncIterator[AssistantMessageChunk]:
+        """Asynchronous streaming LLM invocation
+
+        Args:
+            :param output_parser:
+            :param model:
+            :param stop:
+            :param temperature:
+            :param tools:
+            :param messages:
+            :param top_p:
+            :param max_tokens:
+            :param timeout:
+            **kwargs: Other parameters
+
+        Yields:
+            AssistantMessageChunk
+        """
+        from openjiuwen.core.context_engine.context.compression_scope import (
+            stamp_context_compression_model_kwargs,
+        )
+
+        stamp_context_compression_model_kwargs(kwargs)
+        first_chunk_timeout = self._resolve_stream_timeout("stream_first_chunk_timeout")
+        idle_timeout = self._resolve_stream_timeout("stream_idle_timeout")
+
+        # The scope is opened here, in the frame that drives the stream, and
+        # not further down inside the callback handlers: every ``__anext__``
+        # below runs in its own ``asyncio.wait_for`` task, and such a task
+        # copies the context, so an id bound inside a chunk callback would be
+        # gone by the time the next chunk arrives. See ``call_scope``.
+        with LlmCallScope(unified_completion=True):
+            model_config = getattr(self, "model_config", None)
+            effective_model_name = model or getattr(model_config, "model_name", None)
+            runtime_lease = await KVCacheModelHook.begin(self, kwargs, effective_model_name)
+            succeeded = False
+            accumulated_chunk: AssistantMessageChunk | None = None
+            try:
+                stream_iterable = self._client.stream(
+                    messages=messages,
+                    stop=stop,
+                    model=model,
+                    tools=tools,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    output_parser=output_parser,
+                    timeout=timeout,
+                    **kwargs
+                )
+                stream_iterator = stream_iterable.__aiter__()
+                started_at = time.monotonic()
+                chunk_count = 0
+                token_chunk_count = 0
+                # Seconds spent waiting on the provider since the last chunk
+                # that carried model output. Only time inside ``__anext__``
+                # counts: the consumer's own processing between chunks must not
+                # eat into the provider's budget. Framing-only chunks (role-only
+                # or heartbeat deltas, usage-only frames) keep accumulating, so
+                # they can neither satisfy the first-token budget nor keep a
+                # stalled stream alive past the idle budget.
+                waited_since_progress = 0.0
+
+                while True:
+                    stage = "first_token" if token_chunk_count == 0 else "idle_token"
+                    budget = first_chunk_timeout if token_chunk_count == 0 else idle_timeout
+                    wait_started_at = time.monotonic()
+
+                    try:
+                        if budget is None:
+                            chunk = await stream_iterator.__anext__()
+                        else:
+                            chunk = await asyncio.wait_for(
+                                stream_iterator.__anext__(),
+                                timeout=max(budget - waited_since_progress, 0.0),
+                            )
+                    except StopAsyncIteration:
+                        succeeded = True
+                        break
+                    except asyncio.TimeoutError as exc:
+                        close = getattr(stream_iterator, "aclose", None) or getattr(stream_iterable, "aclose", None)
+                        if callable(close):
+                            await close()
+
+                        now = time.monotonic()
+                        total_elapsed_seconds = now - started_at
+                        wait_elapsed_seconds = waited_since_progress + (now - wait_started_at)
+                        timeout_seconds = budget if budget is not None else 0
+                        model_provider = getattr(self.model_client_config, "client_provider", None)
+                        elapsed_label = "first_token_elapsed" if token_chunk_count == 0 else "idle_elapsed"
+                        error_detail = (
+                            f"stream frame timeout: stage={stage}, timeout={timeout_seconds}s, "
+                            f"chunk_count={chunk_count}, token_chunk_count={token_chunk_count}, "
+                            f"{elapsed_label}={wait_elapsed_seconds:.2f}s, "
+                            f"total_elapsed={total_elapsed_seconds:.2f}s, "
+                            f"model={effective_model_name or ''}"
+                        )
+                        from openjiuwen.core.runner.callback.events import LLMCallEvents
+                        await trigger(
+                            LLMCallEvents.LLM_CALL_ERROR,
+                            model_name=effective_model_name,
+                            model_provider=model_provider,
+                            is_stream=True,
+                            error=exc,
+                            # The bare TimeoutError renders as an empty string;
+                            # carry the already-built diagnostic into the span.
+                            error_message=f"LLM stream timeout: {error_detail}")
+                        llm_logger.error(
+                            "LLM stream timeout.",
+                            event_type=LogEventType.LLM_CALL_ERROR,
+                            model_name=effective_model_name,
+                            model_provider=model_provider,
+                            tools=tools,
+                            temperature=temperature,
+                            top_p=top_p,
+                            max_tokens=max_tokens,
+                            is_stream=True,
+                            exception=error_detail
+                        )
+                        raise build_error(
+                            StatusCode.MODEL_CALL_FAILED,
+                            error_msg=f"LLM stream timeout: {error_detail}"
+                        ) from exc
+
+                    chunk_count += 1
+                    waited_since_progress += time.monotonic() - wait_started_at
+                    # Anything other than a message chunk (e.g. a transformed
+                    # callback result) cannot be inspected, so it counts as
+                    # progress rather than risking a false timeout.
+                    if not isinstance(chunk, AssistantMessageChunk) or chunk.carries_output_token():
+                        token_chunk_count += 1
+                        waited_since_progress = 0.0
+                    # A client (or an LLM_STREAM_OUTPUT transform callback ahead
+                    # of this frame) may yield something other than a message
+                    # chunk; only real chunks accumulate into the completion.
+                    if isinstance(chunk, AssistantMessageChunk):
+                        accumulated_chunk = (
+                            accumulated_chunk + chunk
+                            if accumulated_chunk is not None
+                            else chunk
+                        )
+                    yield chunk
+            finally:
+                await KVCacheModelHook.end(runtime_lease, succeeded=succeeded)
+
+            completed_message = (
+                AssistantMessage.model_validate(accumulated_chunk.model_dump())
+                if accumulated_chunk is not None
+                else AssistantMessage(content="")
+            )
+            from openjiuwen.core.runner.callback.events import LLMCallEvents
+            await trigger(
+                LLMCallEvents.LLM_STREAM_COMPLETED,
+                result=completed_message,
+                model_config=self.model_config,
+                model_client_config=self.model_client_config,
+            )
+
+    def supports_kv_cache_affinity(self) -> bool:
+        """Whether underlying client supports Ascend KV cache affinity actions."""
+        supports_fn = getattr(self._client, "supports_kv_cache_affinity", None)
+        if callable(supports_fn):
+            return bool(supports_fn())
+        return all(
+            callable(getattr(self._client, name, None))
+            for name in ("evict_kvc", "offload_kvc", "prefetch_kvc")
+        )
+
+    def build_kv_cache_affinity_invoke_kwargs(
+            self,
+            *,
+            session: object = None,
+            session_id: Optional[str] = None,
+            parent_session_id: Optional[str] = None,
+            turn_num: Optional[int] = None,
+            enable_kv_cache_affinity: bool = False,
+    ) -> dict:
+        """Build AscendAffinity agent_hint kwargs for normal invoke/stream."""
+        build_fn = getattr(self._client, "build_kv_cache_affinity_invoke_kwargs", None)
+        if not callable(build_fn):
+            return {}
+        try:
+            return build_fn(
+                session=session,
+                session_id=session_id,
+                parent_session_id=parent_session_id,
+                turn_num=turn_num,
+                enable_kv_cache_affinity=enable_kv_cache_affinity,
+            )
+        except Exception as exc:
+            llm_logger.warning(
+                "KVC affinity hint construction failed; continue without affinity: %s",
+                exc,
+            )
+            return {}
+
+    async def _run_kv_cache_action(self, action: str, **kwargs) -> bool:
+        """Run an optional KVC action without exposing failures to business code."""
+        action_fn = getattr(self._client, f"{action}_kvc", None)
+        if not callable(action_fn):
+            return False
+        try:
+            return bool(await action_fn(**kwargs))
+        except Exception as exc:
+            llm_logger.warning(
+                "KVC %s failed; continue normal flow: %s",
+                action,
+                exc,
+            )
+            return False
+
+    async def evict_kvc(
+            self,
+            *,
+            session_id: str,
+            parent_session_id: Optional[str] = None,
+            target: str = "session",
+            messages: Union[str, List[BaseMessage], List[dict], None] = None,
+            tools: Union[List[ToolInfo], List[dict], None] = None,
+            model: Optional[str] = None,
+            msg_start: Optional[int] = None,
+            msg_end: Optional[int] = None,
+            tools_start: Optional[int] = None,
+            tools_end: Optional[int] = None,
+            include_tools: bool = False,
+            turn_num: Optional[int] = None,
+            timeout: Optional[float] = None,
+    ) -> bool:
+        """Evict KV cache through the underlying affinity-capable client."""
+        return await self._run_kv_cache_action(
+            "evict",
+            session_id=session_id,
+            parent_session_id=parent_session_id,
+            target=target,
+            messages=messages,
+            tools=tools,
+            model=model,
+            msg_start=msg_start,
+            msg_end=msg_end,
+            tools_start=tools_start,
+            tools_end=tools_end,
+            include_tools=include_tools,
+            turn_num=turn_num,
+            timeout=timeout,
+        )
+
+    async def offload_kvc(
+            self,
+            *,
+            session_id: str,
+            parent_session_id: Optional[str] = None,
+            target: str = "session",
+            messages: Union[str, List[BaseMessage], List[dict], None] = None,
+            tools: Union[List[ToolInfo], List[dict], None] = None,
+            model: Optional[str] = None,
+            msg_start: Optional[int] = None,
+            msg_end: Optional[int] = None,
+            tools_start: Optional[int] = None,
+            tools_end: Optional[int] = None,
+            include_tools: bool = False,
+            turn_num: Optional[int] = None,
+            timeout: Optional[float] = None,
+    ) -> bool:
+        """Offload KV cache through the underlying affinity-capable client."""
+        return await self._run_kv_cache_action(
+            "offload",
+            session_id=session_id,
+            parent_session_id=parent_session_id,
+            target=target,
+            messages=messages,
+            tools=tools,
+            model=model,
+            msg_start=msg_start,
+            msg_end=msg_end,
+            tools_start=tools_start,
+            tools_end=tools_end,
+            include_tools=include_tools,
+            turn_num=turn_num,
+            timeout=timeout,
+        )
+
+    async def prefetch_kvc(
+            self,
+            *,
+            session_id: str,
+            parent_session_id: Optional[str] = None,
+            target: str = "session",
+            messages: Union[str, List[BaseMessage], List[dict], None] = None,
+            tools: Union[List[ToolInfo], List[dict], None] = None,
+            model: Optional[str] = None,
+            msg_start: Optional[int] = None,
+            msg_end: Optional[int] = None,
+            tools_start: Optional[int] = None,
+            tools_end: Optional[int] = None,
+            include_tools: bool = False,
+            turn_num: Optional[int] = None,
+            timeout: Optional[float] = None,
+    ) -> bool:
+        """Prefetch KV cache through the underlying affinity-capable client."""
+        return await self._run_kv_cache_action(
+            "prefetch",
+            session_id=session_id,
+            parent_session_id=parent_session_id,
+            target=target,
+            messages=messages,
+            tools=tools,
+            model=model,
+            msg_start=msg_start,
+            msg_end=msg_end,
+            tools_start=tools_start,
+            tools_end=tools_end,
+            include_tools=include_tools,
+            turn_num=turn_num,
+            timeout=timeout,
+        )
+
+    async def generate_image(
+            self,
+            messages: List[UserMessage],
+            *,
+            model: Optional[str] = None,
+            size: Optional[str] = "1664*928",
+            negative_prompt: Optional[str] = None,
+            n: Optional[int] = 1,
+            prompt_extend: bool = True,
+            watermark: bool = False,
+            seed: int = 0,
+            **kwargs
+    ) -> ImageGenerationResponse:
+        """Generate image from text prompt (text-to-image or text+image-to-image)
+
+        Args:
+            messages: List of UserMessage containing text descriptions and optional image URLs
+            model: Model to use for generation
+            size: Size of the generated image (e.g., "1664*928", "1024*1024")
+            negative_prompt: Optional negative prompt to guide what not to generate
+            n: Number of images to generate
+            prompt_extend: Whether to automatically extend/enhance the prompt
+            watermark: Whether to add watermark to generated images
+            seed: Random seed for reproducible generation (0 for random)
+            **kwargs: Additional parameters
+
+        Returns:
+            ImageGenerationResponse: Generated image response
+        """
+        return await self._client.generate_image(
+            messages=messages,
+            model=model,
+            negative_prompt=negative_prompt,
+            size=size,
+            n=n,
+            prompt_extend=prompt_extend,
+            watermark=watermark,
+            seed=seed,
+            **kwargs
+        )
+
+    async def generate_speech(
+            self,
+            messages: List[UserMessage],
+            *,
+            model: Optional[str] = None,
+            voice: Optional[str] = "Cherry",
+            language_type: Optional[str] = "Auto",
+            **kwargs
+    ) -> AudioGenerationResponse:
+        """Generate speech audio from text
+
+        Args:
+            messages: List of UserMessage containing text to convert to speech
+            model: Model to use for generation
+            voice: Voice to use for speech synthesis (required), refer to supported voices
+            language_type: Language type for synthesized audio, defaults to "Auto" for automatic detection
+            **kwargs: Additional parameters
+
+        Returns:
+            AudioGenerationResponse: Generated audio response
+        """
+        return await self._client.generate_speech(
+            messages=messages,
+            model=model,
+            voice=voice,
+            language_type=language_type,
+            **kwargs
+        )
+
+    async def generate_video(
+            self,
+            messages: List[UserMessage],
+            *,
+            img_url: Optional[str] = None,
+            audio_url: Optional[str] = None,
+            model: Optional[str] = None,
+            size: Optional[str] = None,
+            resolution: Optional[str] = None,
+            duration: Optional[int] = 5,
+            prompt_extend: bool = True,
+            watermark: bool = False,
+            negative_prompt: Optional[str] = None,
+            seed: Optional[int] = None,
+            **kwargs
+    ) -> VideoGenerationResponse:
+        """Generate video from text prompt (text-to-video or image-to-video)
+
+        Args:
+            messages: List of UserMessage containing text description of the video to generate
+            img_url: Optional URL/path of the first frame image for image-to-video generation.
+                     Supports: public URL, local file path (file:// prefix), or base64 encoded image
+            audio_url: Optional URL of audio to add to the video
+            model: Model to use for generation
+            size: Video size (e.g., "1280*720"). Use '*' as separator.
+            resolution: Video resolution (e.g., "720P", "1080P")
+            duration: Duration of the video in seconds (default: 5)
+            prompt_extend: Whether to automatically extend/enhance the prompt (default: True)
+            watermark: Whether to add watermark to generated video (default: False)
+            negative_prompt: Negative prompt to guide what not to generate
+            seed: Random seed for reproducible generation
+            **kwargs: Additional parameters
+
+        Returns:
+            VideoGenerationResponse: Generated video response
+        """
+        return await self._client.generate_video(
+            messages=messages,
+            img_url=img_url,
+            audio_url=audio_url,
+            model=model,
+            size=size,
+            resolution=resolution,
+            duration=duration,
+            prompt_extend=prompt_extend,
+            watermark=watermark,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            **kwargs
+        )
+
+
+# Vendor JSON-body extensions that must not be passed as top-level OpenAI SDK
+# kwargs (``chat.completions.create`` rejects them with TypeError).
+_INIT_MODEL_EXTRA_BODY_FIELDS = frozenset({
+    "enable_thinking",
+    "thinking",
+    "chat_template_kwargs",
+})
+
+
+def init_model(
+        provider: str,
+        model_name: str,
+        api_key: str,
+        api_base: str,
+        *,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: float = 60.0,
+        max_retries: int = 3,
+        verify_ssl: bool = False,
+        custom_headers: Optional[dict[str, str]] = None,
+        extra_body: Optional[dict] = None,
+        reasoning_effort: Optional[str] = None,
+        **request_extras,
+) -> Model:
+    """Convenience factory to create a Model instance.
+
+    Args:
+        provider: Model provider name (e.g. "OpenAI").
+        model_name: Model name (e.g. "gpt-4").
+        api_key: API key.
+        api_base: API base URL.
+        temperature: Sampling temperature.
+        top_p: Top-p sampling parameter.
+        max_tokens: Maximum tokens to generate.
+        timeout: Request timeout in seconds.
+        max_retries: Maximum number of retries.
+        verify_ssl: Whether to verify SSL certificates.
+        custom_headers: Additional headers sent with each model request.
+        extra_body: Extra JSON body fields (e.g. DeepSeek ``thinking``,
+            OpenLux ``enable_thinking``). Prefer this over top-level kwargs.
+        reasoning_effort: Top-level reasoning effort (e.g. ``low``/``high``/``max``).
+        **request_extras: Additional ``ModelRequestConfig`` fields. Known
+            body-extension keys (``enable_thinking``, ``thinking``,
+            ``chat_template_kwargs``) are folded into ``extra_body`` so they
+            are not forwarded as illegal OpenAI SDK kwargs.
+
+    Returns:
+        Configured Model instance.
+    """
+    client_config = ModelClientConfig(
+        client_provider=provider,
+        api_key=api_key,
+        api_base=api_base,
+        timeout=timeout,
+        max_retries=max_retries,
+        verify_ssl=verify_ssl,
+        custom_headers=custom_headers,
+    )
+    request_kwargs: dict = {}
+    if reasoning_effort is not None:
+        request_kwargs["reasoning_effort"] = reasoning_effort
+
+    merged_extra_body: dict = dict(extra_body or {})
+    remaining_extras: dict = {}
+    for key, value in request_extras.items():
+        if key in _INIT_MODEL_EXTRA_BODY_FIELDS:
+            merged_extra_body[key] = value
+        else:
+            remaining_extras[key] = value
+    if merged_extra_body:
+        request_kwargs["extra_body"] = merged_extra_body
+    if remaining_extras:
+        request_kwargs.update(remaining_extras)
+
+    request_config = ModelRequestConfig(
+        model=model_name,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        **request_kwargs,
+    )
+    return Model(
+        model_client_config=client_config,
+        model_config=request_config,
+    )

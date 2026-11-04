@@ -1,0 +1,167 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Span state management for tracer_otel extension.
+
+Manages invoke_id → OtelSpanState mappings and buffered incremental data.
+Uses instance-level dicts (not contextvars) because tracer handlers run
+sequentially within the same async context in a single session/Tracer.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+
+from opentelemetry import trace
+
+from openjiuwen.extensions.tracer_otel.semconv import (
+    GEN_AI_TOOL_NAME,
+    OJ_TRACE_ID,
+)
+
+
+@dataclass
+class OtelSpanState:
+    """Wraps an OTel span with its context token, invoke_id, and cached start_time."""
+
+    span: trace.Span
+    context_token: object
+    invoke_id: str
+    start_time: datetime | None = None  # cached start_time for elapsed calculation
+    # Reference to the inputs dict from on_pre_invoke. Used by on_invoke /
+    # on_call_done to re-serialize OJ_WORKFLOW_INPUTS after transform callbacks
+    # (e.g. resolve_global_vars_transform) have mutated the inputs in place.
+    # Holds a reference, not a copy, so mutations are visible.
+    inputs: Any | None = None
+    # Track which workflow this span belongs to for cross-workflow isolation.
+    workflow_id: str | None = None
+    # Marks tool spans emitted by OtelRail's tool hooks, as opposed to the
+    # legacy session-tracer decorator's tool event. Used by
+    # OtelAgentSpanManager.has_open_tool_span; deliberately an internal
+    # field, not an exported attribute — gen_ai.tool.call.id is only
+    # written when the model supplied an id, but the dedupe must also
+    # cover id-less tool calls (bug #2046).
+    from_tool_rail: bool = False
+    # P0 perf: cache is_recording() result at construction time.
+    # Non-recording spans (the vast majority under low sample rates) skip
+    # all attribute serialisation and stream buffering.
+    recorded: bool = field(default=True, init=False)
+
+    def __post_init__(self) -> None:
+        self.recorded = self.span.is_recording()
+
+
+class OtelAgentSpanManager:
+    """Manage invoke_id → OtelSpanState for agent handlers.
+
+    Used to establish parent-child relationships: when creating a child
+    span, look up the parent span's invoke_id and use its OTel context
+    as parent context.
+    """
+
+    def __init__(self):
+        self._spans: dict[str, OtelSpanState] = {}
+
+    def push(self, invoke_id: str, state: OtelSpanState) -> None:
+        self._spans[invoke_id] = state
+
+    def pop(self, invoke_id: str) -> OtelSpanState | None:
+        return self._spans.pop(invoke_id, None)
+
+    def get(self, invoke_id: str) -> OtelSpanState | None:
+        return self._spans.get(invoke_id)
+
+    def has_open_tool_span(self, tool_name: str, trace_id: str = "") -> bool:
+        """Whether an OtelRail-emitted tool span is still open.
+
+        Rail emission is identified by the ``from_tool_rail`` span-state
+        flag (set in OtelAgentHandler.on_plugin_start) — not by attribute
+        presence, because ``gen_ai.tool.call.id`` is only written when the
+        model supplied an id while the dedupe must also cover id-less
+        calls. Matching is by ``gen_ai.tool.name`` attribute, not span
+        name — display naming differs across release branches while the
+        attributes do not. Scoping by trace id keeps concurrent agents in
+        different traces from matching each other. Used to drop the
+        decorator's duplicate tool event for the same physical call
+        (bug #2046). ``getattr`` defensively: non-recording spans expose
+        neither ``name`` nor ``attributes``.
+        """
+        for state in list(self._spans.values()):
+            if not state.from_tool_rail:
+                continue
+            attributes = getattr(state.span, "attributes", None) or {}
+            if str(attributes.get(GEN_AI_TOOL_NAME, "")) != tool_name:
+                continue
+            if trace_id and str(attributes.get(OJ_TRACE_ID, "")) != trace_id:
+                continue
+            return True
+        return False
+
+
+class OtelWorkflowSpanManager:
+    """Manage invoke_id → OtelSpanState for workflow handlers plus
+    buffered incremental data.
+
+    Incremental data (on_invoke_data, stream_inputs, stream_outputs) is
+    buffered as lists and flushed as single OTel span events on
+    on_call_done, avoiding many small individual events.
+    """
+
+    def __init__(self):
+        self._spans: dict[str, OtelSpanState] = {}
+        # Buffered incremental data: invoke_id → list
+        self._on_invoke_data: dict[str, list[dict]] = {}
+        self._stream_inputs: dict[str, list] = {}
+        self._stream_outputs: dict[str, list] = {}
+
+    def push(self, invoke_id: str, state: OtelSpanState) -> None:
+        self._spans[invoke_id] = state
+        self._on_invoke_data[invoke_id] = []
+        self._stream_inputs[invoke_id] = []
+        self._stream_outputs[invoke_id] = []
+
+    def pop(self, invoke_id: str) -> OtelSpanState | None:
+        self._on_invoke_data.pop(invoke_id, None)
+        self._stream_inputs.pop(invoke_id, None)
+        self._stream_outputs.pop(invoke_id, None)
+        return self._spans.pop(invoke_id, None)
+
+    def get(self, invoke_id: str) -> OtelSpanState | None:
+        return self._spans.get(invoke_id)
+
+    # --- Incremental data buffers ---
+
+    def append_on_invoke_data(self, invoke_id: str, data: dict) -> None:
+        state = self._spans.get(invoke_id)
+        if state is None or not state.recorded:
+            return
+        buf = self._on_invoke_data.get(invoke_id)
+        if buf is not None:
+            buf.append(data)
+
+    def get_on_invoke_data(self, invoke_id: str) -> list[dict]:
+        return self._on_invoke_data.get(invoke_id, [])
+
+    def append_stream_input(self, invoke_id: str, chunk: dict) -> None:
+        state = self._spans.get(invoke_id)
+        if state is None or not state.recorded:
+            return
+        buf = self._stream_inputs.get(invoke_id)
+        if buf is not None:
+            buf.append(chunk)
+
+    def get_stream_inputs(self, invoke_id: str) -> list:
+        return self._stream_inputs.get(invoke_id, [])
+
+    def append_stream_output(self, invoke_id: str, chunk: dict) -> None:
+        state = self._spans.get(invoke_id)
+        if state is None or not state.recorded:
+            return
+        buf = self._stream_outputs.get(invoke_id)
+        if buf is not None:
+            buf.append(chunk)
+
+    def get_stream_outputs(self, invoke_id: str) -> list:
+        return self._stream_outputs.get(invoke_id, [])

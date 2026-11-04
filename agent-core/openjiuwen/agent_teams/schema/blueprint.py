@@ -1,0 +1,1132 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Team-level specifications for constructing and configuring AgentTeams.
+
+DeepAgent-scoped specs live in ``deep_agent_spec``.  This module
+re-exports them so existing ``from …blueprint import DeepAgentSpec``
+keeps working.
+"""
+
+from __future__ import annotations
+
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    Optional,
+    Union,
+)
+
+from pydantic import (
+    BaseModel,
+    Field,
+    model_validator,
+)
+
+from openjiuwen.agent_teams.constants import (
+    DEFAULT_LEADER_MEMBER_NAME,
+    RESERVED_MEMBER_NAMES,
+)
+from openjiuwen.agent_teams.i18n import t
+from openjiuwen.agent_teams.memory import TeamMemoryConfig
+from openjiuwen.agent_teams.models.pool import (
+    IntelliRouterConfig,
+    ModelPoolEntry,
+    ModelRouterConfig,
+)
+from openjiuwen.agent_teams.reliability.config import ReliabilityConfig
+from openjiuwen.agent_teams.schema.deep_agent_spec import DeepAgentSpec
+from openjiuwen.agent_teams.schema.team import (
+    BridgeMemberSpec,
+    ExternalCliAgentSpec,
+    ExternalCliMemberSpec,
+    MemberSpecBase,
+    TeamLifecycle,
+    TeamMemberSpec,
+    TeamRole,
+    TeamRuntimeContext,
+    TeamSpec,
+)
+from openjiuwen.agent_teams.team_workspace.models import TeamWorkspaceConfig
+from openjiuwen.agent_teams.workflow.concurrency import ConcurrencyLimits, validate_swarmflow_concurrency
+from openjiuwen.core.single_agent.schema.agent_card import AgentCard
+from openjiuwen.harness.tools.worktree import WorktreeConfig
+
+if TYPE_CHECKING:
+    # Resolved for type-checkers only; the runtime import lives in ``build()``
+    # below to sidestep the blueprint <-> team_agent module import cycle.
+    from openjiuwen.agent_teams.agent.team_agent import TeamAgent
+
+# ---------------------------------------------------------------------------
+# Transport / Storage registries (pluggable team infrastructure)
+# ---------------------------------------------------------------------------
+
+_TRANSPORT_REGISTRY: dict[str, type[BaseModel]] = {}
+_STORAGE_REGISTRY: dict[str, type[BaseModel]] = {}
+
+
+def register_transport(name: str, cls: type[BaseModel]) -> None:
+    """Register a transport config class for use in TransportSpec."""
+    _TRANSPORT_REGISTRY[name] = cls
+
+
+def register_storage(name: str, cls: type[BaseModel]) -> None:
+    """Register a storage config class for use in StorageSpec."""
+    _STORAGE_REGISTRY[name] = cls
+
+
+def _ensure_builtin_infra_registered() -> None:
+    """Lazily populate transport/storage registries with built-in types."""
+    if not _TRANSPORT_REGISTRY:
+        from openjiuwen.agent_teams.messager.base import MessagerTransportConfig
+
+        _TRANSPORT_REGISTRY["inprocess"] = MessagerTransportConfig
+        _TRANSPORT_REGISTRY["pyzmq"] = MessagerTransportConfig
+        _TRANSPORT_REGISTRY["hybrid"] = MessagerTransportConfig
+
+    if not _STORAGE_REGISTRY:
+        from openjiuwen.agent_teams.tools.database import DatabaseConfig
+
+        _STORAGE_REGISTRY["sqlite"] = DatabaseConfig
+        _STORAGE_REGISTRY["postgresql"] = DatabaseConfig
+        _STORAGE_REGISTRY["mysql"] = DatabaseConfig
+        # "memory" is an alias for a :memory: SQLite db (DatabaseConfig
+        # normalises db_type="memory" -> sqlite + connection_string=":memory:").
+        _STORAGE_REGISTRY["memory"] = DatabaseConfig
+
+
+class TransportSpec(BaseModel):
+    """Pluggable transport layer specification.
+
+    Resolved via registry: built-in types include "inprocess" and "pyzmq".
+    Register custom transports with ``register_transport()``.
+    """
+
+    type: str
+    params: dict[str, Any] = {}
+
+    def build(self) -> BaseModel:
+        _ensure_builtin_infra_registered()
+        config_cls = _TRANSPORT_REGISTRY.get(self.type)
+        if config_cls is None:
+            raise ValueError(f"Unknown transport type '{self.type}'. Registered types: {list(_TRANSPORT_REGISTRY)}")
+        merged = {"backend": self.type, **self.params}
+        return config_cls.model_validate(merged)
+
+
+class StorageSpec(BaseModel):
+    """Pluggable storage layer specification.
+
+    Resolved via registry: built-in type is "sqlite".
+    Register custom storage backends with ``register_storage()``.
+    """
+
+    type: str
+    params: dict[str, Any] = {}
+
+    def build(self) -> BaseModel:
+        _ensure_builtin_infra_registered()
+        config_cls = _STORAGE_REGISTRY.get(self.type)
+        if config_cls is None:
+            raise ValueError(f"Unknown storage type '{self.type}'. Registered types: {list(_STORAGE_REGISTRY)}")
+        merged = {"db_type": self.type, **self.params}
+        return config_cls.model_validate(merged)
+
+
+# ---------------------------------------------------------------------------
+# Predefined member union
+# ---------------------------------------------------------------------------
+#
+# ``predefined_members`` entries dispatch on ``role_type``: bridge entries
+# carry extra fields (mailbox_inject_mode / protocol / adapter_config), so
+# the spec layer needs to materialize ``BridgeMemberSpec`` rather than the
+# base ``TeamMemberSpec`` for those rows. Pydantic v2's discriminated union
+# does the dispatch when both arms declare the discriminator as ``Literal``
+# (already wired in ``schema/team.py``).
+PredefinedMemberSpec = Annotated[
+    Union[BridgeMemberSpec, ExternalCliMemberSpec, TeamMemberSpec],
+    Field(discriminator="role_type"),
+]
+
+
+# ---------------------------------------------------------------------------
+# TeamAgentSpec
+# ---------------------------------------------------------------------------
+
+
+class LeaderSpec(MemberSpecBase):
+    """Leader identity specification.
+
+    Shares the ``desc`` (public) / ``prompt`` (private) split with every other
+    member via :class:`MemberSpecBase`. The leader's ``prompt`` — its private
+    system prompt — is fixed at build time and, unlike a teammate, is never
+    regenerated after ``build_team``, keeping the leader's system-prompt prefix
+    KV-cache stable.
+
+    Overrides ``model_name``'s docstring only to note the ``build()``-time
+    (rather than ``build_team``-time) allocation; the field itself is inherited.
+    """
+
+    member_name: str = "team_leader"
+    display_name: str = "Team Leader"
+    desc: str = Field(default_factory=lambda: t("blueprint.default_desc"))
+
+
+class TinyAgentSpec(BaseModel):
+    """Team-scoped tiny-agent specification (one per name, held by TeamInfra).
+
+    A team may declare several independent tiny agents in
+    ``TeamAgentSpec.tiny_agents``; each is lazily built on first access and
+    disposed when the team stops. A tiny agent carries only a system prompt +
+    model (resolved from ``model_name`` against the team model pool) and,
+    optionally, a default output schema — no tools beyond structured output.
+    """
+
+    model_config = {"protected_namespaces": ()}
+
+    system_prompt: str
+    model_name: str
+    name: str = "tiny"
+    max_iterations: int = 6
+    enable_security_rail: bool = False
+    default_schema: Optional[dict[str, Any]] = None
+    """Optional default JSON-Schema applied to structured output on every call."""
+
+
+class TeamAgentSpec(BaseModel):
+    """Fully JSON-serializable specification for constructing a TeamAgent.
+
+    Composes per-role DeepAgentSpecs with team-level configuration.
+    The ``agents`` dict keys correspond to TeamRole values ("leader", "teammate").
+    """
+
+    model_config = {"protected_namespaces": ()}
+
+    agents: dict[str, DeepAgentSpec]
+    reviewer_agent: DeepAgentSpec | None = None
+    """Base spec for the one-shot reviewers spawned per review round.
+
+    Under scheduled dispatch a task's reviewers run as temporary harnesses that
+    only inspect a deliverable and cast a vote, so they should carry a narrow,
+    read-only capability set rather than a teammate's full one. The host that
+    assembles member capabilities builds this spec. ``None`` falls back to the
+    teammate spec with the framework-level trimming the scheduler applies
+    (read-only file tools, no todo planning, no sub-agents).
+
+    Kept out of ``agents`` on purpose: that dict is also looked up by member
+    name, so a reserved ``"reviewer"`` key would collide with a member of that
+    name.
+    """
+    team_name: str = "agent_team"
+    lifecycle: str = TeamLifecycle.TEMPORARY
+    evolution_enabled: bool = True
+    """Team switch for self-evolution coverage.
+
+    ``True`` (default): workspace files with an evolved value override code
+    defaults / DB values. ``False``: files are never applied — everything
+    falls back to code defaults / DB values.
+    """
+    enable_team_plan: bool = False
+    """Whether the leader starts in single-agent plan mode for this run.
+
+    This is a request/spec-level switch, not a YAML configuration entry.
+    ``teammate_mode`` remains the single switch that controls whether
+    members submit per-task plans to the leader.
+    """
+    teammate_mode: str = "build_mode"
+    """Member execution mode: ``build_mode`` or ``plan_mode``."""
+    spawn_mode: str = "process"
+    member_workspace_prefix: bool = True
+    """Dynamic-only switch for member workspace isolation (block C).
+
+    When True, dynamic member real directories live at
+    ``.agent_teams/<team>#<member>/`` (per-team isolation). When False they
+    share the plain ``.agent_teams/<member>/`` shape (same as predefined).
+    The in-team link name is unaffected — it stays
+    ``workspaces/<member>_workspace`` either way, so A/B code and the worker
+    path never notice the switch.
+    """
+    leader: LeaderSpec = LeaderSpec()
+    predefined_members: list[PredefinedMemberSpec] = []
+    agent_group_name: Optional[str] = None
+    """Name of the AgentGroup this team was assembled from, if any.
+
+    Set by the host that seeds ``predefined_members`` / ``agents[<member>]``
+    from an AgentGroup package. ``spawn_expert`` uses it to spawn further
+    instances of a bound member from the team's own assembled spec (its
+    ``agents[<member>].agent_template_spec`` and predefined persona) instead
+    of re-reading the package from disk.
+    """
+    external_cli_agents: list[ExternalCliAgentSpec] = []
+    """Static launch configs for external CLI agents (claudecode / codex / ...).
+
+    Each entry pre-declares how to launch one CLI kind and whether to
+    auto-inject the team MCP server. The runtime
+    ``spawn_member(role_type='external_cli', cli_agent=<name>)`` references an
+    entry by its ``cli_agent`` name, so the spawn call carries only the role
+    type and the CLI identifier — all launch knowledge stays here. A
+    ``cli_agent`` not declared here is rejected at spawn time (the non-empty
+    set is the capability ceiling for external-CLI members).
+    """
+    tiny_agents: dict[str, TinyAgentSpec] = {}
+    """Team-scoped tiny agents, keyed by logical name.
+
+    Each entry is an independent invisible member (system prompt + model only,
+    no team-collaboration tools), lazily built on first ``TeamAgent.get_tiny_agent``
+    access and disposed when the team stops. Not persisted to the team DB.
+    """
+    model_pool: list[ModelPoolEntry] = []
+    """Optional pool of LLM endpoints shared by every team member.
+
+    When non-empty, ``ModelAllocator`` distributes pool entries across
+    leader and teammates (round-robin by default) so concurrent calls
+    spread across endpoints instead of saturating a single one. When
+    empty (default), members fall back to the per-agent ``model`` declared
+    in ``agents`` and behavior is unchanged. Propagated to ``TeamSpec``
+    at ``build()`` time so allocators reachable from runtime context
+    see the same pool.
+
+    Mutually exclusive with ``model_router`` and ``model_intelli_router``:
+    configure at most one of the three.
+    """
+    model_router: Optional[ModelRouterConfig] = None
+    """Optional single-endpoint router configuration.
+
+    Convenience input for backends that serve many model names through
+    one ``(api_key, api_base_url, api_provider)`` triple (OpenRouter,
+    LiteLLM proxy, ...). At ``build()`` time the router is expanded into
+    ``TeamSpec.model_pool`` (one entry per declared name) and
+    ``model_pool_strategy`` is set to ``"router"``, so all downstream
+    machinery (``resolve_member_model``, ``inherit_pool_ids``,
+    ``update_model_pool``) keeps working against the flat pool view.
+
+    Mutually exclusive with ``model_pool`` and ``model_intelli_router``.
+    The first declared model name acts as the team's default —
+    ``RouterAllocator.allocate()`` with no hint returns it, so the
+    leader can run without an explicit ``leader.model_name``.
+    """
+    model_intelli_router: Optional[IntelliRouterConfig] = None
+    """Optional client-side reliable-router configuration.
+
+    Use this when reliability should come from the *client* rather than
+    from spreading members across endpoints: ``IntelliRouterModelClient``
+    wraps ``intelli_router.ReliableRouter``, which retries and fails over
+    across the declared deployments on every request, honouring per-
+    deployment tpm / rpm budgets and (optionally) health checks.
+
+    At ``build()`` time the config expands into ``TeamSpec.model_pool``
+    (one logical ``"*"`` entry carrying the full deployment list) and
+    ``model_pool_strategy`` is set to ``"intelli_router"``, so
+    all downstream machinery (``resolve_member_model``,
+    ``inherit_pool_ids``, ``update_model_pool``) keeps working against
+    the flat pool view.
+
+    Mutually exclusive with ``model_pool`` and ``model_router``. The
+    The sole logical model name is ``"*"`` (unified routing), so a leader
+    without an explicit ``leader.model_name`` gets the broadest failover.
+    """
+    model_pool_strategy: Literal["round_robin", "by_model_name", "router", "intelli_router"] = "round_robin"
+    """Allocation strategy applied to ``model_pool``.
+
+    Mirrors ``TeamSpec.model_pool_strategy`` and propagates to it at
+    ``build()`` time. See ``TeamSpec.model_pool_strategy`` for the
+    semantics of each option. When ``model_router`` or
+    ``model_intelli_router`` is set, ``build()`` forces this to
+    ``"router"`` / ``"intelli_router"`` respectively, regardless of the
+    configured value.
+    """
+    team_mode: Literal["default", "predefined", "hybrid"] | None = None
+    """Team operating mode.
+
+    ``None`` (default) derives the mode automatically: "hybrid" when
+    ``predefined_members`` has non-human members, "default" otherwise.
+    "hybrid" keeps the predefined roster while still allowing
+    ``spawn_member`` calls during execution. Set explicitly to
+    "predefined" to lock the roster and drop the leader's
+    ``spawn_member`` tool.
+    """
+    dispatch_mode: Literal["autonomous", "scheduled"] = "autonomous"
+    """How a task reaches the member that executes it. Static configuration.
+
+    Orthogonal to ``team_mode`` (which governs whether the roster can
+    grow). ``"autonomous"`` (default) puts tasks on a shared board:
+    members claim what matches their expertise, and the leader launches
+    them with a ``send_message`` broadcast. ``"scheduled"`` has the
+    leader assign every task to a named member up front; the scheduling
+    runtime (``agent/scheduling``, F_62) starts each task and performs
+    every handoff — start, review dispatch, rework, verified — as
+    leader-identity mailbox messages, and members lose ``claim_task``
+    in favour of ``member_complete_task``. Prompts and tool shapes are
+    assembled per mode at build time; the mode never changes at runtime.
+    """
+    enable_task_verification: bool = False
+    """Team-level "verification expected" switch for the verify gate.
+
+    Purely prompt-driven: when True the leader's task-creation guidance
+    asks it to assign 0..N reviewers per task by its own judgement (no
+    hard validation — a task the leader deems trivial may still carry no
+    reviewer). The reviewer machinery itself (column, guards, voting) is
+    always available regardless of this flag. Overridable per team
+    instance at ``build_team`` time. See F_62.
+    """
+    enable_member_messaging: bool = False
+    """Let scheduled-dispatch members message each other directly.
+
+    Scheduled dispatch narrows a member's ``send_message`` to the leader and
+    the user, so the leader routes every exchange. When True, members keep
+    the full reach an autonomous member has — point-to-point, multicast and
+    broadcast to peers — while ``"leader"`` stays a valid role recipient.
+    Prompts and the tool description follow the same flag. Static
+    configuration; ignored under ``dispatch_mode="autonomous"``, where
+    members already reach each other. See F_126.
+    """
+    max_subtask_depth: int = Field(default=0, ge=0)
+    """Let scheduled-dispatch members split their task into subtasks.
+
+    ``0`` (default) keeps ``create_task`` leader-only. A positive value gives
+    scheduled members a ``create_task`` that parks their executing task at
+    ``BLOCKED`` until the new subtasks finish, and caps how deep subtasks may
+    nest (a leader task is depth 0, its subtasks depth 1, ...). Static
+    configuration, no ``build_team`` override; ignored under
+    ``dispatch_mode="autonomous"``. See F_128.
+    """
+    bootstrap_mode: Literal["leader", "framework"] = "leader"
+    """Who materializes the team row, and how the leader receives its policy.
+
+    ``"leader"`` (default): the leader calls the ``build_team`` tool, which
+    creates the team and discloses the collaboration policy in its result
+    (F_76). ``"framework"``: the leader's coordination kernel builds the team
+    itself on ``start()`` when no team row exists yet, the leader's tool set
+    carries no ``build_team``, and the policy reaches the leader through the
+    ``TeamContextTracker`` as a ``<team-policy>`` block ahead of its first
+    input. Only valid together with ``dispatch_mode="scheduled"`` — the
+    task-driven handoffs are what make a pre-built, memberless team usable.
+    See F_122.
+    """
+    team_display_name: str | None = None
+    """Team label written to the team row by a framework bootstrap.
+
+    ``None`` falls back to the generic i18n default (per ``language``).
+    Ignored under ``bootstrap_mode="leader"``, where the leader names the
+    team in its ``build_team`` call.
+    """
+    team_desc: str | None = None
+    """Team description written to the team row by a framework bootstrap.
+
+    Lands in ``team_card.md`` and in the team info every member reads.
+    ``None`` falls back to the generic i18n default (per ``language``).
+    Ignored under ``bootstrap_mode="leader"``.
+    """
+    default_max_review_rounds: int = 3
+    """Default per-task review-round ceiling (scheduled dispatch).
+
+    Used when a task does not set ``max_review_rounds`` at creation.
+    When a review round beyond this ceiling still fails, the scheduler
+    stops the automatic rework loop and escalates to the leader instead.
+    See F_62.
+    """
+    review_stall_timeout: int = 2400
+    """Seconds before a stalled review round escalates to the leader.
+
+    A round that produced no verdict (including no votes at all) within
+    this window is surfaced to the leader with the current vote status —
+    covering reviewers that never vote, which the round ceiling alone
+    cannot catch. Consumed only by the leader-side scheduler. See F_62.
+    """
+    stale_claim_idle_timeout: int = 600
+    """Autonomous dispatch: seconds a member may sit idle holding active work.
+
+    A member that stays runtime-IDLE this long while still owning a
+    ``PLANNING`` / ``IN_PROGRESS`` task gets a nudge fed back into its own
+    loop to keep pushing; if consecutive windows keep finding it idle the
+    stall is escalated to the leader, who can reassign or intervene.
+    Measured off the member's process-local idle clock
+    (``TeamAgentState.idle_since``), never DB ``updated_at`` — see F_65.
+    Ignored under scheduled dispatch. See F_65.
+    """
+    stale_pending_idle_timeout: int = 600
+    """Autonomous dispatch: seconds the leader may sit idle on unclaimed work.
+
+    Once the leader has been runtime-IDLE this long while unassigned
+    ``PENDING`` tasks exist *and* at least one non-leader member is READY,
+    it self-prompts to assign them — the free-member precondition keeps the
+    prompt away from a team whose members are simply all busy. Measured off
+    the leader's process-local idle clock, never DB ``updated_at``.
+    Ignored under scheduled dispatch. See F_65.
+    """
+    steer_batch_size: int = 2
+    """How many queued steering inputs a non-leader member takes per model call.
+
+    Mailbox messages reach a running member one queue entry each, so a member
+    coming back from a busy stretch used to get the whole pile fused into one
+    turn. This caps the batch; the rest stays queued and arrives at the
+    following model calls, in order. The leader is exempt — it reads the
+    sequence of task-board snapshots to decide whether to re-plan, so it must
+    keep seeing all of it. See F_78.
+    """
+    transport: Optional[TransportSpec] = None
+    """Pluggable transport layer specification.
+
+    When unset, the framework picks a sensible default based on
+    ``spawn_mode``: ``"inprocess"`` spawn implies an in-process messager,
+    so ``transport`` is materialized as ``TransportSpec(type="inprocess")``
+    during validation; ``"process"`` spawn keeps ``None`` and forces the
+    caller to configure a cross-process backend (e.g. ``"pyzmq"``) when
+    teammates are involved.
+    """
+    external_transport: Optional[TransportSpec] = None
+    """Optional transport used by external CLI MCP clients."""
+    storage: Optional[StorageSpec] = None
+    worktree: Optional[WorktreeConfig] = None
+    """Optional worktree isolation config for team members."""
+    workspace: Optional[TeamWorkspaceConfig] = None
+    """Optional shared workspace config for team members."""
+    metadata: dict[str, Any] = {}
+    enable_hitt: bool = False
+    """Spec-level Human-in-the-Team capability ceiling.
+
+    True opens the capability — the framework will register every
+    HUMAN_AGENT member declared in ``predefined_members`` during
+    ``build_team``, and the leader's ``spawn_member`` tool may
+    additionally bring up new human members at runtime via
+    ``role_type='human_agent'``. False forbids both paths.
+
+    The framework does **not** inject any default ``human_agent``
+    when this flag is True — callers must declare the human roster
+    explicitly via ``predefined_members`` (or rely on dynamic
+    ``spawn_member`` after build).
+
+    Consistency check (``build()`` time):
+    - ``enable_hitt=False`` with any HUMAN_AGENT in predefined → error.
+    - ``enable_hitt=True`` with no HUMAN_AGENT predefined → allowed
+      (dynamic spawn path).
+
+    The ``build_team`` tool exposes its own ``enable_hitt`` parameter
+    that gates the runtime instance: it may downgrade an open ceiling
+    to disabled, but cannot exceed it.
+    """
+    expose_human_agents_to_teammates: bool = False
+    """Whether to expose the concrete human_agent roster to teammate
+    prompts.
+
+    False (default, fail-safe): teammates receive a short HITT section
+    that **does not list** any human_agent ``member_name`` and does
+    not say "real humans". It only carries the role-neutral guidance
+    relevant to working with possibly-asynchronous peers (always use
+    ``send_message`` for cross-member contact, tolerate response
+    latency, do not infer peer identity). This keeps peer role
+    (teammate vs human_agent) hidden from other members' system
+    prompts.
+
+    True: teammates receive the legacy HITT section that lists every
+    registered human_agent ``member_name`` inline with a "real humans"
+    label. Use this only when the deploying team explicitly wants
+    every teammate to know which peers are human-driven (e.g.
+    internal collaboration where role transparency is desired).
+
+    Has no effect on LEADER or HUMAN_AGENT prompts: leader always
+    sees the full roster (it owns spawn / approval flows); a
+    human_agent always sees the roster (it includes itself).
+    """
+    enable_bridge: bool = False
+    """Spec-level Bridge-Agent capability ceiling.
+
+    True opens the capability — the framework will register every
+    BRIDGE_AGENT member declared in ``predefined_members`` during
+    ``build_team``, and the leader's ``spawn_member`` tool may
+    additionally bring up new bridge members at runtime via
+    ``role_type='bridge_agent'``. False forbids both paths.
+
+    Bridge agents are full local teammates paired with a remote
+    independent agent reachable through a pure-text protocol. The
+    framework auto-forwards inbound mailbox messages to the remote
+    via ``BridgeProtocolAdapter.relay`` and composes the original
+    body with the remote's reply into the bridge avatar's context.
+    See ``BridgeMemberSpec`` for per-member configuration.
+
+    Consistency check (``build()`` time):
+    - ``enable_bridge=False`` with any BRIDGE_AGENT in predefined → error.
+    - ``enable_bridge=True`` with no BRIDGE_AGENT predefined → allowed
+      (dynamic spawn path).
+    """
+    enable_fork: bool = False
+    """Spec-level capability gate for context inheritance (fork).
+
+    True opens three surfaces at once, all keyed off this one flag:
+
+    - the ``checkpoint(name)`` tool, which lets any member save a named
+      snapshot of its own conversation position;
+    - the ``fork`` / ``fork_source`` / ``compact`` properties on
+      ``spawn_teammate``'s schema;
+    - the "context inheritance" section of ``spawn_teammate``'s description.
+
+    False (default) removes all three. Schema and prose are gated on the same
+    signal deliberately: a leader that reads about ``fork`` but has no
+    ``fork`` property to fill deliberates over a mechanism it cannot invoke,
+    which is worse than never mentioning it.
+
+    Fork only takes effect under ``spawn_mode="inprocess"`` — it injects the
+    source member's live message list into the new member's context engine,
+    which requires both to share a process. Under ``spawn_mode="process"``
+    the captured context cannot cross the boundary and is dropped. For the
+    same reason ``fork_source`` must name a member the caller hosts
+    in-process (the leader itself, or a teammate it spawned).
+    """
+    enable_swarmflow: bool = False
+    """Spec-level capability gate for swarmflow orchestration.
+
+    True wires the ``swarmflow(script_path, args)`` tool on the leader AND on
+    every in-process teammate that received the shared team handles (the tool
+    factory drops the name again for members without them — subprocess /
+    external CLI). The tool runs a swarmflow script (a multi-agent workflow)
+    in the background. The script's ``agent()`` calls execute as single-shot
+    ``WORKER`` members via the team worker backend, and phase progress is
+    streamed back on the team topic: the leader (a spectator) narrates it to
+    the user, a teammate owner reports its run's result back to the
+    leader. False (default) hides the tool everywhere. Evolution direction:
+    this switch is meant to default-on and eventually disappear once teammate
+    orchestration is fully proven — do not add a second member-level switch.
+    See ``openjiuwen/agent_teams/workflow``.
+    """
+    swarmflow_concurrency: ConcurrencyLimits = Field(default_factory=ConcurrencyLimits)
+    """Three-layer Swarmflow concurrency caps (L1/L2/L3). Used when ``enable_swarmflow``."""
+
+    swarmflow_budget: Optional[int] = None
+    """Token ceiling for this leader's Swarmflow runs; ``None`` (default) is unbounded.
+
+    A hard ceiling, not a hint: workers report the token usage their model
+    client returns, and once the ceiling is reached the in-flight ones are cut
+    short at their next model call and no further ``agent()`` starts. Scripts
+    read it as ``budget.total`` and poll ``budget.remaining()`` to wind down on
+    their own before the cut.
+
+    It is deliberately *not* a ``swarmflow()`` tool argument: a spend limit is
+    the operator's call, not something the leader should pick per invocation.
+    Counted per leader across all its runs (matching ``budget``'s documented
+    "shared across the main loop and all workflows" semantics), so concurrent
+    runs draw down one pool rather than getting a ceiling each.
+    """
+
+    progressive_tool: bool = False
+    """Opt swarmflow worker avatars into progressive tool exposure.
+
+    True writes ``ProgressiveToolSpec(enabled=True)`` into the worker base spec
+    so each worker mounts the harness ``ProgressiveToolRail`` (``tool_search``
+    meta-tool + deferred tools). Team-level and independent of the single-agent
+    global ``progressive_tool_enabled`` switch: the two member kinds expose
+    different tool surfaces, so one deployment may want them set differently.
+    Only meaningful when ``enable_swarmflow`` is True; ignored otherwise.
+    """
+
+    enable_permissions: bool = False
+    """Team-specific permission control."""
+
+    enable_organization: bool = True
+    """Spec-level gate for organization tool mounting.
+
+    True mounts org control tools on the leader and rehydrates existing
+    organization bindings. False skips both, so the leader sees no
+    organization tools at all. Default True preserves standalone library
+    behavior; hosts map their own switch to this field, JiuwenSwarm maps
+    its experimental team organization toggle.
+    """
+
+    language: Optional[str] = None
+    """Preferred language for prompts and tool descriptions ("cn" or "en").
+
+    Propagated to every per-role ``DeepAgentSpec`` (when the role spec does
+    not set its own language) and recorded on ``TeamSpec`` so team tools
+    can pick up the same locale.  Resolved to the nearest supported language
+    at ``build()`` time via ``resolve_language()``.
+    """
+
+    build_context: Optional[Any] = Field(
+        default=None,
+        exclude=True,
+    )
+    """Optional runtime carrier for provider-based capability assembly.
+
+    Holds a ``BuildContext`` subclass with live, non-serializable handles
+    (excluded from JSON). ``setup_agent`` derives a per-member view from it to
+    thread into ``DeepAgentSpec.build``.
+    Typed as ``Any`` so Pydantic does not attempt to build a schema for the
+    opaque carrier. Across a serialization boundary it is rebuilt from
+    ``build_context_seed`` via ``materialize_build_context`` rather than relying
+    on in-process survival.
+    """
+
+    build_context_seed: Optional[dict[str, Any]] = Field(default=None)
+    """Serializable seed used to rebuild ``build_context`` after deserialization.
+
+    Unlike ``build_context`` this travels with ``model_dump`` / ``model_validate``.
+    The platform fills it (a plain mapping of primitives) alongside
+    ``build_context``; the receiving side calls ``materialize_build_context`` to
+    turn it back into a live ``BuildContext`` through the registered factory
+    (``register_build_context_factory``).
+    """
+
+    memory: Optional[TeamMemoryConfig] = None
+    """Optional team memory configuration. When enabled, TeamMemoryManager
+    replaces default MemoryRail/CodingMemoryRail with per-member isolated instances."""
+
+    reliability: Optional[ReliabilityConfig] = None
+    """Optional team reliability framework configuration. Opt-in via
+    ``reliability.enabled``; attaches a monitoring rail to the configured roles
+    and a remediation handler on the leader."""
+
+    """
+    Signature: ``(deep_agent: DeepAgent) -> None``.
+    Used by platform adapters to inject additional rails / tools.
+    Not serializable — only usable with in-process spawn mode.
+    """
+
+    def materialize_build_context(self) -> None:
+        """Rebuild ``build_context`` from ``build_context_seed`` when missing.
+
+        Idempotent: acts only when ``build_context`` is None and a seed is
+        present, so the in-process path (live context already set) and the
+        legacy path (no seed) are both untouched. Called on the
+        receiving side of a serialization boundary (``from_spawn_payload`` /
+        ``recover_from_session``) before ``configure`` so provider-based members
+        rebuild their capabilities declaratively from the registered factory.
+        """
+        if self.build_context is not None or not self.build_context_seed:
+            return
+        from openjiuwen.agent_teams.schema.build_context import build_context_from_seed
+
+        self.build_context = build_context_from_seed(self.build_context_seed)
+
+    @model_validator(mode="after")
+    def _validate_pool_router_exclusive(self) -> "TeamAgentSpec":
+        """Reject configs that set more than one model-pool source.
+
+        ``model_pool`` / ``model_router`` / ``model_intelli_router``
+        describe overlapping concerns — a flat list of endpoints versus
+        two router-shaped declarations that each expand into the same
+        kind of list. Allowing more than one leaves both the strategy
+        and the materialized pool ambiguous, so we surface the conflict
+        early instead of silently picking one.
+        """
+        candidates = (
+            ("model_pool", bool(self.model_pool)),
+            ("model_router", self.model_router is not None),
+            ("model_intelli_router", self.model_intelli_router is not None),
+        )
+        configured = [name for name, value in candidates if value]
+        if len(configured) > 1:
+            raise ValueError(
+                f"model_pool, model_router and model_intelli_router are mutually exclusive; "
+                f"configure exactly one (got: {configured})",
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_external_cli_unique(self) -> "TeamAgentSpec":
+        """Reject duplicate ``cli_agent`` names in ``external_cli_agents``.
+
+        Entries are resolved by ``cli_agent`` name at spawn time, so a
+        duplicate would silently shadow an earlier config. Surface the
+        collision while the caller is still looking at the spec.
+        """
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for cfg in self.external_cli_agents:
+            if cfg.cli_agent in seen:
+                duplicates.add(cfg.cli_agent)
+            seen.add(cfg.cli_agent)
+        if duplicates:
+            raise ValueError(
+                f"external_cli_agents has duplicate cli_agent name(s) {sorted(duplicates)}; "
+                f"declare each CLI kind at most once",
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_review_settings(self) -> "TeamAgentSpec":
+        """Range-check the verify-gate knobs (F_62).
+
+        The scheduler consumes these without further guarding, so an
+        out-of-range value must fail at spec time, not mid-run.
+        """
+        if self.default_max_review_rounds < 1:
+            raise ValueError(
+                f"default_max_review_rounds must be >= 1, got {self.default_max_review_rounds}",
+            )
+        if self.review_stall_timeout <= 0:
+            raise ValueError(
+                f"review_stall_timeout must be > 0 seconds, got {self.review_stall_timeout}",
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_stall_settings(self) -> "TeamAgentSpec":
+        """Range-check the autonomous stall-nudge thresholds (F_65).
+
+        The stale-task sweep consumes these as-is, so a non-positive window
+        must fail at spec time rather than turn every poll into a nudge.
+        """
+        if self.stale_claim_idle_timeout <= 0:
+            raise ValueError(
+                f"stale_claim_idle_timeout must be > 0 seconds, got {self.stale_claim_idle_timeout}",
+            )
+        if self.stale_pending_idle_timeout <= 0:
+            raise ValueError(
+                f"stale_pending_idle_timeout must be > 0 seconds, got {self.stale_pending_idle_timeout}",
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_bootstrap_mode(self) -> "TeamAgentSpec":
+        """Reject a framework bootstrap outside scheduled dispatch (F_122).
+
+        A framework-built team starts with no members; only the scheduling
+        runtime turns ``create_task`` into member handoffs, so under
+        autonomous dispatch the pre-built team would sit idle while its
+        leader lacks the ``build_team`` call that normally hands it the
+        policy. Failing here keeps that combination from ever being built.
+        """
+        if self.bootstrap_mode == "framework" and self.dispatch_mode != "scheduled":
+            raise ValueError(
+                "bootstrap_mode='framework' requires dispatch_mode='scheduled'; "
+                f"got dispatch_mode={self.dispatch_mode!r}",
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_steer_batch_size(self) -> "TeamAgentSpec":
+        """Reject a steering batch that would consume nothing (F_78).
+
+        A member always takes at least one queued message, so a zero here
+        would not stall anything — it would silently mean "one", which is a
+        worse thing to configure by accident than an outright error.
+        """
+        if self.steer_batch_size <= 0:
+            raise ValueError(
+                f"steer_batch_size must be > 0 messages, got {self.steer_batch_size}",
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _default_transport_for_spawn_mode(self) -> "TeamAgentSpec":
+        """Fill an in-process transport default when spawn_mode='inprocess'.
+
+        ``spawn_mode='inprocess'`` co-locates teammates in the leader's
+        event loop, so the only transport that makes sense is the
+        in-process messager. Materializing the default here (rather than
+        inside ``build()``) keeps the spec self-describing: a dumped spec
+        always carries the transport that will actually be used, which
+        matters for cross-process spawn payloads and for callers that
+        introspect the spec without building it.
+
+        Cross-process spawn (``"process"``) intentionally keeps
+        ``transport=None`` so the caller is forced to configure a real
+        cross-process backend (e.g. ``"pyzmq"``) when teammates are
+        involved.
+        """
+        if self.transport is None and self.spawn_mode == "inprocess":
+            self.transport = TransportSpec(type="inprocess")
+        return self
+
+    def resolve_db_config(self):
+        """Resolve the DatabaseConfig this spec would use at build time.
+
+        Mirrors the materialisation step inside ``build()`` so callers that
+        only need the storage handle (e.g. the runtime manager probing the
+        static team table before deciding the run path) can obtain the same
+        config without constructing a TeamAgent.
+        """
+        from openjiuwen.agent_teams.tools.database import DatabaseConfig as _DatabaseConfig
+
+        db_config = self.storage.build() if self.storage else _DatabaseConfig()
+        if db_config.db_type == "sqlite" and not db_config.connection_string:
+            from openjiuwen.agent_teams.paths import get_agent_teams_home
+
+            db_config.connection_string = str(get_agent_teams_home() / "team.db")
+        return db_config
+
+    def build(self, *, conversation_mode: Literal["team", "group_chat"] = "team") -> "TeamAgent":
+        """Materialize a configured TeamAgent from this spec."""
+        from openjiuwen.agent_teams.agent.team_agent import TeamAgent as _TeamAgent
+        from openjiuwen.harness.prompts import resolve_language
+
+        leader_agent = self.agents.get("leader")
+        if leader_agent is None:
+            raise ValueError("agents dict must contain a 'leader' key")
+
+        self._validate_reserved_names()
+        self._validate_hitt_consistency()
+        self._validate_bridge_consistency()
+        if self.enable_swarmflow:
+            validate_swarmflow_concurrency(self.swarmflow_concurrency)
+            self._validate_swarmflow_budget()
+
+        resolved_language = resolve_language(self.language)
+        for role_spec in self.agents.values():
+            if role_spec.language is None:
+                role_spec.language = resolved_language
+
+        # ``model_router`` / ``model_intelli_router`` are convenience
+        # inputs that expand into the flat ``model_pool`` view at build
+        # time. Doing the expansion here keeps every downstream component
+        # (resolver, pool refresh, DB ref lookup) on a single code path —
+        # they only ever see entries.
+        team_strategy: Literal["round_robin", "by_model_name", "router", "intelli_router"]
+        if self.model_router is not None:
+            team_pool = self.model_router.to_pool_entries()
+            team_strategy = "router"
+        elif self.model_intelli_router is not None:
+            team_pool = self.model_intelli_router.to_pool_entries()
+            team_strategy = "intelli_router"
+        else:
+            team_pool = list(self.model_pool)
+            team_strategy = self.model_pool_strategy
+
+        external_messager_config = self.external_transport.build() if self.external_transport else None
+        team_spec = TeamSpec(
+            team_name=self.team_name,
+            display_name=self.team_name,
+            conversation_mode=conversation_mode,
+            leader_member_name=self.leader.member_name,
+            language=resolved_language,
+            dispatch_mode=self.dispatch_mode,
+            enable_member_messaging=self.enable_member_messaging,
+            max_subtask_depth=self.max_subtask_depth,
+            teammate_mode=str(self.teammate_mode),
+            model_pool=team_pool,
+            model_pool_strategy=team_strategy,
+            external_messager_config=external_messager_config,
+            workspace=self.workspace.model_dump() if self.workspace is not None else None,
+            evolution_enabled=self.evolution_enabled,
+            member_workspace_prefix=self.member_workspace_prefix,
+        )
+
+        messager_config = self.transport.build() if self.transport else None
+        db_config = self.resolve_db_config()
+
+        leader_card_id = f"{self.team_name}_{self.leader.member_name}"
+        leader_card = leader_agent.card or AgentCard(
+            id=leader_card_id,
+            name=self.leader.display_name,
+            description=f"Leader of team {self.team_name}",
+        )
+
+        # Build the allocator now (rather than inside ``_setup_infra``) so
+        # the leader can draw from the same rotation as teammates: with a
+        # configured pool we pre-allocate the leader's model here and inject
+        # it into the runtime context. Without a pool the legacy
+        # PerAgentModelAllocator returns ``None`` for the leader and the
+        # downstream ``ctx.member_model or agent_spec.model`` fallback in
+        # ``TeamAgent._setup_agent`` keeps behavior unchanged.
+        from openjiuwen.agent_teams.models.allocator import build_model_allocator
+
+        model_allocator = build_model_allocator(self, team_spec)
+        leader_allocation = (
+            model_allocator.allocate(model_name=self.leader.model_name) if model_allocator is not None else None
+        )
+        leader_member_model = leader_allocation.to_team_model_config() if leader_allocation else None
+        self._validate_leader_model_resolved(leader_agent, leader_member_model, team_spec)
+
+        context = TeamRuntimeContext(
+            role=TeamRole.LEADER,
+            member_name=self.leader.member_name,
+            display_name=self.leader.display_name,
+            desc=self.leader.desc,
+            prompt=self.leader.prompt,
+            team_spec=team_spec,
+            messager_config=messager_config,
+            db_config=db_config,
+            member_model=leader_member_model,
+        )
+
+        agent = _TeamAgent(leader_card)
+        # Hand the already-built allocator (and the leader's allocation)
+        # to the agent before ``configure`` runs so ``_setup_infra``
+        # reuses the same rotation state for subsequent teammate spawns
+        # instead of spawning a fresh instance, and so the leader's DB
+        # ref matches what was actually allocated at build time.
+        agent.attach_model_allocator(model_allocator, leader_allocation=leader_allocation)
+        agent.configure(self, context)
+        return agent
+
+    def _validate_leader_model_resolved(
+        self,
+        leader_agent: DeepAgentSpec,
+        leader_member_model,
+        team_spec: TeamSpec,
+    ) -> None:
+        """Fail fast when the leader has no model to drive its DeepAgent.
+
+        With a configured pool, ``ByModelNameAllocator`` returns ``None``
+        when ``leader.model_name`` is missing or unknown, leaving the
+        leader to fall through to ``agents['leader'].model``. If that
+        too is unset the underlying DeepAgent is built with no model
+        and the failure surfaces only at the first LLM invocation as
+        a confusing "model_client_config is required" error.
+
+        ``RouterAllocator`` always falls back to the first declared
+        ``model_name`` when no hint is given, so this path only trips
+        when ``leader.model_name`` is set to a name that isn't in the
+        router's list (or, under ``by_model_name``, in any pool group).
+
+        Surface it at ``build()`` time with a clear remediation list
+        so the inconsistency is caught while the user is still looking
+        at the spec.
+        """
+        if leader_member_model is not None or leader_agent.model is not None:
+            return
+        if not team_spec.model_pool:
+            return
+
+        from openjiuwen.core.common.exception.codes import StatusCode
+        from openjiuwen.core.common.exception.errors import raise_error
+
+        available_names = sorted({entry.model_name for entry in team_spec.model_pool})
+        strategy = team_spec.model_pool_strategy
+        name_routed = strategy in ("router", "intelli_router")
+        leader_name = self.leader.model_name
+        if leader_name and leader_name not in available_names:
+            scope = "router" if name_routed else "pool"
+            cause = (
+                f"leader.model_name='{leader_name}' is not present in the {scope} (available names: {available_names})"
+            )
+        elif strategy == "by_model_name":
+            cause = "model_pool_strategy='by_model_name' requires leader.model_name to be set to one of the pool names"
+        else:
+            cause = "the allocator did not produce a model for the leader"
+
+        if name_routed:
+            tail = (
+                f"(1) leave leader.model_name unset to fall back on the router's first declared name, "
+                f"(2) set leader.model_name to one of {available_names}, "
+                f"(3) provide an explicit agents['leader'].model in the spec"
+            )
+        else:
+            tail = (
+                f"(1) set leader.model_name to one of {available_names}, "
+                f"(2) provide an explicit agents['leader'].model in the spec, "
+                f"(3) switch model_pool_strategy to 'round_robin' (always allocates)"
+            )
+        reason = f"{cause}; resolve by either: {tail}"
+        raise_error(StatusCode.AGENT_TEAM_CONFIG_INVALID, reason=reason)
+
+    def _validate_swarmflow_budget(self) -> None:
+        """Reject a non-positive ``swarmflow_budget`` (a run with no headroom).
+
+        Zero or negative would exhaust the ceiling before the first ``agent()``,
+        making every run fail identically — a config mistake worth catching at
+        build time rather than at the first gate.
+        """
+        if self.swarmflow_budget is None or self.swarmflow_budget >= 1:
+            return
+
+        from openjiuwen.core.common.exception.codes import StatusCode
+        from openjiuwen.core.common.exception.errors import raise_error
+
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason=f"swarmflow_budget must be >= 1 when set (got {self.swarmflow_budget})",
+        )
+
+    def _validate_reserved_names(self) -> None:
+        """Reject user-declared members that collide with reserved names.
+
+        ``human_agent`` and ``user`` are owned by the runtime and must
+        never collide with user-declared identities. ``team_leader`` is
+        the default leader name so the leader itself is allowed to use
+        it, but a teammate must not — otherwise two members would share
+        a name in the roster.
+        """
+        # Leader may keep the default ``team_leader`` but cannot claim
+        # the user/human_agent identities.
+        leader_forbidden = RESERVED_MEMBER_NAMES - {DEFAULT_LEADER_MEMBER_NAME}
+        if self.leader.member_name in leader_forbidden:
+            raise ValueError(f"LeaderSpec.member_name '{self.leader.member_name}' is reserved; pick a different name")
+        for member in self.predefined_members:
+            # A HITT-auto-injected human_agent is legal here; anything
+            # else under a reserved name is not.
+            if member.role_type == TeamRole.HUMAN_AGENT:
+                continue
+            if member.member_name in RESERVED_MEMBER_NAMES:
+                raise ValueError(
+                    f"predefined member '{member.member_name}' uses a "
+                    f"reserved name (reserved: "
+                    f"{sorted(RESERVED_MEMBER_NAMES)})"
+                )
+
+    def _validate_hitt_consistency(self) -> None:
+        """Reject configs where predefined human members exist without HITT enabled.
+
+        ``enable_hitt`` acts as the spec-level capability ceiling. Declaring
+        a human member (avatar ``HUMAN_AGENT`` or ``PASSIVE_HUMAN``) without
+        opening that ceiling is a misconfiguration. The reverse
+        (``enable_hitt=True`` with no predefined human member) is allowed:
+        callers may rely on dynamic
+        ``spawn_member(role_type='human_agent', ...)`` after build.
+        """
+        human_roles = (TeamRole.HUMAN_AGENT, TeamRole.PASSIVE_HUMAN)
+        if self.enable_hitt:
+            return
+        if not any(m.role_type in human_roles for m in self.predefined_members):
+            return
+
+        from openjiuwen.core.common.exception.codes import StatusCode
+        from openjiuwen.core.common.exception.errors import raise_error
+
+        offenders = [
+            m.member_name
+            for m in self.predefined_members
+            if m.role_type in human_roles
+        ]
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason=(
+                f"predefined_members contains human member role(s) {offenders} "
+                f"but enable_hitt=False; set enable_hitt=True (capability ceiling) "
+                f"or remove the human member(s)"
+            ),
+        )
+
+    def _validate_bridge_consistency(self) -> None:
+        """Reject configs where predefined BRIDGE_AGENT members exist without Bridge enabled.
+
+        ``enable_bridge`` is the spec-level capability ceiling for the
+        bridge feature. Declaring a BRIDGE_AGENT predefined member without
+        opening that ceiling is a misconfiguration. The reverse
+        (``enable_bridge=True`` with no predefined BRIDGE_AGENT) is
+        allowed: callers may rely on dynamic
+        ``spawn_member(role_type='bridge_agent', ...)`` after build.
+        """
+        if self.enable_bridge:
+            return
+        if not any(m.role_type == TeamRole.BRIDGE_AGENT for m in self.predefined_members):
+            return
+
+        from openjiuwen.core.common.exception.codes import StatusCode
+        from openjiuwen.core.common.exception.errors import raise_error
+
+        offenders = [m.member_name for m in self.predefined_members if m.role_type == TeamRole.BRIDGE_AGENT]
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason=(
+                f"predefined_members contains BRIDGE_AGENT role(s) {offenders} "
+                f"but enable_bridge=False; set enable_bridge=True (capability ceiling) "
+                f"or remove the bridge member(s)"
+            ),
+        )
+
+
+__all__ = [
+    "DeepAgentSpec",
+    "ExternalCliAgentSpec",
+    "ExternalCliMemberSpec",
+    "LeaderSpec",
+    "PredefinedMemberSpec",
+    "StorageSpec",
+    "TeamAgentSpec",
+    "TinyAgentSpec",
+    "TransportSpec",
+    "register_storage",
+    "register_transport",
+]

@@ -1,0 +1,128 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""OTel tracer provider initialization.
+
+Creates a ``TracerProvider`` from ``OtelTracerConfig`` and returns an
+OTel ``Tracer`` instance.  Independent from ``observability`` — the
+resulting provider is used solely by tracer_otel extension handlers.
+
+Does NOT call ``trace.set_tracer_provider()`` so that it never conflicts
+with ``agent_teams.observability.init_observability()`` (which manages
+the global TracerProvider). The returned tracer is bound directly to
+this module's TracerProvider, so OtelAgentHandler / OtelWorkflowHandler
+work correctly without relying on global state.
+"""
+
+from __future__ import annotations
+
+import os
+
+from opentelemetry import trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter, SimpleSpanProcessor, SpanExporter
+from opentelemetry.sdk.trace.sampling import ParentBasedTraceIdRatio
+
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import raise_error
+from openjiuwen.extensions.observability.instrumentation import (
+    ensure_global_http_instrumentation,
+    resolve_global_instrument_flag,
+)
+from openjiuwen.extensions.tracer_otel.config import OtelTracerConfig
+
+
+def init_otel_tracer(config: OtelTracerConfig) -> trace.Tracer:
+    """Initialize an OTel TracerProvider and return a Tracer instance.
+
+    Supported ``exporter_type`` values:
+    - ``console``: ``ConsoleSpanExporter`` (debugging)
+    - ``otlp``: ``OTLPSpanExporter`` (requires endpoint)
+
+    Supported ``protocol`` values (for otlp exporter):
+    - ``grpc``: uses ``opentelemetry.exporter.otlp.proto.grpc`` exporter
+    - ``http``: uses ``opentelemetry.exporter.otlp.proto.http`` exporter
+
+    Args:
+        config: Immutable ``OtelTracerConfig`` instance.
+
+    Returns:
+        An ``opentelemetry.trace.Tracer`` ready for use in handlers.
+    """
+    provider = _build_provider(config)
+
+    # Optional process-wide HTTP instrumentation (traceparent propagation).
+    # Global-state ownership stays in extensions.observability.instrumentation;
+    # this package only supplies a provider factory pointing at the same
+    # collector. The factory runs only when no global SDK provider exists yet,
+    # so coexistence with the observability stack stays order-independent.
+    if resolve_global_instrument_flag(config.global_instrument_enable):
+        ensure_global_http_instrumentation(provider_factory=lambda: _build_provider(config))
+
+    # The private provider above is unaffected by the global flag: tracer_otel
+    # handlers hold a direct tracer reference, so global provider state is not
+    # needed for them.
+    return provider.get_tracer(config.tracer_name)
+
+
+def _build_provider(config: OtelTracerConfig) -> TracerProvider:
+    """Build the private TracerProvider for the tracer_otel handlers."""
+
+    resource_attrs = {
+        "service.name": config.service_name,
+        "service.version": config.service_version or "unknown",
+    }
+    # In k8s pods HOSTNAME is the pod name. Gate on the service env so hosts
+    # that merely happen to set HOSTNAME (bare metal, plain CI containers,
+    # where it is a container/hostname id) don't pollute the resource.
+    pod_name = os.environ.get("HOSTNAME", "")
+    if pod_name and os.environ.get("KUBERNETES_SERVICE_HOST"):
+        resource_attrs["k8s.pod.name"] = pod_name
+    resource = Resource.create(resource_attrs)
+
+    sampler = ParentBasedTraceIdRatio(rate=config.sample_rate)
+    provider = TracerProvider(sampler=sampler, resource=resource)
+
+    if config.exporter_type == "console":
+        exporter = ConsoleSpanExporter()
+        processor = SimpleSpanProcessor(exporter)
+    elif config.exporter_type == "otlp":
+        exporter = _create_otlp_exporter(config)
+        processor = BatchSpanProcessor(
+            exporter,
+            schedule_delay_millis=config.schedule_delay_millis,
+            max_export_batch_size=config.max_export_batch_size,
+            export_timeout_millis=config.export_timeout_ms,
+        )
+    else:
+        raise_error(StatusCode.COMMON_TASK_CONFIG_ERROR,
+                     error_msg=f"unknown exporter_type '{config.exporter_type}', supported: console, otlp")
+
+    provider.add_span_processor(processor)
+    return provider
+
+
+def _create_otlp_exporter(config: OtelTracerConfig) -> SpanExporter:
+    """Create OTLP span exporter based on protocol and headers config.
+
+    ``protocol="grpc"`` → ``OTLPSpanExporter`` from grpc package.
+    ``protocol="http"`` → ``OTLPSpanExporter`` from http package.
+    ``headers`` are passed to the exporter for authentication.
+    """
+    endpoint = config.exporter_endpoint
+    headers = config.headers or {}
+
+    if config.protocol == "http":
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        # HTTP exporter expects endpoint to include path: /v1/traces
+        if endpoint and not endpoint.endswith("/v1/traces"):
+            endpoint = f"{endpoint}/v1/traces"
+        return OTLPSpanExporter(endpoint=endpoint, headers=headers)
+    elif config.protocol == "grpc":
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+        return OTLPSpanExporter(endpoint=endpoint, headers=headers)
+    else:
+        raise_error(StatusCode.COMMON_TASK_CONFIG_ERROR,
+                     error_msg=f"unknown otlp protocol '{config.protocol}', supported: grpc, http")
+        return None

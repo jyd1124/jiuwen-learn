@@ -1,0 +1,225 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Tests for external CLI backend registry."""
+
+from dataclasses import replace
+
+import pytest
+from pydantic import ValidationError
+
+from openjiuwen.agent_teams.external.cli_agent import backends
+from openjiuwen.agent_teams.external.cli_agent.backends import (
+    SdkRequirement,
+    available_backends,
+    backend_for,
+    is_known_backend,
+    missing_sdk_requirement,
+)
+from openjiuwen.agent_teams.schema.team import ExternalCliAgentSpec
+
+
+def test_available_backends_includes_sdk_and_adapter_kinds():
+    """Known SDK backends and adapter-backed CLIs are exposed together."""
+    names = set(available_backends())
+    assert {"claude", "codex", "gemini", "openclaw", "hermes", "generic"} <= names
+
+
+def test_claude_backend_metadata_marks_sdk_prompt_injection():
+    """Claude is a SDK backend, not a generic CLI adapter."""
+    backend = backend_for("claude")
+    assert backend is not None
+    assert backend.kind == "sdk"
+    assert not backend.supports_command_override
+    assert backend.injects_system_prompt_via_arg
+
+
+def test_codex_backend_metadata_marks_sdk_prompt_injection():
+    """Codex is an SDK backend, not a generic CLI adapter."""
+    backend = backend_for("codex")
+    assert backend is not None
+    assert backend.kind == "sdk"
+    assert not backend.supports_command_override
+    assert backend.injects_system_prompt_via_arg
+
+
+def test_codex_static_config_uses_explicit_binary_not_full_command():
+    config = ExternalCliAgentSpec(cli_agent="codex", codex_bin="/opt/codex")
+    assert config.codex_bin == "/opt/codex"
+
+    with pytest.raises(ValidationError, match="use cli_path"):
+        ExternalCliAgentSpec(cli_agent="codex", command=["codex", "app-server"])
+
+    with pytest.raises(ValidationError, match="only valid"):
+        ExternalCliAgentSpec(cli_agent="generic", codex_bin="/opt/codex")
+
+
+def test_sdk_static_config_accepts_cli_path():
+    """SDK-backed CLI agents accept a custom executable path."""
+    claude_config = ExternalCliAgentSpec(cli_agent="claude", cli_path="/opt/claude")
+    codex_config = ExternalCliAgentSpec(cli_agent="codex", cli_path="/opt/codex")
+
+    assert claude_config.cli_path == "/opt/claude"
+    assert codex_config.cli_path == "/opt/codex"
+
+    with pytest.raises(ValidationError, match="not valid for adapter-backed"):
+        ExternalCliAgentSpec(cli_agent="generic", cli_path="/opt/generic")
+
+
+def test_sdk_static_config_rejects_empty_paths():
+    """Optional CLI path fields accept None but reject empty strings."""
+    config = ExternalCliAgentSpec(cli_agent="codex", cli_path=None, codex_bin=None)
+    assert config.cli_path is None
+    assert config.codex_bin is None
+
+    with pytest.raises(ValidationError, match="String should have at least 1 character"):
+        ExternalCliAgentSpec(cli_agent="claude", cli_path="")
+
+    with pytest.raises(ValidationError, match="String should have at least 1 character"):
+        ExternalCliAgentSpec(cli_agent="codex", codex_bin="")
+
+
+def test_sdk_static_config_accepts_model_config_alias():
+    config = ExternalCliAgentSpec(
+        cli_agent="claude",
+        model_config={
+            "provider": "anthropic",
+            "model": "claude-sonnet-test",
+            "api_base": "https://gateway.example",
+            "api_key": "sk-test",
+        },
+    )
+
+    assert config.external_model_config is not None
+    assert config.external_model_config.provider == "anthropic"
+    assert config.external_model_config.model == "claude-sonnet-test"
+    assert config.model_dump(by_alias=True)["model_config"]["api_base"] == "https://gateway.example"
+
+    with pytest.raises(ValidationError, match="model_config is not valid for adapter-backed"):
+        ExternalCliAgentSpec(
+            cli_agent="generic",
+            model_config={"model": "some-model"},
+        )
+
+
+def test_mcp_approval_mode_is_explicit_and_codex_only():
+    config = ExternalCliAgentSpec(
+        cli_agent="codex",
+        mcp_default_tools_approval_mode="approve",
+    )
+    assert config.mcp_default_tools_approval_mode == "approve"
+
+    with pytest.raises(ValidationError, match="mcp_default_tools_approval_mode is only valid"):
+        ExternalCliAgentSpec(
+            cli_agent="claude",
+            mcp_default_tools_approval_mode="approve",
+        )
+
+
+def test_full_access_bypass_defaults_for_codex_and_can_be_disabled():
+    default_config = ExternalCliAgentSpec(cli_agent="codex")
+    disabled_config = ExternalCliAgentSpec(
+        cli_agent="codex",
+        codex_bypass_approvals_and_sandbox=False,
+    )
+    claude_config = ExternalCliAgentSpec(cli_agent="claude")
+
+    assert default_config.codex_bypass_approvals_and_sandbox
+    assert not disabled_config.codex_bypass_approvals_and_sandbox
+    assert not claude_config.codex_bypass_approvals_and_sandbox
+
+    with pytest.raises(ValidationError, match="codex_bypass_approvals_and_sandbox is only valid"):
+        ExternalCliAgentSpec(
+            cli_agent="claude",
+            codex_bypass_approvals_and_sandbox=True,
+        )
+
+
+def test_codex_turn_stall_policy_is_validated_and_codex_only():
+    config = ExternalCliAgentSpec(
+        cli_agent="codex",
+        codex_turn_idle_timeout_s=45.0,
+        codex_turn_idle_retries=2,
+    )
+    assert config.codex_turn_idle_timeout_s == 45.0
+    assert config.codex_turn_idle_retries == 2
+
+    with pytest.raises(ValidationError, match="greater than 0"):
+        ExternalCliAgentSpec(cli_agent="codex", codex_turn_idle_timeout_s=0)
+
+    with pytest.raises(ValidationError, match="codex_turn_idle_timeout_s is only valid"):
+        ExternalCliAgentSpec(cli_agent="claude", codex_turn_idle_timeout_s=45.0)
+
+    with pytest.raises(ValidationError, match="codex_turn_idle_retries is only valid"):
+        ExternalCliAgentSpec(cli_agent="generic", codex_turn_idle_retries=1)
+
+
+def test_claude_turn_stall_policy_is_validated_and_claude_only():
+    config = ExternalCliAgentSpec(
+        cli_agent="claude",
+        claude_turn_idle_timeout_s=45.0,
+    )
+    assert config.claude_turn_idle_timeout_s == 45.0
+
+    with pytest.raises(ValidationError, match="greater than 0"):
+        ExternalCliAgentSpec(cli_agent="claude", claude_turn_idle_timeout_s=0)
+
+    with pytest.raises(ValidationError, match="claude_turn_idle_timeout_s is only valid"):
+        ExternalCliAgentSpec(cli_agent="codex", claude_turn_idle_timeout_s=45.0)
+
+
+def test_claude_max_buffer_size_is_validated_and_claude_only():
+    config = ExternalCliAgentSpec(cli_agent="claude", claude_max_buffer_size=1024)
+    assert config.claude_max_buffer_size == 1024
+
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
+        ExternalCliAgentSpec(cli_agent="claude", claude_max_buffer_size=0)
+
+    with pytest.raises(ValidationError, match="claude_max_buffer_size is only valid"):
+        ExternalCliAgentSpec(cli_agent="codex", claude_max_buffer_size=1024)
+
+
+@pytest.mark.parametrize("cli_agent", ["claude", "codex", "generic"])
+def test_spec_survives_model_dump_round_trip(cli_agent: str):
+    """Spawn payloads and checkpoints re-validate a full ``model_dump``."""
+    config = ExternalCliAgentSpec(cli_agent=cli_agent)
+
+    restored = ExternalCliAgentSpec.model_validate(config.model_dump(mode="json", by_alias=True))
+
+    assert restored == config
+
+
+def test_sdk_backends_declare_their_optional_sdk():
+    claude = backend_for("claude")
+    codex = backend_for("codex")
+
+    assert claude is not None and claude.sdk_requirement is not None
+    assert claude.sdk_requirement.module == "claude_agent_sdk"
+    assert codex is not None and codex.sdk_requirement is not None
+    assert codex.sdk_requirement.module == "openai_codex"
+
+
+def test_missing_sdk_requirement_probes_import_without_importing(monkeypatch: pytest.MonkeyPatch):
+    requirement = SdkRequirement(
+        module="openjiuwen_absent_sdk_probe",
+        distribution="absent-sdk",
+        extra="absent",
+    )
+    backend = backend_for("claude")
+    assert backend is not None
+    monkeypatch.setitem(backends._SDK_BACKENDS, "claude", replace(backend, sdk_requirement=requirement))
+    assert missing_sdk_requirement("claude") == requirement
+
+    present = replace(requirement, module="json")
+    monkeypatch.setitem(backends._SDK_BACKENDS, "claude", replace(backend, sdk_requirement=present))
+    assert missing_sdk_requirement("claude") is None
+
+
+def test_missing_sdk_requirement_ignores_backends_without_sdk():
+    assert missing_sdk_requirement("not-a-real-cli") is None
+
+
+def test_unknown_backend_returns_none():
+    """Unknown backend names are rejected by registry helpers."""
+    assert backend_for("not-a-real-cli") is None
+    assert not is_known_backend("not-a-real-cli")

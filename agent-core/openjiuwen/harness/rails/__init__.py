@@ -1,0 +1,170 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+"""DeepAgent rail definitions."""
+
+# fmt: off
+# ruff: noqa: I001
+from openjiuwen.harness.rails.agent_mode_rail import AgentModeRail
+from openjiuwen.harness.rails.base import DeepAgentRail
+from openjiuwen.harness.rails.evolution import (
+    configure_skill_evolution,
+    configure_skill_evolution_runtime,
+    configure_ttse_evolution,
+    configure_ttse_evolution_runtime,
+    unconfigure_skill_evolution,
+    unconfigure_ttse_evolution,
+    ContextEvolveRail,
+    ContextEvolutionRail,
+    EvolutionInterruptRail,
+    EvolutionRail,
+    EvolutionTriggerPoint,
+    MemberSkillEvolutionRail,
+    MetisContextEvolveRail,
+    SkillEvolutionRail,
+    SummarizeTrajectoriesInput,
+    CapabilityIdentity,
+    CapabilitySnapshotProvider,
+    GraphSnapshotProvider,
+    SymphonyEvolutionSubmitCallback,
+    SymphonyGraphEvolutionInput,
+    SymphonyGraphEvolutionRail,
+    TeamSymphonyGraphEvolutionRail,
+    TeamSkillEvolutionRail,
+    TeamContextEvolutionRail,
+    TeamInsightBuffer,
+    TeamInsightEntry,
+    TrajectoryRail,
+)
+from openjiuwen.harness.rails.heartbeat_rail import HeartbeatRail
+from openjiuwen.harness.rails.model_anomaly_detection_rail import (
+    ModelAnomalyDetectionRail,
+    ToolLoopCompactConfig,
+)
+from openjiuwen.harness.rails.interrupt.ask_user_rail import AskUserPayload, AskUserRail
+from openjiuwen.harness.rails.interrupt.confirm_rail import ConfirmInterruptRail
+from openjiuwen.harness.rails.interrupt.interrupt_base import BaseInterruptRail
+from openjiuwen.harness.rails.lsp_rail import LspRail
+from openjiuwen.harness.rails.mcp_rail import McpRail
+from openjiuwen.harness.rails._multimodal import build_read_image_multimodal_resolver
+from openjiuwen.harness.rails.multimodal_context_summarizer_rail import (
+    ARCHIVED_SCREEN_PLACEHOLDER,
+    MultimodalContextSummarizerRail,
+)
+from openjiuwen.harness.rails.memory import (
+    CodingMemoryRail,
+    ExternalMemoryRail,
+    JiuwenMemoryRail,
+    MemoryRail,
+)
+from openjiuwen.harness.rails.progressive_tool_rail import ProgressiveToolRail
+from openjiuwen.harness.rails.security import (
+    BaseSecurityRail,
+    PermissionInterruptRail,
+    SafetyPromptRail,
+    SecurityAllow,
+    SecurityCheckContext,
+    SecurityDecision,
+    SecurityInterrupt,
+    SecurityReject,
+    SecurityRail,
+)
+from openjiuwen.harness.rails.skills import (
+    SkillCreateRail,
+    SkillUseRail,
+    TeamSkillCreateRail,
+    TeamSkillRail,
+)
+from openjiuwen.harness.rails.subagent import (
+    SessionRail,
+    SubagentRail,
+    VerificationContractRail,
+    VerificationRail,
+)
+from openjiuwen.harness.rails.sys_operation_rail import SysOperationRail
+from openjiuwen.harness.rails.task_completion_rail import TaskCompletionRail
+from openjiuwen.harness.rails.task_planning_rail import TaskPlanningRail
+# fmt: on
+
+__all__ = [
+    "ARCHIVED_SCREEN_PLACEHOLDER",
+    "AgentModeRail",
+    "AskUserPayload",
+    "AskUserRail",
+    "BaseInterruptRail",
+    "BaseSecurityRail",
+    "CodingMemoryRail",
+    "CapabilityIdentity",
+    "CapabilitySnapshotProvider",
+    "GraphSnapshotProvider",
+    "ConfirmInterruptRail",
+    "ContextEvolutionRail",
+    "ContextEvolveRail",
+    "DeepAgentRail",
+    "EvolutionRail",
+    "EvolutionInterruptRail",
+    "EvolutionTriggerPoint",
+    "ExternalMemoryRail",
+    "HeartbeatRail",
+    "JiuwenMemoryRail",
+    "ModelAnomalyDetectionRail",
+    "ToolLoopCompactConfig",
+    "LspRail",
+    "McpRail",
+    "MemoryRail",
+    "MemberSkillEvolutionRail",
+    "MetisContextEvolveRail",
+    "MultimodalContextSummarizerRail",
+    "PermissionInterruptRail",
+    "ProgressiveToolRail",
+    "SafetyPromptRail",
+    "SecurityAllow",
+    "SecurityCheckContext",
+    "SecurityDecision",
+    "SecurityInterrupt",
+    "SecurityReject",
+    "SecurityRail",
+    "SessionRail",
+    "SkillCreateRail",
+    "SkillEvolutionRail",
+    "SkillUseRail",
+    "SubagentRail",
+    "SummarizeTrajectoriesInput",
+    "SymphonyGraphEvolutionInput",
+    "SymphonyGraphEvolutionRail",
+    "SymphonyEvolutionSubmitCallback",
+    "SysOperationRail",
+    "TeamContextEvolutionRail",
+    "TeamInsightBuffer",
+    "TeamInsightEntry",
+    "TaskCompletionRail",
+    "TaskPlanningRail",
+    "TeamSkillCreateRail",
+    "TeamSkillEvolutionRail",
+    "TeamSymphonyGraphEvolutionRail",
+    "TeamSkillRail",
+    "build_read_image_multimodal_resolver",
+    "configure_skill_evolution",
+    "configure_skill_evolution_runtime",
+    "configure_ttse_evolution",
+    "configure_ttse_evolution_runtime",
+    "unconfigure_skill_evolution",
+    "unconfigure_ttse_evolution",
+    "TrajectoryRail",
+    "TTSERail",
+    "VerificationContractRail",
+    "VerificationRail",
+]
+
+
+def __getattr__(name: str):
+    """Load TTSERail only when the TTSE export is requested."""
+    if name != "TTSERail":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from openjiuwen.harness.rails.evolution import TTSERail
+
+    globals()["TTSERail"] = TTSERail
+    return TTSERail
+
+
+def __dir__():
+    return sorted({*globals().keys(), "TTSERail"})

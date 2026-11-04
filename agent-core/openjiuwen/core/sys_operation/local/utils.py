@@ -1,0 +1,527 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+import asyncio
+import codecs
+import os
+import signal
+import tempfile
+from datetime import (
+    datetime,
+    timezone,
+)
+from enum import Enum
+from typing import (
+    AsyncGenerator,
+    Dict,
+    Optional,
+    Union,
+)
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+)
+
+from openjiuwen.core.common.logging import sys_operation_logger, LogEventType
+
+
+class StreamEventType(str, Enum):
+    """Enumeration of stream event types for async process output monitoring."""
+    STDOUT = "stdout"
+    STDERR = "stderr"
+    EXIT = "exit"
+    ERROR = "error"
+
+
+class StreamEvent(BaseModel):
+    """Data model for async process stream events."""
+    type: StreamEventType = Field(
+        ...,
+        description="Type of the stream event, must be one of StreamEventType values"
+    )
+    data: Union[str, int] = Field(
+        ...,
+        description="Event payload data with type dependent on event type: "
+                    "stdout/stderr = text output string, exit = integer exit code, "
+                    "error = error message string"
+    )
+    timestamp: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="UTC datetime timestamp when the event was created (auto-generated)"
+    )
+
+
+class InvokeData(BaseModel):
+    """Structured return model for one-time async subprocess execution via invoke() method."""
+    stdout: str = Field(
+        ...,
+        description="Complete standard output string captured from the subprocess execution"
+    )
+    stderr: str = Field(
+        ...,
+        description="Complete standard error string captured from the subprocess execution"
+    )
+    exit_code: int = Field(
+        ...,
+        description="Exit code returned by the subprocess (0 for successful execution, non-zero for errors)"
+    )
+    exception: Optional[Exception] = Field(
+        default=None,
+        description="Record exception during subprocess execution"
+    )
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+class AsyncProcessHandler:
+    """Handler for monitoring asyncio subprocess output and state."""
+
+    def __init__(self,
+                 process: asyncio.subprocess.Process,
+                 chunk_size: int = 1024,
+                 encoding: str = "utf-8",
+                 timeout: int = 300):
+        self._process = process
+        self._chunk_size = chunk_size
+        self._encoding = encoding
+        self._overall_timeout = timeout
+        self._queue: asyncio.Queue[StreamEvent] = asyncio.Queue()
+        self._is_executed = False
+        self._background_tasks: set[asyncio.Task[str]] = set()
+
+    def _kill_process_tree(self) -> None:
+        """Kill the subprocess and all its children using process group.
+
+        Requires ``start_new_session=True`` when creating the subprocess
+        for full process-tree coverage.  Falls back to ``process.kill()``
+        when the process group is not available (e.g. Windows).
+        """
+        pid = self._process.pid
+        if pid is None:
+            return
+        try:
+            if os.name != "nt":
+                os.killpg(pid, signal.SIGKILL)
+            else:
+                self._process.kill()
+        except OSError:
+            try:
+                self._process.kill()
+            except ProcessLookupError:
+                pass
+
+    async def invoke(self) -> InvokeData:
+        """One-time execution to get structured subprocess result by wrapping stream().
+
+        Returns:
+            InvokeData - Structured result containing stdout, stderr and exit code
+
+        Raises:
+            RuntimeError: If invoke() or stream() has already been executed
+            Exception: If any ERROR event is captured from the stream (timeout/reader/loop error)
+        """
+        if self._is_executed:
+            raise RuntimeError(
+                "AsyncProcessHandler: invoke() and stream() are mutually exclusive, only one can be executed once")
+
+        self._is_executed = True
+        # Drain stdout/stderr continuously into buffers instead of communicate():
+        # communicate()'s internally buffered data is lost when its wait_for is
+        # cancelled (timeout or user cancel), so output written before the kill
+        # would vanish. Reading into our own buffers keeps it recoverable.
+        stdout_buf = bytearray()
+        stderr_buf = bytearray()
+
+        async def _drain(stream, buf: bytearray) -> None:
+            if stream is None:
+                return
+            while True:
+                chunk = await stream.read(65536)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+
+        readers = [
+            asyncio.create_task(_drain(self._process.stdout, stdout_buf)),
+            asyncio.create_task(_drain(self._process.stderr, stderr_buf)),
+        ]
+
+        def _decode(buf: bytearray) -> str:
+            return buf.decode(self._encoding, errors='replace')
+
+        async def _finish_readers(grace: float) -> None:
+            try:
+                await asyncio.wait_for(asyncio.gather(*readers, return_exceptions=True), timeout=grace)
+            except asyncio.TimeoutError:
+                for reader in readers:
+                    if not reader.done():
+                        reader.cancel()
+
+        try:
+            await asyncio.wait_for(self._process.wait(), timeout=self._overall_timeout)
+        except asyncio.CancelledError:
+            # WARNING: Do NOT swallow CancelledError here.
+            # Outer anyio.fail_after relies on CancelledError propagation
+            # to correctly convert it to TimeoutError. Swallowing it would
+            # break the timeout contract for callers (e.g. AbilityManager).
+            sys_operation_logger.warning(
+                "Process cancelled by user, killing subprocess tree",
+                event_type=LogEventType.SYS_OP_ERROR,
+                metadata={"pid": self._process.pid},
+            )
+            self._kill_process_tree()
+            await _finish_readers(5)
+            raise
+        except asyncio.TimeoutError as ori_ex:
+            sys_operation_logger.error("Get process result time out",
+                                       event_type=LogEventType.SYS_OP_ERROR,
+                                       error_message=f"Process timed out after {self._overall_timeout} seconds",
+                                       exception=ori_ex,
+                                       metadata={"timeout": self._overall_timeout})
+            self._kill_process_tree()
+            # Killing closes the pipes; collect whatever was written before the kill.
+            await _finish_readers(30)
+            # Reap the killed child so it leaves no zombie and reports its exit
+            # code: pipe EOF can arrive before the child watcher records the exit.
+            try:
+                await asyncio.wait_for(self._process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                sys_operation_logger.warning(
+                    "Killed process did not exit within the reap grace period",
+                    event_type=LogEventType.SYS_OP_ERROR,
+                    metadata={"pid": self._process.pid},
+                )
+            return InvokeData(
+                stdout=_decode(stdout_buf),
+                stderr=_decode(stderr_buf),
+                exit_code=self._process.returncode if self._process.returncode is not None else -1,
+                exception=ori_ex
+            )
+
+        # Normal completion: ensure both drainers have read through to EOF.
+        await asyncio.gather(*readers, return_exceptions=True)
+        final_exit_code = self._process.returncode if self._process.returncode is not None else -1
+        return InvokeData(
+            stdout=_decode(stdout_buf),
+            stderr=_decode(stderr_buf),
+            exit_code=final_exit_code
+        )
+
+    async def stream(self) -> AsyncGenerator[StreamEvent, None]:
+        """Async generator for emitting process stream events in order.
+
+        Yields:
+            StreamEvent: Sequential stream events (STDOUT/STDERR/ERROR/EXIT)
+        """
+        if self._is_executed:
+            raise RuntimeError(
+                "AsyncProcessHandler: invoke() and stream() are mutually exclusive, only one can be executed once")
+
+        self._is_executed = True
+        tasks = [
+            asyncio.create_task(self._reader(self._process.stdout, StreamEventType.STDOUT)),
+            asyncio.create_task(self._reader(self._process.stderr, StreamEventType.STDERR))
+        ]
+
+        try:
+            start_time = asyncio.get_event_loop().time()
+            total_num = 0
+            while any(not task.done() for task in tasks) or not self._queue.empty():
+                if self._overall_timeout > 0:
+                    elapsed_time = asyncio.get_event_loop().time() - start_time
+                    if elapsed_time >= self._overall_timeout:
+                        sys_operation_logger.error("Stream execution time out",
+                                                   event_type=LogEventType.SYS_OP_ERROR,
+                                                   metadata={"timeout": self._overall_timeout})
+                        raise asyncio.TimeoutError
+                try:
+                    event = await asyncio.wait_for(self._queue.get(), timeout=0.1)
+                    yield event
+                    self._queue.task_done()
+                    total_num += 1
+                    sys_operation_logger.debug("Success to get stream queue item",
+                                               event_type=LogEventType.SYS_OP_STREAM,
+                                               metadata={"total_num": total_num,
+                                                         "returncode": self._process.returncode,
+                                                         "queue_size": self._queue.qsize()})
+                except asyncio.TimeoutError:
+                    sys_operation_logger.debug("Get stream queue time out",
+                                               event_type=LogEventType.SYS_OP_STREAM,
+                                               metadata={"timeout": 0.1})
+                    continue
+        except asyncio.CancelledError:
+            sys_operation_logger.warning(
+                "Stream cancelled by user, killing subprocess tree",
+                event_type=LogEventType.SYS_OP_ERROR,
+                metadata={"pid": self._process.pid},
+            )
+            self._kill_process_tree()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            yield StreamEvent(
+                type=StreamEventType.ERROR,
+                data="Execution cancelled by user"
+            )
+            return
+        except asyncio.TimeoutError:
+            self._kill_process_tree()
+            await self._process.wait()
+            yield StreamEvent(
+                type=StreamEventType.ERROR,
+                data=f"execution timeout after {self._overall_timeout} seconds"
+            )
+        except Exception as e:
+            sys_operation_logger.error("Stream execution error",
+                                       event_type=LogEventType.SYS_OP_ERROR,
+                                       exception=e)
+            yield StreamEvent(
+                type=StreamEventType.ERROR,
+                data=f"stream loop error: {str(e)}"
+            )
+
+        # Cancel any unfinished reader tasks to prevent orphaned coroutines
+        canceled_num = 0
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+                canceled_num += 1
+
+        sys_operation_logger.info(f"Finished canceling reader tasks",
+                                  event_type=LogEventType.SYS_OP_STREAM,
+                                  metadata={"total_tasks": len(tasks),
+                                            "canceled_tasks": canceled_num,
+                                            "done_tasks": len(tasks) - canceled_num})
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Emit ERROR events for any reader task exceptions
+        for result in results:
+            if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+                yield StreamEvent(
+                    type=StreamEventType.ERROR,
+                    data=f"reader task error: {str(result)}"
+                )
+
+        try:
+            await self._queue.join()
+            await self._process.wait()
+            yield StreamEvent(
+                type=StreamEventType.EXIT,
+                data=self._process.returncode if self._process.returncode is not None else -1
+            )
+        except Exception as e:
+            sys_operation_logger.error("Release process error",
+                                       event_type=LogEventType.SYS_OP_ERROR,
+                                       exception=e)
+            yield StreamEvent(
+                type=StreamEventType.ERROR,
+                data=f"process wait error: {str(e)}"
+            )
+
+    async def _drain_background_stderr(self, limit: int = 8192) -> str:
+        """Drain stderr without allowing retained diagnostics to grow without bound."""
+        if self._process.stderr is None:
+            return ""
+
+        retained = bytearray()
+        truncated = False
+        while True:
+            chunk = await self._process.stderr.read(self._chunk_size)
+            if not chunk:
+                break
+            remaining = limit - len(retained)
+            if remaining > 0:
+                retained.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                truncated = True
+
+        message = retained.decode(self._encoding, errors="replace").strip()
+        if truncated:
+            message = f"{message}\n[stderr truncated]" if message else "[stderr truncated]"
+        return message
+
+    async def background(self, grace: float = 3.0) -> tuple[int, Optional[str]]:
+        """Launch process in background and wait briefly for early failure detection.
+
+        Args:
+            grace: Seconds to wait before declaring the process successfully started.
+
+        Returns:
+            (pid, error): pid is the process ID; error is None if still running after
+                          grace period, or an error message if process exited early with
+                          non-zero code.
+
+        Raises:
+            RuntimeError: If invoke() or stream() has already been executed
+        """
+        if self._is_executed:
+            raise RuntimeError(
+                "AsyncProcessHandler: invoke() and stream() are mutually exclusive, only one can be executed once")
+
+        self._is_executed = True
+        pid = self._process.pid
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(grace, 0)
+        stderr_task = asyncio.create_task(self._drain_background_stderr())
+        self._background_tasks.add(stderr_task)
+        stderr_task.add_done_callback(self._background_tasks.discard)
+        while self._process.returncode is None:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return pid, None  # still running after grace period — success
+            await asyncio.sleep(min(0.05, remaining))
+
+        code = self._process.returncode
+        if code != 0:
+            # A descendant may keep the inherited stderr write end open after
+            # the direct child exits. Only wait for the grace period's remaining
+            # time, while leaving the task alive to keep draining the pipe.
+            remaining = max(0, deadline - loop.time())
+            done, _ = await asyncio.wait({stderr_task}, timeout=remaining)
+            stderr = stderr_task.result() if stderr_task in done else ""
+            error = f"process exited early with code {code}"
+            if stderr:
+                error = f"{error}: {stderr}"
+            return pid, error
+        return pid, None
+
+    async def _reader(self, stream: asyncio.StreamReader, stream_type: StreamEventType):
+        """Background stream reader coroutine for stdout/stderr.
+
+        Args:
+            stream: Asyncio StreamReader instance to read from (stdout/stderr)
+            stream_type: Corresponding StreamEventType (STDOUT/STDERR) for the stream
+        """
+        try:
+            total_num = 0
+            decoder = codecs.getincrementaldecoder(self._encoding)(errors="replace")
+            while True:
+                chunk = await stream.read(self._chunk_size)
+                # Terminate loop when stream has no more data
+                if not chunk:
+                    # Flush any bytes buffered by the incremental decoder so a
+                    # multi-byte sequence split across chunks is not dropped.
+                    tail = decoder.decode(b"", final=True)
+                    if tail:
+                        await self._queue.put(StreamEvent(type=stream_type, data=tail))
+                    sys_operation_logger.info("Receive stream eof",
+                                              event_type=LogEventType.SYS_OP_STREAM,
+                                              metadata={"total_num": total_num,
+                                                        "returncode": self._process.returncode,
+                                                        "queue_size": self._queue.qsize()})
+                    break
+                data = decoder.decode(chunk)
+                if not data:
+                    # All bytes of this chunk belong to a character that is
+                    # still incomplete; carry them over to the next chunk.
+                    continue
+                event = StreamEvent(type=stream_type, data=data)
+                await self._queue.put(event)
+                total_num += 1
+                sys_operation_logger.debug("Success to put stream queue item",
+                                           event_type=LogEventType.SYS_OP_STREAM,
+                                           metadata={"total_num": total_num,
+                                                     "returncode": self._process.returncode,
+                                                     "queue_size": self._queue.qsize()})
+        except Exception as e:
+            sys_operation_logger.error("Stream read error",
+                                       event_type=LogEventType.SYS_OP_ERROR,
+                                       exception=e,
+                                       metadata={"stream_type": stream_type.value,
+                                                 "chunk_size": self._chunk_size,
+                                                 "encoding": self._encoding})
+            await self._queue.put(StreamEvent(
+                type=StreamEventType.ERROR,
+                data=f"{stream_type.value} reader error: {str(e)}"
+            ))
+
+
+class OperationUtils:
+    """Utility class for common subprocess operation helper methods."""
+
+    @staticmethod
+    async def create_tmp_file(file_content: str, file_suffix: str) -> str:
+        """Asynchronously creates a unique temporary file and writes content to it.
+
+        Args:
+            file_content: Content to be written into the temporary file (UTF-8 encoded)
+            file_suffix: Suffix of the temporary file, must start with dot (e.g. '.py', '.sh', '.txt')
+
+        Returns:
+            str: Absolute and unique path of the created temporary file
+        """
+
+        def _sync_create_tmp():
+            try:
+                with tempfile.NamedTemporaryFile(suffix=file_suffix, delete=False,
+                                                 mode='w', encoding='utf-8') as tmp_file:
+                    tmp_file.write(file_content)
+                    return tmp_file.name
+            except Exception as e:
+                sys_operation_logger.warning("Failed to create tmp file",
+                                             event_type=LogEventType.SYS_OP_ERROR,
+                                             exception=e)
+                return None
+
+        return await asyncio.to_thread(_sync_create_tmp)
+
+    @staticmethod
+    async def delete_tmp_file(file_path: str) -> bool:
+        """Asynchronously deletes the specified temporary file (auxiliary method).
+
+        Args:
+            file_path: Absolute path of the temporary file to be deleted
+
+        Returns:
+            bool: True if the file is deleted successfully, False if deletion fails
+        """
+
+        def _sync_delete_tmp():
+            if not os.path.exists(file_path) or not os.path.isfile(file_path):
+                return False
+            try:
+                os.remove(file_path)
+                return True
+            except Exception as e:
+                sys_operation_logger.warning("Failed to delete tmp file",
+                                             event_type=LogEventType.SYS_OP_ERROR,
+                                             exception=e)
+                return False
+
+        return await asyncio.to_thread(_sync_delete_tmp)
+
+    @staticmethod
+    def prepare_environment(custom_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        """Create a merged environment dictionary for subprocess execution.
+
+        Args:
+            custom_env: Optional custom environment variables to add/override
+
+        Returns:
+            Merged environment dictionary (OS env + custom env)
+        """
+        env = os.environ.copy()
+        if custom_env:
+            env.update(custom_env)
+        return env
+
+    @staticmethod
+    def create_handler(process: asyncio.subprocess.Process,
+                       chunk_size: int = 1024,
+                       encoding: str = "utf-8",
+                       timeout: int = 300) -> AsyncProcessHandler:
+        """Factory method to create an AsyncProcessHandler instance.
+
+        Args:
+            process: asyncio subprocess process instance to monitor and handle
+            chunk_size: Max byte size for each stream read operation (default: 1024)
+            encoding: Text encoding for decoding stream binary data to string,
+                common values: utf-8, gbk, latin-1 (default: utf-8)
+            timeout: Overall timeout duration (in seconds) for the entire stream processing loop,
+                prevents infinite blocking of the handler (default: 300)
+
+        Returns:
+            Initialized AsyncProcessHandler instance
+        """
+        return AsyncProcessHandler(process, chunk_size, encoding, timeout)

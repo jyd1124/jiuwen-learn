@@ -1,0 +1,270 @@
+"""Regression coverage for codegen metrics rejected despite item_records."""
+
+import pytest
+
+from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.common.metrics import (
+    validate_metrics_contract,
+    validate_smoke_live_path,
+)
+from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.code_implementation.agent import (
+    CandidateValidation,
+    CodeImplementationAgent,
+)
+
+
+@pytest.mark.parametrize("key", ["per_question", "per_item", "task_records", "records", "item_records"])
+def test_smoke_accepts_item_record_aliases(key):
+    payload = {
+        "method": "react_baseline", "n_questions": 1, "model_call_count": 1,
+        key: [{"id": "case-01", "correct": True}],
+    }
+    assert validate_metrics_contract(payload, expected_method="react_baseline").ok
+    assert validate_smoke_live_path(payload).ok
+
+
+def test_smoke_accepts_n_items_as_an_n_questions_synonym():
+    # Different task prompts legitimately declare different field-name
+    # conventions (observed directly: a real task's own contract asked for
+    # n_items/per_item instead of n_questions/per_question).
+    payload = {
+        "method": "zero_shot_direct", "n_items": 1, "model_call_count": 1,
+        "per_item": [{"id": "test-01", "correct": True}],
+    }
+    assert validate_metrics_contract(payload, expected_method="zero_shot_direct").ok
+    assert validate_smoke_live_path(payload).ok
+
+
+def test_smoke_accepts_model_call_count_nested_under_canonical_metrics_key():
+    # Observed directly against a real packaged run: the candidate wrote
+    # every scalar (including model_call_count) under the canonical
+    # `metrics` object instead of at the root, which this rejected before
+    # it also checked the nested location.
+    payload = {
+        "method": "zero_shot_direct",
+        "n_questions": 1,
+        "per_question": [{"id": "test-01", "correct": True}],
+        "metrics": {"model_call_count": 1},
+    }
+    assert validate_smoke_live_path(payload).ok
+
+
+def test_smoke_accepts_item_records_nested_under_canonical_metrics_key():
+    # Mirrors the model_call_count case: a candidate that writes its
+    # item-record list under the canonical `metrics` object instead of
+    # the root should not be rejected for it.
+    payload = {
+        "method": "zero_shot_direct",
+        "n_questions": 1,
+        "metrics": {
+            "model_call_count": 1,
+            "per_question": [{"id": "test-01", "correct": True}],
+        },
+    }
+    assert validate_metrics_contract(payload, expected_method="zero_shot_direct").ok
+    assert validate_smoke_live_path(payload).ok
+
+
+def test_nested_item_records_still_participate_in_count_mismatch_detection():
+    # Nested lookup must not blind the (non-blocking) mismatch note either.
+    payload = {
+        "n_questions": 2,
+        "model_call_count": 1,
+        "metrics": {"per_question": [{"id": "one"}]},
+    }
+    contract = validate_metrics_contract(payload)
+    assert contract.ok
+    assert any(issue.reason == "n_questions_mismatch" for issue in contract.issues)
+
+
+def test_malformed_n_questions_is_non_blocking():
+    payload = {"n_questions": "many", "model_call_count": 1, "item_records": [{"id": "one"}]}
+    contract = validate_metrics_contract(payload)
+    assert contract.ok
+    issue = next(i for i in contract.issues if i.reason == "malformed_n_questions")
+    assert issue.blocking is False
+
+
+def test_n_questions_non_positive_stays_blocking():
+    payload = {"n_questions": 0, "model_call_count": 1, "item_records": [{"id": "one"}]}
+    contract = validate_metrics_contract(payload)
+    assert not contract.ok
+    issue = next(i for i in contract.issues if i.reason == "n_questions_non_positive")
+    assert issue.blocking is True
+
+
+def test_existence_checks_stay_blocking_despite_mismatch_downgrade():
+    # The anti-stub / anti-fabrication checks must not have been weakened
+    # by downgrading the count-mismatch note.
+    harness_failed_payload = {"status": "failed", "n_questions": 1, "item_records": [{"id": "one"}]}
+    assert not validate_metrics_contract(harness_failed_payload).ok
+
+    universal_failure_payload = {
+        "status": "completed",
+        "n_questions": 1,
+        "item_records": [{"id": "one", "status": "failed"}],
+    }
+    assert not validate_metrics_contract(universal_failure_payload).ok
+
+    smoke_no_records_payload = {"n_questions": 1, "model_call_count": 1, "item_records": []}
+    assert not validate_smoke_live_path(smoke_no_records_payload).ok
+
+    smoke_no_call_payload = {"n_questions": 1, "model_call_count": 0, "item_records": [{"id": "one"}]}
+    assert not validate_smoke_live_path(smoke_no_call_payload).ok
+
+
+@pytest.mark.parametrize("records", [[], ["not an object"]])
+def test_alias_does_not_allow_empty_or_invalid_records(records):
+    # A declared n_questions that doesn't match the item-record count is a
+    # non-blocking data-quality note now (the host tolerates this class of
+    # mismatch by design) -- it must not fail an otherwise-real run.
+    payload = {"n_questions": 1, "model_call_count": 1, "item_records": records}
+    contract = validate_metrics_contract(payload)
+    assert contract.ok
+    assert any(issue.reason == "n_questions_mismatch" for issue in contract.issues)
+    result = validate_smoke_live_path(payload)
+    assert not result.ok
+    assert "per_question" in result.errors[0]
+
+
+def test_alias_keeps_count_failure_and_canonical_precedence_checks():
+    payload = {"n_questions": 2, "model_call_count": 1, "item_records": [{"id": "one"}]}
+    contract = validate_metrics_contract(payload)
+    assert contract.ok
+    assert any(issue.reason == "n_questions_mismatch" for issue in contract.issues)
+    payload.update(n_questions=1, per_question=[])
+    assert not validate_smoke_live_path(payload).ok
+    del payload["per_question"]
+    payload["model_call_count"] = 0
+    assert not validate_smoke_live_path(payload).ok
+    payload.update(status="completed", item_records=[{"status": "failed"}])
+    assert not validate_metrics_contract(payload).ok
+
+
+def test_repeated_metrics_failure_guides_writer_repair():
+    validation = CandidateValidation(ok=False, stage="metrics", repeated=True)
+    prompt = CodeImplementationAgent._build_validation_repair_prompt(validation)
+    assert "per_question=" in prompt
+    assert "metrics writer" in prompt
+    assert "Isolate the smallest failing SDK call" not in prompt
+
+
+def test_repeated_non_metrics_failure_keeps_sdk_guidance():
+    validation = CandidateValidation(ok=False, stage="smoke", repeated=True)
+    prompt = CodeImplementationAgent._build_validation_repair_prompt(validation)
+    assert "Isolate the smallest failing SDK call" in prompt
+
+
+def test_smoke_subprocess_receives_supplied_paper(tmp_path):
+    """Generated code reads the same input in smoke and full execution."""
+    code_dir = tmp_path / "code"
+    code_dir.mkdir()
+    paper = tmp_path / "paper.tex"
+    paper.write_text("supplied evidence", encoding="utf-8")
+    (code_dir / "run.py").write_text(
+        "import argparse, json, os\n"
+        "from pathlib import Path\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--method'); p.add_argument('--smoke-test', action='store_true')\n"
+        "p.add_argument('--output'); args = p.parse_args()\n"
+        "assert Path(os.environ['ARTIFACT_PATH']).read_text() == 'supplied evidence'\n"
+        "Path(args.output).write_text(json.dumps({'method': args.method, 'n_questions': 1, "
+        "'model_call_count': 1, 'per_question': [{'id': 'one', 'correct': True}]}))\n",
+        encoding="utf-8",
+    )
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    agent = CodeImplementationAgent({"code_implementation": {"smoke_test_timeout_seconds": 10}})
+    result = agent._run_smoke_and_metrics(
+        "input-check", code_dir, ["proposed"], cycle=1,
+        log_dir=log_dir, candidate_hash="test", artifact_path=str(paper),
+    )
+    assert result.ok, result.errors
+
+
+_TRACE_SCRIPT = (
+    "import argparse\n"
+    "p = argparse.ArgumentParser()\n"
+    "p.add_argument('--method')\n"
+    "p.add_argument('--smoke-test', action='store_true')\n"
+    "p.add_argument('--output')\n"
+    "p.parse_args()\n"
+    "raise ValueError('paired_discordance')\n"
+)
+
+_CONTRACT_FAIL_SCRIPT = (
+    "import argparse, json\n"
+    "from pathlib import Path\n"
+    "p = argparse.ArgumentParser()\n"
+    "p.add_argument('--method')\n"
+    "p.add_argument('--smoke-test', action='store_true')\n"
+    "p.add_argument('--output')\n"
+    "args = p.parse_args()\n"
+    "Path(args.output).write_text(json.dumps({\n"
+    "    'method': args.method, 'n_questions': 0,\n"
+    "    'model_call_count': 0, 'per_question': [],\n"
+    "}))\n"
+)
+
+
+def test_smoke_nonzero_exit_stores_error_tree_on_validation_and_manifest(tmp_path):
+    from datetime import UTC, datetime
+
+    from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.experiment_design.schemas import (
+        ExperimentPlan,
+    )
+
+    code_dir = tmp_path / "code"
+    code_dir.mkdir()
+    (code_dir / "run.py").write_text(_TRACE_SCRIPT, encoding="utf-8")
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    agent = CodeImplementationAgent({"code_implementation": {"smoke_test_timeout_seconds": 10}})
+    validation = agent._run_smoke_and_metrics(
+        "error-tree",
+        code_dir,
+        ["proposed"],
+        cycle=1,
+        log_dir=log_dir,
+        candidate_hash="test",
+    )
+    assert not validation.ok
+    tree = validation.error_trees["proposed"]
+    assert tree.startswith("Traceback (most recent call last):")
+    assert "ValueError: paired_discordance" in tree
+    now = datetime.now(UTC)
+    output = agent._build_output(
+        ExperimentPlan(
+            run_id="error-tree",
+            design_session_id="experiment-design:error-tree",
+            design_path="design.md",
+            code_agent_instruction_path="instruction.md",
+            created_at=now,
+            updated_at=now,
+        ),
+        code_dir,
+        ["proposed"],
+        "agent done",
+        validation=validation,
+    )
+    assert output.implementation.error_trees["proposed"] == tree
+    assert "exit_code=" in output.implementation.smoke_failures["proposed"]
+
+
+def test_smoke_metrics_contract_failure_omits_error_tree(tmp_path):
+    code_dir = tmp_path / "code"
+    code_dir.mkdir()
+    (code_dir / "run.py").write_text(_CONTRACT_FAIL_SCRIPT, encoding="utf-8")
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    agent = CodeImplementationAgent({"code_implementation": {"smoke_test_timeout_seconds": 10}})
+    validation = agent._run_smoke_and_metrics(
+        "contract-fail",
+        code_dir,
+        ["proposed"],
+        cycle=1,
+        log_dir=log_dir,
+        candidate_hash="test",
+    )
+    assert not validation.ok
+    assert "proposed" not in validation.error_trees
+    assert "metrics contract failed" in validation.failures["proposed"]

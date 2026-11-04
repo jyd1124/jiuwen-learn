@@ -1,0 +1,21 @@
+# openjiuwen.harness
+
+API documentation for the agent harness framework — built-in planning, context management, sub-agent spawning, and long-term memory for complex, multi-step tasks.
+
+| Module | Description |
+|---|---|
+| [`deep_agent`](./deep_agent.md) | `DeepAgent` class — the primary agent harness runtime |
+| [`factory`](./factory.md) | `create_deep_agent` convenience factory function |
+| [`schema/config`](./schema/config.md) | Configuration dataclasses (`DeepAgentConfig`, `SubAgentConfig`, `VisionModelConfig`, `AudioModelConfig`) |
+| [`schema/state`](./schema/state.md) | Persistent agent state (`DeepAgentState`) |
+| [`schema/loop_event`](./schema/loop_event.md) | Loop event types and helpers (`DeepLoopEventType`, `DeepLoopEvent`) |
+| [`schema/task`](./schema/task.md) | Task planning models (`TaskStatus`, `TaskItem`, `TaskPlan`) |
+| [`task_loop`](./task_loop/task_loop.md) | Task-loop runtime (`LoopCoordinator`, `TaskLoopController`, event handler and executor) |
+| [`workspace`](./workspace/workspace.md) | Workspace directory management (`Workspace`, `WorkspaceNode`) |
+| [`rails`](./rails/rails.md) | Built-in guardrails overview, including regular and team skill evolution rails |
+| [`rails/evolution/skill_evolution_rail`](./rails/evolution/skill_evolution_rail.md) | Regular skill online evolution (`SkillEvolutionRail`) |
+| [`rails/evolution/team_skill_evolution_rail`](./rails/evolution/team_skill_evolution_rail.md) | Team skill creation and online evolution (`TeamSkillCreateRail`, `TeamSkillEvolutionRail`; compatibility alias: `TeamSkillRail`) |
+| [`rails/evolution/trajectory_rail`](./rails/evolution/trajectory_rail.md) | Per-invoke canonical trajectory archival (`TrajectoryRail`) |
+| [`tools`](./tools/tools.md) | Built-in tools overview (27 tools) |
+| [`subagents`](./subagents/subagents.md) | Sub-agent factory functions (`create_browser_agent`, `create_code_agent`, `create_research_agent`) |
+| [`prompts`](./prompts/prompts.md) | Prompt assembly (`PromptMode`, `SystemPromptBuilder`, `PromptReport`, sanitizers) |

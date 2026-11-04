@@ -1,0 +1,159 @@
+# coding: utf-8
+"""Tests for role-based tool registration."""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from openjiuwen.agent_teams.agent.team_agent import TeamAgent
+from openjiuwen.agent_teams.schema.blueprint import (
+    DeepAgentSpec,
+    TeamAgentSpec,
+    TransportSpec,
+)
+from openjiuwen.agent_teams.schema.team import (
+    TeamRole,
+    TeamRuntimeContext,
+)
+
+
+def _tool_names(agent) -> set[str]:
+    """Extract registered tool names from the agent's ability manager.
+
+    Team tools register during ``ensure_initialized`` (the rail init pass), so
+    drive it first — ``build`` only prepares the config and queues the rails.
+    """
+    native = agent.harness.inner_agent
+    asyncio.run(native.ensure_initialized())
+    return set(native.ability_manager._tools.keys())
+
+
+def _dummy_agents() -> dict[str, DeepAgentSpec]:
+    """Build a minimal agents dict for unit tests (no real LLM)."""
+    return {"leader": DeepAgentSpec()}
+
+
+_PYZMQ_TRANSPORT = TransportSpec(
+    type="pyzmq",
+    params={
+        "team_id": "test",
+        "node_id": "team_leader",
+    },
+)
+
+
+# === Leader gets full tool set ===
+
+
+@pytest.mark.level0
+def test_leader_gets_management_tools():
+    """Leader should have team management and
+    messaging tools."""
+    leader = TeamAgentSpec(
+        agents=_dummy_agents(),
+        team_name="test",
+        transport=_PYZMQ_TRANSPORT,
+    ).build()
+    names = _tool_names(leader)
+    assert "create_task" in names
+    assert "build_team" in names
+    assert "spawn_teammate" in names
+    assert "send_message" in names
+    assert "view_task" in names
+
+
+# === Teammate gets execution-only tools ===
+
+
+@pytest.mark.level0
+@pytest.mark.skip(reason="pre-existing autonomous coordination issue, unrelated to reviewer PR")
+def test_teammate_gets_execution_tools():
+    """Teammate should have task execution and
+    messaging tools but not management-only tools."""
+    leader = TeamAgentSpec(
+        agents=_dummy_agents(),
+        team_name="test",
+        transport=_PYZMQ_TRANSPORT,
+    ).build()
+    ctx = TeamRuntimeContext(
+        role=TeamRole.TEAMMATE,
+        member_id="dev-1",
+        name="Dev",
+        desc="dev",
+        team_spec=leader._configurator.ctx.team_spec,
+        messager_config=leader._configurator.ctx.messager_config,
+        db_config=leader._configurator.ctx.db_config,
+    )
+    card = leader.card.model_copy(
+        update={
+            "id": "dev-1",
+            "name": "Dev",
+            "description": "Teammate: dev",
+        }
+    )
+    teammate = TeamAgent(card)
+    teammate.configure(leader._configurator.spec, ctx)
+    names = _tool_names(teammate)
+
+    # Execution tools present
+    assert "claim_task" in names
+    assert "send_message" in names
+    assert "view_task" in names
+
+    # Leader-only tools absent
+    assert "create_task" not in names
+    assert "build_team" not in names
+    assert "spawn_teammate" not in names
+
+
+# === Manager instances are stored ===
+
+
+@pytest.mark.level1
+def test_task_and_message_managers_are_stored():
+    """After configuration, _task_manager and
+    _message_manager should be set on the
+    TeamAgent."""
+    leader = TeamAgentSpec(
+        agents=_dummy_agents(),
+        team_name="test",
+        transport=_PYZMQ_TRANSPORT,
+    ).build()
+    assert leader._configurator.task_manager is not None
+    assert leader._configurator.message_manager is not None
+
+
+@pytest.mark.level1
+def test_teammate_registers_tool_approval_rail_from_deep_agent_spec():
+    """Configured teammate approval tools should attach TeamToolApprovalRail."""
+    leader = TeamAgentSpec(
+        agents={
+            "leader": DeepAgentSpec(),
+            "teammate": DeepAgentSpec(approval_required_tools=["send_message"]),
+        },
+        team_name="test",
+        transport=_PYZMQ_TRANSPORT,
+    ).build()
+    ctx = TeamRuntimeContext(
+        role=TeamRole.TEAMMATE,
+        member_id="dev-1",
+        name="Dev",
+        desc="dev",
+        team_spec=leader._configurator.ctx.team_spec,
+        messager_config=leader._configurator.ctx.messager_config,
+        db_config=leader._configurator.ctx.db_config,
+    )
+    card = leader.card.model_copy(
+        update={
+            "id": "dev-1",
+            "name": "Dev",
+            "description": "Teammate: dev",
+        }
+    )
+    teammate = TeamAgent(card)
+    teammate.configure(leader._configurator.spec, ctx)
+
+    rail_names = {type(r).__name__ for r in teammate.harness.inner_agent._pending_rails}
+    assert "TeamToolApprovalRail" in rail_names

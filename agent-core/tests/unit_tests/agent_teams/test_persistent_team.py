@@ -1,0 +1,252 @@
+# coding: utf-8
+
+"""Unit tests for persistent team feature."""
+
+from unittest.mock import (
+    AsyncMock,
+)
+
+import pytest
+import pytest_asyncio
+
+from openjiuwen.agent_teams.agent.coordination.event_bus import (
+    EventBus,
+)
+from openjiuwen.agent_teams.messager import Messager
+from openjiuwen.agent_teams.schema.team import (
+    TeamMemberSpec,
+    TeamRole,
+)
+from openjiuwen.agent_teams.context import (
+    reset_session_id,
+    set_session_id,
+)
+from openjiuwen.agent_teams.tools.database import (
+    DatabaseConfig,
+    DatabaseType,
+    TeamDatabase,
+)
+from openjiuwen.agent_teams.schema.status import (
+    is_valid_transition,
+    MEMBER_TRANSITIONS,
+    MemberStatus,
+)
+from openjiuwen.agent_teams.tools.team import TeamBackend
+from openjiuwen.agent_teams.schema.events import (
+    EventMessage,
+    TeamEvent,
+    TeamStandbyEvent,
+)
+from tests.test_logger import logger
+
+
+# ========== Fixtures ==========
+
+
+@pytest.fixture
+def db_config():
+    return DatabaseConfig(db_type=DatabaseType.SQLITE, connection_string=":memory:")
+
+
+@pytest_asyncio.fixture
+async def db(db_config):
+    token = set_session_id("session_1")
+    database = TeamDatabase(db_config)
+    try:
+        await database.initialize()
+        yield database
+    finally:
+        reset_session_id(token)
+        await database.close()
+
+
+@pytest_asyncio.fixture
+async def message_bus():
+    bus = AsyncMock(spec=Messager)
+    yield bus
+
+
+# ========== EventBus pause/resume ==========
+
+
+class TestEventBusPauseResume:
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_pause_polls_stops_polling(self):
+        loop = EventBus(role=TeamRole.LEADER)
+        await loop.start()
+        assert loop.is_running
+        assert not loop.polls_paused
+
+        await loop.pause_polls()
+        assert loop.polls_paused
+        assert loop._mailbox_poll_task is None
+        assert loop._task_poll_task is None
+        assert loop.is_running  # main loop still running
+
+        await loop.stop()
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_resume_polls_restarts_polling(self):
+        loop = EventBus(role=TeamRole.LEADER)
+        await loop.start()
+
+        await loop.pause_polls()
+        assert loop.polls_paused
+
+        await loop.resume_polls()
+        assert not loop.polls_paused
+        assert loop._mailbox_poll_task is not None
+        assert loop._task_poll_task is not None
+
+        await loop.stop()
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_pause_polls_idempotent(self):
+        loop = EventBus(role=TeamRole.LEADER)
+        await loop.start()
+        await loop.pause_polls()
+        await loop.pause_polls()  # should not raise
+        assert loop.polls_paused
+        await loop.stop()
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_resume_polls_noop_when_not_paused(self):
+        loop = EventBus(role=TeamRole.LEADER)
+        await loop.start()
+        original_mailbox = loop._mailbox_poll_task
+        await loop.resume_polls()  # should be noop
+        assert loop._mailbox_poll_task is original_mailbox
+        await loop.stop()
+
+
+# ========== TeamStandbyEvent ==========
+
+
+class TestTeamStandbyEvent:
+    @pytest.mark.level1
+    def test_standby_event_serialization(self):
+        event = TeamStandbyEvent(team_name="test_team")
+        msg = EventMessage.from_event(event)
+        assert msg.event_type == TeamEvent.STANDBY
+        logger.info("Standby event type: {}", msg.event_type)
+
+    @pytest.mark.level1
+    def test_standby_event_deserialization(self):
+        event = TeamStandbyEvent(team_name="test_team")
+        msg = EventMessage.from_event(event)
+        payload = msg.get_payload()
+        assert isinstance(payload, TeamStandbyEvent)
+        assert payload.team_name == "test_team"
+
+
+# ========== MemberStatus READY self-transition ==========
+
+
+class TestReadySelfTransition:
+    @pytest.mark.level1
+    def test_ready_to_ready_is_valid(self):
+        assert is_valid_transition(MemberStatus.READY, MemberStatus.READY, MEMBER_TRANSITIONS)
+
+    @pytest.mark.level1
+    def test_ready_to_busy_still_valid(self):
+        assert is_valid_transition(MemberStatus.READY, MemberStatus.BUSY, MEMBER_TRANSITIONS)
+
+
+# ========== Persistent team build_team + member status ==========
+
+
+class TestPersistentTeamBuildTeam:
+    @pytest_asyncio.fixture
+    async def persistent_team(self, db, message_bus):
+        predefined = [
+            TeamMemberSpec(
+                member_name="dev-1",
+                display_name="Developer",
+                desc="Backend dev",
+            ),
+        ]
+        return TeamBackend(
+            team_name="persistent_team",
+            member_name="leader1",
+            is_leader=True,
+            db=db,
+            messager=message_bus,
+            predefined_members=predefined,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_build_team_persistent_members_unstarted(self, persistent_team, db):
+        await persistent_team.build_team(
+            display_name="Persistent Team",
+            desc="A persistent team",
+            leader_display_name="Leader",
+            leader_desc="PM",
+        )
+
+        dev = await db.member.get_member("dev-1", "persistent_team")
+        assert dev.status == MemberStatus.UNSTARTED.value
+        logger.info("Persistent team member status after build: {}", dev.status)
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_persistent_team_member_can_go_ready_then_ready(self, persistent_team, db):
+        """Verify READY -> READY transition works for persistent team resume."""
+        await persistent_team.build_team(
+            display_name="Persistent Team",
+            desc="desc",
+            leader_display_name="Leader",
+            leader_desc="PM",
+        )
+        # Simulate member starting up
+        await db.member.update_member_status("dev-1", "persistent_team", MemberStatus.READY.value)
+        dev = await db.member.get_member("dev-1", "persistent_team")
+        assert dev.status == MemberStatus.READY.value
+
+        # Simulate persistent team resume (READY -> READY)
+        success = await db.member.update_member_status("dev-1", "persistent_team", MemberStatus.READY.value)
+        assert success
+        dev = await db.member.get_member("dev-1", "persistent_team")
+        assert dev.status == MemberStatus.READY.value
+
+
+# ========== resume_for_new_session ==========
+
+
+class TestResumeForNewSession:
+    @pytest_asyncio.fixture
+    async def db_file(self, tmp_path):
+        """Use file-based SQLite so state persists across session switches."""
+        db_path = str(tmp_path / "team.db")
+        config = DatabaseConfig(db_type=DatabaseType.SQLITE, connection_string=db_path)
+        token = set_session_id("session_1")
+        database = TeamDatabase(config)
+        try:
+            await database.initialize()
+            yield database, config
+        finally:
+            reset_session_id(token)
+            await database.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_new_session_creates_dynamic_tables(self, db_file):
+        database, config = db_file
+        team_id = "persistent_team"
+        await database.team.create_team(team_name=team_id, display_name="PT", leader_member_name="leader1")
+
+        # Switch session
+        token = set_session_id("session_2")
+        try:
+            await database.create_cur_session_tables()
+            # Verify team still exists (static table)
+            team = await database.team.get_team(team_id)
+            assert team is not None
+            assert team.display_name == "PT"
+            logger.info("Team persists across sessions: {}", team.display_name)
+        finally:
+            reset_session_id(token)

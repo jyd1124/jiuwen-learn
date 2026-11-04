@@ -1,0 +1,288 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+import os
+import shutil
+import tempfile
+
+import pytest
+import pytest_asyncio
+
+from openjiuwen.core.runner import Runner
+from openjiuwen.core.sys_operation import SysOperationCard, OperationMode, LocalWorkConfig
+from openjiuwen.core.sys_operation.cwd import init_cwd
+from openjiuwen.harness.tools import BashTool
+
+
+# ────────────────────────────────────────────────────────────
+# Fixtures
+# ────────────────────────────────────────────────────────────
+
+@pytest_asyncio.fixture(name="sys_op")
+async def sys_op_fixture():
+    await Runner.start()
+    card_id = "test_shell_tools_op"
+    card = SysOperationCard(id=card_id, mode=OperationMode.LOCAL, work_config=LocalWorkConfig(
+        shell_allowlist=[]
+    ))
+    Runner.resource_mgr.add_sys_operation(card)
+    op = Runner.resource_mgr.get_sys_operation(card_id)
+    init_cwd(os.getcwd())
+    yield op
+    Runner.resource_mgr.remove_sys_operation(sys_operation_id=card_id)
+    await Runner.stop()
+
+
+@pytest_asyncio.fixture(name="sys_op_sandboxed")
+async def sys_op_sandboxed_fixture():
+    """SysOperation with a temp workspace; yields (op, workspace_path)."""
+    await Runner.start()
+    workspace = tempfile.mkdtemp()
+    card_id = "test_shell_sandboxed_op"
+    card = SysOperationCard(id=card_id, mode=OperationMode.LOCAL, work_config=LocalWorkConfig())
+    Runner.resource_mgr.add_sys_operation(card)
+    op = Runner.resource_mgr.get_sys_operation(card_id)
+    yield op, workspace
+    Runner.resource_mgr.remove_sys_operation(sys_operation_id=card_id)
+    shutil.rmtree(workspace, ignore_errors=True)
+    await Runner.stop()
+
+
+@pytest.fixture
+def tmp_workspace():
+    path = tempfile.mkdtemp()
+    yield path
+    shutil.rmtree(path, ignore_errors=True)
+
+
+# ────────────────────────────────────────────────────────────
+# Original tests
+# ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_bash_tool(sys_op):
+    bash_tool = BashTool(sys_op)
+
+    bash_res = await bash_tool.invoke({"command": "echo 你好"})
+    assert bash_res.success is True
+    assert "你好" in bash_res.data["content"]
+    assert bash_res.error is None
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_ls_chinese_filename(sys_op, tmp_workspace):
+    import pathlib
+    bash_tool = BashTool(sys_op)
+
+    test_dir = pathlib.Path(tmp_workspace) / "test_chinese_files"
+    test_dir.mkdir(exist_ok=True)
+
+    try:
+        (test_dir / "测试文件.txt").write_text("test content", encoding="utf-8")
+        (test_dir / "中文文件 - 副本.txt").write_text("test content", encoding="utf-8")
+
+        ls_res = await bash_tool.invoke({"command": f"ls -la \"{test_dir}\""})
+        assert ls_res.success is True
+        assert "测试文件.txt" in ls_res.data["content"]
+        assert "中文文件 - 副本.txt" in ls_res.data["content"]
+        assert ls_res.error is None
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_fail_command(sys_op):
+    bash_tool = BashTool(sys_op)
+
+    fail_res = await bash_tool.invoke({"command": "echo fail && exit 1"})
+    assert fail_res.success is False
+    assert "Exit Code: 1" in fail_res.data["content"]
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_allowlist(sys_op):
+    card_id = "test_shell_allowlist_op"
+    card = SysOperationCard(id=card_id, mode=OperationMode.LOCAL, work_config=LocalWorkConfig(
+        shell_allowlist=["echo"]
+    ))
+    Runner.resource_mgr.add_sys_operation(card)
+    restricted_op = Runner.resource_mgr.get_sys_operation(card_id)
+    bash_tool = BashTool(restricted_op)
+
+    ok_res = await bash_tool.invoke({"command": "echo ok"})
+    assert ok_res.success is True
+
+    blocked_res = await bash_tool.invoke({"command": "whoami"})
+    assert blocked_res.success is False
+    assert blocked_res.error is not None
+    assert blocked_res.data is None
+
+    Runner.resource_mgr.remove_sys_operation(sys_operation_id=card_id)
+
+
+# ────────────────────────────────────────────────────────────
+# Dangerous command interception
+# Overlapping items (rm -rf / shutdown / disk / registry) are Engine policy.
+# Local no longer hard-blocks them; see test_shell_operation.py.
+# Local only honors explicit run_config.dangerous_patterns.
+# ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_custom_dangerous_patterns_still_block():
+    await Runner.start()
+    card_id = "test_shell_custom_danger"
+    card = SysOperationCard(
+        id=card_id,
+        mode=OperationMode.LOCAL,
+        work_config=LocalWorkConfig(
+            shell_allowlist=[],
+            dangerous_patterns=[r"custom-block-marker"],
+        ),
+    )
+    Runner.resource_mgr.add_sys_operation(card)
+    try:
+        bash_tool = BashTool(Runner.resource_mgr.get_sys_operation(card_id))
+        res = await bash_tool.invoke({"command": "echo custom-block-marker"})
+        assert res.success is False
+        assert res.data is None
+        assert "safety" in (res.error or "")
+        assert "custom-block-marker" in (res.error or "")
+    finally:
+        Runner.resource_mgr.remove_sys_operation(sys_operation_id=card_id)
+        await Runner.stop()
+
+
+# ────────────────────────────────────────────────────────────
+# Workdir sandbox
+# ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_workdir_valid_absolute_subdir(sys_op_sandboxed):
+    op, workspace = sys_op_sandboxed
+    subdir = os.path.join(workspace, "sub")
+    os.makedirs(subdir)
+    bash_tool = BashTool(op)
+
+    cmd = "cd" if os.name == "nt" else "pwd"
+    res = await bash_tool.invoke({"command": cmd, "workdir": subdir})
+    assert res.success is True
+
+
+@pytest.mark.asyncio
+async def test_workdir_valid_relative_subdir(sys_op_sandboxed):
+    from openjiuwen.core.sys_operation.cwd import init_cwd
+
+    op, workspace = sys_op_sandboxed
+    os.makedirs(os.path.join(workspace, "sub"))
+    init_cwd(workspace)
+    bash_tool = BashTool(op)
+
+    cmd = "cd" if os.name == "nt" else "pwd"
+    res = await bash_tool.invoke({"command": cmd, "workdir": os.path.join(workspace, "sub")})
+    assert res.success is True
+
+
+@pytest.mark.asyncio
+async def test_workdir_nonexistent_dir_fails(sys_op_sandboxed):
+    """BashTool no longer enforces sandbox; non-existent workdir simply fails at shell level."""
+    op, workspace = sys_op_sandboxed
+    bash_tool = BashTool(op)
+
+    missing_path = os.path.join(workspace, "definitely_not_exist_xyz")
+    res = await bash_tool.invoke({"command": "echo hi", "workdir": missing_path})
+    assert res.success is False
+    assert res.error is not None
+
+
+@pytest.mark.asyncio
+async def test_workdir_from_contextvar(sys_op, tmp_workspace):
+    """CWD comes from ContextVar via init_cwd(), not BashTool constructor."""
+    from openjiuwen.core.sys_operation.cwd import init_cwd, get_cwd
+
+    init_cwd(tmp_workspace)
+    bash_tool = BashTool(sys_op)
+
+    assert get_cwd() == str(os.path.realpath(tmp_workspace))
+    cmd = "cd" if os.name == "nt" else "pwd"
+    res = await bash_tool.invoke({"command": cmd})
+    assert res.success is True
+    assert tmp_workspace in res.data["content"] or os.path.realpath(tmp_workspace) in res.data["content"]
+
+
+# ────────────────────────────────────────────────────────────
+# Background execution
+# ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_default_workdir_prefers_current_cwd_over_workspace(sys_op, tmp_workspace):
+    """Workspace is an artifact root and must not override the active CWD."""
+    from openjiuwen.core.sys_operation.cwd import init_cwd
+
+    current_dir = os.path.join(tmp_workspace, "current")
+    os.makedirs(current_dir)
+    init_cwd(current_dir, workspace=tmp_workspace)
+    bash_tool = BashTool(sys_op)
+
+    cmd = "cd" if os.name == "nt" else "pwd"
+    res = await bash_tool.invoke({"command": cmd})
+
+    assert res.success is True
+    assert os.path.realpath(current_dir) in os.path.realpath(res.data["content"].strip())
+
+
+@pytest.mark.asyncio
+async def test_background_returns_pid(sys_op):
+    bash_tool = BashTool(sys_op)
+    cmd = "ping -n 5 127.0.0.1 > nul" if os.name == "nt" else "sleep 5"
+    res = await bash_tool.invoke({"command": cmd, "run_in_background": True})
+    assert res.success is True
+    assert res.data["status"] == "started"
+    assert isinstance(res.data["pid"], int)
+    assert res.data["pid"] > 0
+
+
+@pytest.mark.asyncio
+async def test_background_fast_fail_detected(sys_op):
+    bash_tool = BashTool(sys_op)
+    # exit 1 terminates immediately with non-zero, should be caught within grace period
+    res = await bash_tool.invoke({"command": "exit 1", "run_in_background": True})
+    assert res.success is False
+    assert res.error is not None
+    assert res.data is None
+
+
+# ────────────────────────────────────────────────────────────
+# Output truncation
+# ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_output_persisted_when_over_limit(sys_op):
+    bash_tool = BashTool(sys_op)
+    # python must be available since we're running in a Python test environment
+    py = "python" if os.name == "nt" else "python3"
+    res = await bash_tool.invoke({
+        "command": f'{py} -c "print(\'x\' * 500)"',
+        "max_output_chars": 250,
+    })
+    assert res.success is True
+    # over-limit output is persisted and shown as a <persisted-output> preview.
+    assert "<persisted-output>" in res.data["content"]
+
+
+@pytest.mark.asyncio
+async def test_output_not_truncated_within_limit(sys_op):
+    bash_tool = BashTool(sys_op)
+    res = await bash_tool.invoke({"command": "echo hello", "max_output_chars": 8000})
+    assert res.success is True
+    assert "hello" in res.data["content"]
+    assert "<persisted-output>" not in res.data["content"]
+
+
+@pytest.mark.asyncio
+async def test_max_output_chars_clamped_to_minimum(sys_op):
+    """max_output_chars below 200 should be silently clamped to 200."""
+    bash_tool = BashTool(sys_op)
+    res = await bash_tool.invoke({"command": "echo hi", "max_output_chars": 1})
+    assert res.success is True
+    # max_output_chars below 200 is clamped to 200; short output is not persisted.
+    assert "hi" in res.data["content"]

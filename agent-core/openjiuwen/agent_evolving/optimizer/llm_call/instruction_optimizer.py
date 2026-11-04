@@ -1,0 +1,272 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+"""
+InstructionOptimizer: Uses LLM to rewrite system/user prompts based on error cases and reflections.
+
+- backward: Uses LLM to generate textual gradients and pre-compute optimized prompts.
+- step: Returns pre-computed optimized prompts (no LLM calls; all done in backward).
+"""
+
+import re
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+from openjiuwen.agent_evolving.optimizer.base import TextualParameter
+from openjiuwen.agent_evolving.optimizer.llm_call.base import LLMCallOptimizerBase
+from openjiuwen.agent_evolving.optimizer.llm_call.templates import (
+    CREATE_BAD_CASE_TEMPLATE,
+    CREATE_PROMPT_TEXTUAL_GRADIENT_TEMPLATE,
+    PLACEHOLDER_RESTORE_TEMPLATE,
+    PROMPT_INSTRUCTION_OPTIMIZE_BOTH_TEMPLATE,
+    PROMPT_INSTRUCTION_OPTIMIZE_TEMPLATE,
+)
+from openjiuwen.agent_evolving.utils import TuneUtils
+from openjiuwen.core.foundation.llm import Model, ModelClientConfig, ModelRequestConfig
+from openjiuwen.core.foundation.prompt.assemble.assembler import PromptAssembler
+
+if TYPE_CHECKING:
+    from openjiuwen.agent_evolving.signal.base import EvolutionSignal
+
+
+class InstructionOptimizer(LLMCallOptimizerBase):
+    """
+    Optimizes LLM prompts using textual gradients.
+
+    Uses LLM to:
+    1. _backward(): Generate textual gradients explaining why prompts failed,
+       then pre-compute optimized prompts (all LLM calls happen here).
+    2. _step(): Return pre-computed optimized prompts (sync, no LLM calls).
+    """
+
+    def __init__(
+        self,
+        model_config: ModelRequestConfig,
+        model_client_config: ModelClientConfig,
+    ):
+        """
+        Initialize instruction optimizer.
+
+        Args:
+            model_config: LLM request configuration
+            model_client_config: LLM client configuration
+            targets: Parameters to optimize (default: ["system_prompt", "user_prompt"])
+        """
+        super().__init__()
+        self._model = Model(model_client_config, model_config)
+
+    def _select_signals(self, signals: List["EvolutionSignal"]) -> List["EvolutionSignal"]:
+        """Consume only failure-driven signals for prompt optimization."""
+        selected: List["EvolutionSignal"] = []
+        failure_signal_types = {
+            "execution_failure",
+            "low_score",
+            "user_intent",
+        }
+        for signal in signals:
+            context = signal.context or {}
+            collaboration_failed = (
+                signal.signal_type == "collaboration" and context.get("collaboration_event") == "failure"
+            )
+            if context.get("score", 1) == 0 or signal.signal_type in failure_signal_types or collaboration_failed:
+                selected.append(signal)
+        return selected
+
+    async def _backward(self, signals: List["EvolutionSignal"]) -> None:
+        """Generate textual gradients and pre-compute optimized prompts (all LLM calls here)."""
+        for op_id, param in self._parameters.items():
+            op = self._operators.get(op_id)
+            if not op:
+                continue
+
+            # Clear any optimized-prompt caches left by a previous epoch so that a
+            # failed or missing LLM response in *this* epoch never re-applies stale data.
+            param.set_gradient("system_prompt_optimized", None)
+            param.set_gradient("user_prompt_optimized", None)
+
+            # No selected failure-driven signals means no cases to learn from.
+            if not self._selected_signals:
+                continue
+
+            textual_gradient = await self._generate_textual_gradient(op)
+            if not self._is_target_frozen(op, "system_prompt"):
+                param.set_gradient("system_prompt", textual_gradient)
+            if not self._is_target_frozen(op, "user_prompt"):
+                param.set_gradient("user_prompt", textual_gradient)
+
+            # Pre-compute optimized prompts in backward (async context); _step is sync
+            has_sys = "system_prompt" in self._targets and not self._is_target_frozen(op, "system_prompt")
+            has_usr = "user_prompt" in self._targets and not self._is_target_frozen(op, "user_prompt")
+
+            if has_sys and has_usr:
+                sys_val, usr_val = await self._optimize_both(op, param)
+                if sys_val:
+                    param.set_gradient("system_prompt_optimized", sys_val)
+                if usr_val:
+                    param.set_gradient("user_prompt_optimized", usr_val)
+            elif has_sys:
+                val = await self._optimize_single(op, param, "system_prompt")
+                if val:
+                    param.set_gradient("system_prompt_optimized", val)
+            elif has_usr:
+                val = await self._optimize_single(op, param, "user_prompt")
+                if val:
+                    param.set_gradient("user_prompt_optimized", val)
+
+    def _step(self) -> Optional[Dict[tuple[str, str], Any]]:
+        """Return pre-computed optimized prompts; all LLM calls were done in _backward."""
+        updates: Dict[tuple[str, str], Any] = {}
+
+        for op_id, param in self._parameters.items():
+            sys_val = param.get_gradient("system_prompt_optimized")
+            usr_val = param.get_gradient("user_prompt_optimized")
+            if sys_val:
+                updates[(op_id, "system_prompt")] = sys_val
+            if usr_val:
+                updates[(op_id, "user_prompt")] = usr_val
+
+        return updates if updates else None
+
+    async def _generate_textual_gradient(self, op: Any) -> str:
+        """Use LLM to analyze why the current prompt failed."""
+        system_tpl = self._get_prompt_template(op, "system_prompt")
+        user_tpl = self._get_prompt_template(op, "user_prompt")
+        messages = CREATE_PROMPT_TEXTUAL_GRADIENT_TEMPLATE.format(
+            {
+                "system_prompt": TuneUtils.get_content_string_from_template(system_tpl),
+                "user_prompt": TuneUtils.get_content_string_from_template(user_tpl),
+                "bad_cases": self._format_bad_cases(),
+                "tools_description": "None",
+            }
+        ).to_messages()
+        raw_response = (await self._model.invoke(messages)).content
+        return raw_response if isinstance(raw_response, str) else str(raw_response)
+
+    async def _invoke_llm(self, messages) -> str:
+        """Invoke LLM and return string content."""
+        raw = (await self._model.invoke(messages)).content
+        return raw if isinstance(raw, str) else str(raw)
+
+    async def _optimize_both(self, op: Any, param: TextualParameter) -> Tuple[Optional[str], Optional[str]]:
+        """Optimize both system and user prompts together."""
+        system_tpl = self._get_prompt_template(op, "system_prompt")
+        user_tpl = self._get_prompt_template(op, "user_prompt")
+        gradient = param.get_gradient("system_prompt") or ""
+
+        messages = PROMPT_INSTRUCTION_OPTIMIZE_BOTH_TEMPLATE.format(
+            {
+                "system_prompt": TuneUtils.get_content_string_from_template(system_tpl),
+                "user_prompt": TuneUtils.get_content_string_from_template(user_tpl),
+                "bad_cases": self._format_bad_cases(),
+                "reflections_on_bad_cases": gradient,
+                "tools_description": "None",
+            }
+        ).to_messages()
+
+        raw_response = await self._invoke_llm(messages)
+        sys_prompt = self._extract_tag(raw_response, "SYSTEM_PROMPT_OPTIMIZED")
+        usr_prompt = self._extract_tag(raw_response, "USER_PROMPT_OPTIMIZED")
+
+        sys_prompt = (
+            await self._restore_placeholders(
+                TuneUtils.get_content_string_from_template(system_tpl),
+                sys_prompt or "",
+            )
+            if sys_prompt
+            else None
+        )
+        usr_prompt = (
+            await self._restore_placeholders(
+                TuneUtils.get_content_string_from_template(user_tpl),
+                usr_prompt or "",
+            )
+            if usr_prompt
+            else None
+        )
+
+        return sys_prompt, usr_prompt
+
+    async def _optimize_single(self, op: Any, param: TextualParameter, prompt_type: str) -> Optional[str]:
+        """Optimize a single prompt (system or user)."""
+        target_tpl = self._get_prompt_template(op, prompt_type)
+        gradient = param.get_gradient(prompt_type) or ""
+
+        messages = PROMPT_INSTRUCTION_OPTIMIZE_TEMPLATE.format(
+            {
+                "prompt_instruction": TuneUtils.get_content_string_from_template(target_tpl),
+                "bad_cases": self._format_bad_cases(),
+                "reflections_on_bad_cases": gradient,
+                "tools_description": "None",
+            }
+        ).to_messages()
+
+        raw_response = await self._invoke_llm(messages)
+        optimized = self._extract_tag(raw_response, "PROMPT_OPTIMIZED")
+
+        if optimized:
+            optimized = await self._restore_placeholders(
+                TuneUtils.get_content_string_from_template(target_tpl),
+                optimized,
+            )
+
+        return optimized
+
+    def _format_bad_cases(self) -> str:
+        """Format selected failure-driven signals for LLM prompts."""
+        parts: List[str] = []
+        for signal in self._selected_signals:
+            ctx = signal.context or {}
+            formatted = CREATE_BAD_CASE_TEMPLATE.format(
+                {
+                    "question": ctx.get("question", ""),
+                    "label": ctx.get("label", ""),
+                    "answer": ctx.get("answer", ""),
+                    "reason": ctx.get("reason", ""),
+                }
+            )
+            content = formatted.content
+            if isinstance(content, str):
+                parts.append(content)
+            elif content:
+                parts.append(str(content))
+        return "".join(parts)
+
+    def _extract_tag(self, response: str, tag: str) -> Optional[str]:
+        """Extract content between XML-like tags."""
+        pattern = rf"<{tag}>(.*?)</{tag}>"
+        match = re.search(pattern, response, re.DOTALL)
+        if not match:
+            return None
+
+        content = match.group(1)
+        return content.replace("<prompt_base>", "").replace("</prompt_base>", "")
+
+    async def _restore_placeholders(
+        self,
+        original_prompt: str,
+        optimized_prompt: str,
+    ) -> str:
+        """Ensure optimized prompt has same placeholders as original."""
+        original_keys = PromptAssembler(original_prompt).input_keys
+        optimized_keys = PromptAssembler(optimized_prompt).input_keys
+
+        missing = set(original_keys) - set(optimized_keys)
+
+        if missing:
+            messages = PLACEHOLDER_RESTORE_TEMPLATE.format(
+                {
+                    "original_prompt": original_prompt,
+                    "revised_prompt": optimized_prompt,
+                    "all_placeholders": str(list(original_keys)),
+                    "missing_placeholders": str(list(missing)),
+                }
+            ).to_messages()
+
+            raw = await self._invoke_llm(messages)
+            restored_keys = PromptAssembler(raw).input_keys
+
+            still_missing = set(original_keys) - set(restored_keys)
+            if still_missing:
+                placeholder_text = "\n".join(f"{{{{{ph}}}}}" for ph in still_missing)
+                raw = str(raw) + "\n" + placeholder_text
+            return raw if isinstance(raw, str) else optimized_prompt
+
+        return optimized_prompt

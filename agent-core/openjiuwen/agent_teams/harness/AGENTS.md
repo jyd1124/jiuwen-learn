@@ -1,0 +1,154 @@
+# Agent Teams Harness（NativeHarness 运行时外壳）
+
+team 成员的运行时外壳层。`NativeHarness` 是 `DeepAgent` 的子类——它 **就是** 那个 DeepAgent，
+只替换交互模型：用单 supervisor 协程一次驱动一个 outer round（`submit_round` +
+`wait_round_completion`），保留 DeepAgent 的全部能力（task loop / 中断恢复 / plan mode /
+SESSION_SPAWN / rails / state）。`TeamHarness` 在其上做 team 适配。
+
+## 模块地图
+
+```
+harness/
+├── protocol.py        # HarnessProtocol（结构化契约，isinstance 校验）：send / abort / pause / resume / stop / outputs
+├── native_harness.py  # NativeHarness(DeepAgent)：supervisor + round 驱动 + send/steer/follow_up；run_once 非流式单次 invoke（不开 supervisor，返回 Runner.run_agent 格式 dict）
+├── team_harness.py    # TeamHarness：在 NativeHarness 上做 team 适配（build / role）；run_once 转发（单轮 worker 入口）；实现 TaskNoticeAwareRuntime：运行周期内用当前子 session 与 configurator 经 `build(task_event_tracker=...)` 交给它的任务告知 tracker 发修改告知（F_129）
+├── control.py         # _CmdSend / _CmdAbort / _CmdPause / _CmdResume / _CmdRoundFinished / _CmdStop
+├── state.py           # HarnessInternalState / InboxMessage / ActiveRound / HarnessState / RoundPhase
+├── turn.py            # MemberTurn + resolve_member_turn：成员轨迹 turn 身份（持久化在 session state，无 OTel 依赖）
+├── outputs.py         # _OutputIterator / _END 输出迭代
+├── snapshot_rail.py   # PhaseSnapshotRail：inner-loop 阶段追踪 + iteration/round 边界快照 + cooperative stop
+└── async_tools.py     # 异步后台工具框架（AsyncTool / AsyncToolRuntime / render_result_text）
+```
+
+## 输入队列：steering 与 follow-up
+
+两条队列，同一个语义——**攒住的东西整批喂给下一次模型调用**：
+
+- `send(immediate=True)` 推进当前 round 的 steering 队列，inner loop 在下一次 model call
+  之前 drain；每条即时输入携带自己的 `run_context`，不同上下文的连续消息分属不同 model
+  boundary，消费时才切换 callback context，不能因为上下文不同而降级成 follow-up；
+- `send(immediate=False)` 进 follow-up 队列，round 结束时**整批** drain 出来驱动下一轮
+  （[[F_71]]）。曾经是 `pop(0)` 一条一轮——两条队列本该同义却不同义，代价是每条排队输入
+  各烧一个完整 round，而且成员对最旧那条动手时看不见后面还排着什么。
+
+**steering 侧每次取多少由 rail 现场定**（[[F_78]]）：drain 之前触发
+`BEFORE_STEERING_DRAIN`（队列为空则不触发），rail 写 `SteeringDrainInputs.limit`；不写就是
+全取，即无 rail 意见时的原行为。team 的非 leader 成员由 `TeamPolicyRail` 限到
+`steer_batch_size` 条（默认 2）——那条队列装的是信箱消息，每条各说各的、一条都不能丢，
+攒多了拼成一个巨型 turn 会把模型顶崩。取不走的原封留在队列里，inner loop 本来就在
+`has_pending_steering()` 为真时继续迭代，后续 model call 依次取完；**队列非空时至少取 1 条**，
+否则 loop 会空转到 `max_iterations` 耗尽。
+
+两条批次都**不在本层拼接**：整批以列表往下走（`InputEvent.input_data` 每条一个 text frame），
+由 inner `ReActAgent._admit_user_message` 先把列表交给 `ON_USER_MESSAGE` rail、rail 增删完
+才拼成一条 user message。拼早了 rail 就只能对着正文做字符串解析——team 侧正是靠这个整条剔除
+被后来者覆盖的任务看板。
+
+## pause / abort / resume（两个正交动词）
+
+停止点一律落在 **inner ReAct iteration 边界**。`abort` 丢弃当前 round（→ IDLE，下次 `send` 起
+全新 round）；`pause` 停在干净边界并**保留 round**（→ PAUSED，`resume` 原地续跑，不追加新的
+user turn）。
+
+`PhaseSnapshotRail` 是正确性权威：它在 `before/after_model_call` 上做 cooperative
+`force_finish`，保证 loop 总能停在边界、**绝不打断运行中的 tool**（副作用不可撤销）；supervisor
+的 hard-cancel 只是及时性优化，且 gated 到 `model_call_in_flight`（只能落在 parked 的 LLM
+`await`）。tool 阶段的 pause 经 `PAUSING` 过渡态等待边界，ack 延迟到 `_on_round_done` resolve。
+
+该 rail 用 **harness back-ref**（公共只读属性 `harness.active_round`）定位活跃 round —— inner loop 跑在
+TaskScheduler 的 exec task 里，ContextVar 读不到。详见 [`S_18`](../../../.agents/agent-docs/specs/agent_teams/S_18_harness-interaction-contract.md)
+与 [`F_60`](../../../.agents/agent-docs/features/agent_teams/F_60_native-harness-pause-abort-resume.md)。
+
+## 轨迹 turn（`turn.py`）
+
+一次 Team 运行周期所有成员共用一个 `team.<name>` trace，trace 分不出成员的一轮轮工作，所以每个
+round 自带 turn 身份：`_start_round` 调 `resolve_member_turn` 把 `MemberTurn` 挂到 `ActiveRound.turn`。
+
+- **开新 turn**：IDLE 起 round、drain follow-up 批次起 round；
+- **沿用当前 turn**：steer（不起 round）、`resume_continuation`（warm/cold resume、PAUSED 时 send）、
+  `InteractiveInput` 回答、failure retry、task-plan 续跑（`continues_turn=True`）。
+
+计数器存 session state 的 `trajectory_member_turn` 键——**不在** `deepagent` blob 里，因为 pause/abort
+回滚 `DeepAgentState` 会把编号倒回去。harness 每个周期重建，编号从 session 读出继续递增；开新 turn 的
+round 在跑之前 `session.commit()` 一次，进程中途死掉也不会复用编号。`TeamObservabilityRail` 把
+`active_round.turn` 作为 `openjiuwen.turn.id/number` 放进 agent span decoration，Step / LLM / tool /
+v2 event 再从 span 父链继承。外部 CLI 成员（`external/member_runtime.py`）每个 provider turn 开一个
+新 turn，经 `start_turn(turn=...)` 交给 claude/codex bridge 打到 turn span 及其子 span 上。
+
+## 异步工具框架（`async_tools.py`）
+
+照搬 Claude Code 两段式范式的通用异步后台工具框架，**限定在 NativeHarness 范围、零
+TeamAgent 依赖**。详见 `.agents/agent-docs/features/agent_teams/F_35`（起步版）、`F_41`（统一 ID + 管控工具 + 磁盘溢写）
+与 `.agents/agent-docs/specs/agent_teams/S_20`。
+
+**两段式（强约束下的唯一可行解）**：openjiuwen 工具循环与 Anthropic API 一样强配对——
+每个 `tool_call` 必产生紧随的 `ToolMessage`，`invoke` 同步阻塞、不可挂起 `tool_result`。
+所以异步工具：① `invoke` 立即返回 `launched(task_id)` 闭合配对、不阻塞当前轮；② 完成结果
+**绕过工具协议**，经 `NativeHarness.send(text, immediate=False)` 作为独立注入式消息进下一轮
+（IDLE 起新轮、RUNNING 排 follow-up，**统一不分 active/idle**）。
+
+| 符号 | 职责 |
+|---|---|
+| `AsyncTool(TeamTool)` | 异步工具基类。持 `parent_agent`(NativeHarness)；子类实现 `run_background(task_id, inputs)`；`invoke` 立即返回 launched |
+| `AsyncToolRuntime` | 挂在 NativeHarness 上的后台任务注册表 + 完成注入器。`launch(task_id, coro_factory, *, tool_name, description, format_completed=None, format_failed=None)` / `has_running` / `cancel_all` + 管控面 `get` / `list_all` / `cancel(task_id)` / `wait(task_id, timeout)`；`_tasks` 是 `dict[task_id, Task]`（非 set）+ per-task `_events`；完成经 `_maybe_spill`（内联 vs 写盘）后调注入回调（= `harness.send(immediate=False)`）。`_run`：回调存在且返回非 `None` 则用回调文本 inject，否则回退 `async_tool.completed` / `async_tool.failed` |
+| `AsyncToolRecord` | 注册表行（task_id / tool_name / status / result / error / `output_file` / `format_completed` / `format_failed` 可选回调） |
+| `CompletionFormatter` / `FailureFormatter` | 类型别名（`Callable[[Any], str \| None]` / `Callable[[str], str \| None]`，`async_tools.__all__` 导出） |
+| `render_result_text` | 通用结果渲染，**完整不截断**（str 原样 / dict-list JSON / 其它 str()） |
+
+**NativeHarness 集成**：`async_tool_runtime`（lazy property，`inject=self._inject_async_completion`）
++ `launch_async_tool(...)`（透传 `format_completed` / `format_failed` 给 `async_tool_runtime.launch`）
++ `stop()` 调 `cancel_all()`。
+
+**AgentTemplate 快照**：`DeepAgentSpec.agent_template_spec` 是可序列化的普通映射。
+`NativeHarness._prepare()` 初始化基础 rails 后将其还原为 `AgentTemplateSpec`，再经
+`DeepAgent.load_agent_template_spec()` 挂载；同一 harness 只加载一次，新建 harness 从其 spec
+快照重新加载。基础 rails 必须先初始化，因为模板 Skill 绑定并 reload 已存在的
+`SkillUseRail`；整个 prepare 仍发生在任何模型调用之前。见 `S_23` / `F_81`。
+
+**工具拿 harness 的方式**：照 `sessions_spawn` 形状——`AsyncTool` 持 `parent_agent`，由
+`TeamToolRail.init(agent)` 的 `agent`(NativeHarness) 在装配期注入（invoke 时 harness 早已 start）。
+
+**第一个实现 = swarmflow**（`workflow/tool_swarmflow.py`）。基类契约演进：旧版 `run_background` 返回
+文本直接进 `async_tool.completed`；现版 `run_background` 返回**原始结果**（`Any`，非 `str`），终态文本由子类经
+`format_completed` / `format_failed` 回调产出（swarmflow 注入 `swarmflow.completed` / `swarmflow.failed`，含
+`run_id` + `summarize_run` 摘要）；无回调时框架用 `render_result_text` + 默认 `async_tool.*`（不含 run_id）。
+新增异步工具时继承 `AsyncTool`、实现 `run_background`、按需传 `format_*` 回调、经装配注入 `parent_agent`
+即可——不必再手搓后台 task + 事件 + handler。详见 `F_47` / `S_20` / `S_21`。
+
+**统一 task_id**：`AsyncTool.invoke` 用 `id_generator.generate_id(self.card.name)`（前缀体系，
+swarmflow→`w`、未注册→`t`）；`id_generator.py` 在 agent_teams 顶层（非 core）。
+
+**管控工具**（`tools/tool_async.py`，三个普通 `TeamTool`、非 `AsyncTool` —— 同步立即返回）：
+`async_tasks_list` / `async_task_output`（`block`/`timeout` + 读盘）/ `async_task_cancel`，经
+`parent_agent.async_tool_runtime` 操作，列入 `LEADER_ONLY_TOOLS` 始终注入（不 gate）。
+
+**磁盘溢写**：结果文本 >`spill_threshold`（默认 32KB）时写
+`paths.async_tool_output_dir(team_name, session_id)/{task_id}.output` + 注入"摘要+路径+取回提示"；
+≤阈值完整内联（尊重"完整回灌"）。溢写目录由 `TeamToolRail._wire_async_spill` 经
+`output_dir_resolver` 惰性注入（runtime 不知 team_name/session_id）+ `register_cleanup_path`
+注册清理。详见 `S_20` / `F_41`。
+
+## 铁律
+
+1. **框架不牵扯 TeamAgent。** 只依赖 NativeHarness 公共表面（`send` / `launch_async_tool` /
+   `model`）。`TeamAgent.deliver_input` 只是 `harness.send` 的薄包装；要注入直接用 harness。
+   `send(..., run_context=...)` 的上下文按模型轮次隔离：延迟输入遵守全局 FIFO，只批量合并
+   连续且 `run_context` 相同的字符串输入，绝不能跨上下文合并或重排。
+2. **没有异步 tool_result。** 启动段与完成段是两个独立回合；完成结果绝不回到原 `tool_use_id`。
+3. **不收编 sessions_spawn / 不走 TaskScheduler 的 SESSION_SPAWN。** 避免结果写进 DeepAgent
+   `pending_follow_ups`（进 session checkpoint 的 user-bound 语义）污染恢复。
+
+## NativeHarness 的公共 protocol 适配
+
+`protocol_adapter.py` 导出 `NativeHarnessProtocolAdapter` 与
+`create_native_harness_protocol(manifest, *, agent_spec=None, build_context=None, event_buffer_capacity=1024)`。
+manifest 复用 `load_manifest` 和 `DeepAgentSpec.agent_template_spec`，装配仍由 NativeHarness._prepare
+完成。输入排队由 protocol adapter 独占，不能直接驱动其 `native_harness.send` 或读取 outputs。
+
+输出映射复用 `DeepAgentHarness`；原生状态与 round 回调经 session FIFO 控制标记和输出同步。
+只有 native IDLE 终结外部 Turn；PAUSED/RESUMED 属于同一 Turn。保留 graceful/force abort、warm
+pause/resume。`checkpoint.py` 使用 JSON 信封和现有 VCS context codec 保存暂停/IDLE 边界，
+恢复后 start 保持 IDLE、resume 延续原 Turn 和 queued receipt；不序列化活跃后台执行。
+统一工厂 `provider="native_v2"` 惰性加载本目录的 `NativeV2HarnessProvider`，复用同一 manifest
+装配逻辑，card/checkpoint provider 均为 native_v2。`provider="native"` 仍对应 DeepAgent。
+见 [F_97](../../../.agents/agent-docs/features/agent_teams/F_97_native-harness-protocol-adapter.md)。

@@ -1,0 +1,408 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""``run_swarmflow`` — drive a swarmflow script on the team worker backend.
+
+This is the integration entrypoint the ``swarmflow()`` tool calls: it wires a
+:class:`TeamWorkerBackend` (real LLM workers) and the caller's observer into the
+engine's ``run_workflow``. ``preprocess_swarmflow`` runs the same script offline
+with the deterministic ``MockBackend`` to produce the 4-layer ``WorkflowRun``
+the console can preview before real execution.
+
+The script's primitives are exposed under ``jiuwenswarm.swarmflow`` (and the
+bare ``swarmflow`` the loader always maps), so a script may import either.
+"""
+from __future__ import annotations
+
+from typing import Any, Callable, Mapping, Sequence
+
+import aiofiles
+import aiofiles.os
+
+from openjiuwen.agent_teams import paths
+from openjiuwen.agent_teams.workflow.backends.team_worker_backend import TeamWorkerBackend
+from openjiuwen.agent_teams.workflow.engine import (
+    MockBackend,
+    ProgressKind,
+    WorkflowProgressEvent,
+    run_workflow,
+)
+from openjiuwen.agent_teams.workflow.engine.budget import BudgetLedger
+from openjiuwen.agent_teams.workflow.engine.loader import extract_workflow_meta, load_workflow_meta
+from openjiuwen.agent_teams.workflow.engine.runtime import AbortSignal
+from openjiuwen.agent_teams.workflow.observer import WorkflowObserver
+from openjiuwen.agent_teams.workflow.schema import WorkflowRun
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import raise_error
+from openjiuwen.core.common.logging import team_logger
+
+
+def _team_log_sink(message: str) -> None:
+    team_logger.warning("{}", message)
+
+
+def _workflow_name(script_path: str) -> str | None:
+    """Read the workflow name from the script ``META`` (best-effort).
+
+    Used to namespace avatar child session ids (``{team}/{workflow}/{member}``)
+    so avatars of the same-named workflow share a stable session across a
+    same-process resume, while different workflows never collide. Returns
+    ``None`` when the script declares no ``name`` (the backend falls back to a
+    workflow-less namespace).
+    """
+    try:
+        meta = load_workflow_meta(script_path)
+        return meta.get("name")
+    except Exception:  # noqa: BLE001 - best-effort namespace read
+        return None
+
+
+def _resolve_journal_path(
+    script_path: str,
+    team_name: str,
+    session_id: str | None,
+    run_id: str | None = None,
+) -> str:
+    """Compute the resume-journal path for a swarmflow run.
+
+    Reads the workflow name from the script ``META`` (required) and maps it
+    to the per-team, per-session journal file. With a ``run_id`` the journal
+    is **per-run** (``journal-{run_id}.jsonl``): each run snapshots to its own
+    file, so two concurrent runs of the same workflow never overwrite each
+    other. Without one (offline / legacy callers) the shared ``journal.jsonl``
+    fallback is used. Both ``resume`` and ``journal_path`` use this single
+    path, so a resume of the same run replays the prior records (cache-hit
+    short-circuit).
+
+    Args:
+        script_path: Path to the swarmflow script.
+        team_name: Team identifier.
+        session_id: Current session id; falls back to ``"default"`` when empty.
+        run_id: Workflow run id; ``None`` falls back to the shared journal.
+
+    Returns:
+        Absolute journal file path as a string.
+
+    Raises:
+        BaseError: If the script ``META`` declares no ``name``.
+    """
+    meta = load_workflow_meta(script_path)
+    name = meta.get("name")
+    if not name:
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason="swarmflow script META requires a 'name' to persist its resume journal",
+        )
+    sid = session_id or "default"
+    journal = paths.workflow_run_journal_path(team_name, sid, name, run_id)
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    return str(journal)
+
+
+def _resolve_wal_path(
+    script_path: str,
+    team_name: str,
+    session_id: str | None,
+    run_id: str | None = None,
+) -> str | None:
+    """Compute the per-run WAL path for a swarmflow run (``wal/{run_id}.wal``).
+
+    Splitting the WAL by run_id is the concurrency fix: two parallel runs of
+    the same workflow append to their own files, so neither a finalize-time
+    cleanup nor any shared-file rewrite can clobber the other run's records.
+    Without a ``run_id`` the legacy shared sidecar ``journal.jsonl.wal`` is
+    used. Returns ``None`` only when the script ``META`` is unreadable (the
+    engine then runs with durability off for this call site's journal).
+
+    Args:
+        script_path: Path to the swarmflow script (``META`` names the workflow).
+        team_name: Team identifier.
+        session_id: Current session id; falls back to ``"default"`` when empty.
+        run_id: Workflow run id; ``None`` falls back to the shared sidecar.
+
+    Returns:
+        Absolute WAL file path as a string, or ``None`` on an unreadable META.
+    """
+    try:
+        meta = load_workflow_meta(script_path)
+    except Exception:  # noqa: BLE001 - WAL path must never break the launch
+        return None
+    name = meta.get("name")
+    if not name:
+        return None
+    sid = session_id or "default"
+    wal = paths.workflow_run_wal_path(team_name, sid, name, run_id)
+    if run_id:
+        wal.parent.mkdir(parents=True, exist_ok=True)
+    return str(wal)
+
+
+def _resolve_legacy_resume(
+    script_path: str,
+    team_name: str,
+    session_id: str | None,
+    run_id: str | None,
+) -> str | None:
+    """Compute the pre-per-run shared journal path, for read-side back-compat.
+
+    Sessions created before the per-run split kept every run's records in one
+    shared ``journal.jsonl`` (+ its ``.wal`` sidecar). A resume of such a
+    session must still be able to replay those records, so the shared path is
+    returned here and read by ``Journal.load`` as a seed under the per-run
+    sources (per-run wins on key conflicts). It is strictly read-only: new
+    records always append to the per-run WAL / snapshot, so the legacy file is
+    frozen the moment the upgrade happens. Only meaningful with a ``run_id``
+    (no run_id means the caller already reads/writes the shared path itself).
+
+    Args:
+        script_path: Path to the swarmflow script (``META`` names the workflow).
+        team_name: Team identifier.
+        session_id: Current session id; falls back to ``"default"`` when empty.
+        run_id: Workflow run id; ``None`` / an unreadable ``META`` yields None.
+
+    Returns:
+        Absolute shared journal path as a string, or ``None``.
+    """
+    if not run_id:
+        return None
+    try:
+        meta = load_workflow_meta(script_path)
+    except Exception:  # noqa: BLE001 - back-compat seed must never break the launch
+        return None
+    name = meta.get("name")
+    if not name:
+        return None
+    sid = session_id or "default"
+    return str(paths.workflow_journal_path(team_name, sid, name))
+
+
+async def materialize_swarmflow_script(
+    source: str,
+    *,
+    team_name: str,
+    session_id: str | None,
+    run_id: str,
+) -> str:
+    """Persist an inline swarmflow ``script`` source to disk, return its path.
+
+    Inline sources reuse the whole path-based execution pipeline (importlib
+    module import + ``META``-derived resume journal) by being written to the
+    same per-workflow directory that holds the journal:
+    ``{team_home}/sessions/{session_id}/workflows/{name}/script-{run_id}.py``.
+
+    The file name is per-run: that directory is shared by every run of the
+    same ``META.name``, and a fixed ``script.py`` let a second run overwrite
+    the first one's source — resuming the first then loaded the second's
+    script (every cache sig misses → wrong full re-run). With a per-run name
+    a resume relaunch keeps loading the exact source snapshot its run
+    launched with. Sessions from before this split only have the legacy
+    ``script.py``: existing tickets/journals pointing at it keep loading it
+    unchanged, and the legacy file is never deleted (it stays a resume asset
+    for those runs).
+
+    Writing under the ``META`` name directory (not a random temp file) keeps
+    the path stable across a pause/resume relaunch and colocates the script
+    with its journal, so a re-run of the same-named inline workflow resolves
+    the same journal (content-addressed cache-hit), matching ``script_path``
+    semantics exactly.
+
+    File I/O is async (``aiofiles``) to avoid stalling the shared event loop,
+    matching the engine journal's write path.
+
+    Args:
+        source: The swarmflow script source text.
+        team_name: Team identifier (script / journal namespacing).
+        session_id: Current session id; falls back to ``"default"`` when empty.
+        run_id: Workflow run id the script is bound to (namespaced file name).
+
+    Returns:
+        Absolute path to the written script as a string.
+
+    Raises:
+        BaseError: If the script ``META`` declares no ``name``.
+    """
+    meta = extract_workflow_meta(source)
+    name = meta.get("name")
+    if not name:
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason="swarmflow script META requires a 'name' to persist its script and journal",
+        )
+    sid = session_id or "default"
+    run_dir = paths.workflow_run_dir(team_name, sid, name)
+    await aiofiles.os.makedirs(run_dir, exist_ok=True)
+    script_file = run_dir / f"script-{paths.safe_path_segment(run_id)}.py"
+    async with aiofiles.open(script_file, "w", encoding="utf-8") as f:
+        await f.write(source)
+    return str(script_file)
+
+
+async def run_swarmflow(
+    script_path: str,
+    *,
+    model: Any,
+    observer: WorkflowObserver,
+    args: Any = None,
+    team_name: str = "swarmflow",
+    language: str = "cn",
+    log_sink: Callable[[str], None] | None = None,
+    model_resolver: Callable[[str], Any] | None = None,
+    worker_base_spec: Any = None,
+    human_base_spec: Any = None,
+    build_context: Any = None,
+    messager: Any = None,
+    session_id: str | None = None,
+    abort_event: AbortSignal | None = None,
+    on_backend_ready: Callable[[Any], None] | None = None,
+    run_id: str | None = None,
+    agent_gate: Any = None,
+    budget: BudgetLedger | None = None,
+    external_cli_agents: Sequence[Any] = (),
+    team_backend: Any = None,
+    expert_specs: Mapping[str, Any] | None = None,
+    expert_loader: Any = None,
+) -> Any:
+    """Execute a swarmflow script with real LLM workers.
+
+    Args:
+        script_path: Path to the ``.py`` swarmflow script (``META`` + ``run``).
+        model: Default LLM ``Model`` each worker DeepAgent runs on when a call
+            carries no ``model`` hint. An unresolvable hint is a pool miss and
+            fails the call (non-retryable) rather than falling back.
+        observer: Receives the progress-event stream; the caller reads
+            ``observer.run`` afterwards for the 4-layer structure.
+        args: Value passed to the script's ``run(args)``.
+        team_name: Namespacing for worker member ids.
+        language: Prompt language hint.
+        log_sink: Optional plain-text diagnostics sink.
+        model_resolver: Optional callback resolving an ``agent(model=...)`` name
+            hint to a worker ``TeamModelConfig``; ``None`` means the worker
+            inherits its base spec's model.
+        worker_base_spec: Base ``DeepAgentSpec`` each worker derives from (the
+            team's teammate spec, or the leader spec) — gives workers
+            teammate-equivalent capabilities without the team tools.
+        human_base_spec: Base ``DeepAgentSpec`` for human-session avatars (the
+            team's human_agent spec, or a fallback). ``None`` disables
+            ``human_session`` / ``human`` (they fail clearly when used).
+        build_context: Optional ``BuildContext`` from the leader harness,
+            forwarded to each worker's ``NativeHarness`` build. Runtime-only
+            handles such as the owner-scoped worktree manager ride in
+            ``build_context.extras``.
+        messager: The team messager, used by human sessions to receive a real
+            person's reply on the dedicated reply topic.
+        session_id: The current session id, used to build the human-reply topic.
+        abort_event: Optional engine pause/stop signal; when set mid-run,
+            ``agent()`` abort checkpoints raise ``WorkflowAborted`` carrying the
+            signal's ``reason`` (pause → resume relaunches it; stop → terminal),
+            so the run unwinds without journaling the in-flight call. ``None``
+            disables the checkpoints.
+        on_backend_ready: Optional callback invoked with the constructed
+            ``TeamWorkerBackend`` before the run starts — the launcher uses it to
+            register a control handle (so pause can reach ``abort_sessions``).
+        budget: The leader's shared token ledger. Workers bill their real usage
+            to it and are cut short at their next model call once its ceiling is
+            reached; ``agent()`` then refuses to start another. ``None`` runs
+            unbounded (the ledger still counts, so ``budget.spent()`` works).
+        team_backend: The host team backend handle — source of the team model
+            pool for third-party worker/session planning (``plan_external_model``
+            reads ``get_model_pool()`` off it). ``None`` (a swarmflow run outside
+            a team shell) leaves the pool empty, so any ``model`` hint fails as a
+            pool miss.
+        expert_specs: AgentGroup expert table for ``agent_template`` picks; empty
+            when none bound.
+        expert_loader: On-demand loader for bound-group members missing from
+            ``expert_specs`` (``BoundGroupExpertLoader``), or ``None``.
+
+    Returns:
+        Whatever the script's ``run(args)`` returned.
+
+    Raises:
+        BudgetExhausted: If the ledger's ceiling is reached and the script keeps
+            calling ``agent()`` instead of winding down on ``budget.remaining()``.
+    """
+
+    def _on_human_prompt(member_name: str, correlation_id: str, prompt: str) -> None:
+        """Surface a pending human turn as a progress event (leader narrates it)."""
+        observer.emit(
+            WorkflowProgressEvent(
+                kind=ProgressKind.HUMAN_PROMPT,
+                label=member_name,
+                prompt=prompt,
+                correlation_id=correlation_id,
+            )
+        )
+
+    def _on_human_replied(member_name: str, correlation_id: str, answer: str | None) -> None:
+        """Signal that a pending human turn was answered (answer = raw reply)."""
+        observer.emit(
+            WorkflowProgressEvent(
+                kind=ProgressKind.HUMAN_REPLIED,
+                label=member_name,
+                correlation_id=correlation_id,
+                answer=answer,
+            )
+        )
+
+    backend = TeamWorkerBackend(
+        model=model,
+        team_name=team_name,
+        language=language,
+        model_resolver=model_resolver,
+        worker_base_spec=worker_base_spec,
+        human_base_spec=human_base_spec,
+        build_context=build_context,
+        messager=messager,
+        session_id=session_id,
+        on_human_prompt=_on_human_prompt,
+        on_human_replied=_on_human_replied,
+        run_id=run_id,
+        workflow_name=_workflow_name(script_path),
+        external_cli_agents=external_cli_agents,
+        team_backend=team_backend,
+        expert_specs=expert_specs,
+        expert_loader=expert_loader,
+    )
+    if on_backend_ready is not None:
+        on_backend_ready(backend)
+    journal_path = _resolve_journal_path(script_path, team_name, session_id, run_id)
+    wal_path = _resolve_wal_path(script_path, team_name, session_id, run_id)
+    legacy_resume = _resolve_legacy_resume(script_path, team_name, session_id, run_id)
+    return await run_workflow(
+        script_path,
+        args=args,
+        backend=backend,
+        progress_sink=observer.emit,
+        log_sink=log_sink or _team_log_sink,
+        resume=journal_path,
+        journal_path=journal_path,
+        wal_path=wal_path,
+        legacy_resume=legacy_resume,
+        abort_event=abort_event,
+        agent_gate=agent_gate,
+        budget=budget,
+        run_id=run_id,
+    )
+
+
+async def preprocess_swarmflow(
+    script_path: str,
+    *,
+    args: Any = None,
+    observer: WorkflowObserver | None = None,
+) -> WorkflowRun:
+    """Dry-run a script offline (MockBackend) to build the 4-layer preview.
+
+    Zero network, deterministic. Used before real execution to hand the TUI
+    console the planned Phase ▸ agents ▸ {prompt, activity, outcome} shape.
+    """
+    obs = observer or WorkflowObserver()
+    await run_workflow(
+        script_path,
+        args=args,
+        backend=MockBackend(),
+        progress_sink=obs.emit,
+    )
+    return obs.run
+
+
+__all__ = ["run_swarmflow", "preprocess_swarmflow", "materialize_swarmflow_script"]

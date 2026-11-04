@@ -1,0 +1,282 @@
+# -*- coding: UTF-8 -*-
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+
+from __future__ import annotations
+
+from typing import Any, Iterable, Optional, Set
+
+from pydantic import BaseModel
+
+from openjiuwen.core.common.logging import logger
+from openjiuwen.core.foundation.llm import ToolMessage
+from openjiuwen.core.foundation.llm.schema.tool_call import ToolCall
+from openjiuwen.core.runner.callback import AbortError
+from openjiuwen.core.single_agent.interrupt.exception import ToolInterruptException
+from openjiuwen.core.single_agent.interrupt.ownership import InterruptOwnerMixin
+from openjiuwen.core.single_agent.interrupt.response import InterruptRequest
+from openjiuwen.core.single_agent.interrupt.state import INTERRUPT_AUTO_CONFIRM_KEY
+from openjiuwen.core.single_agent.rail.base import (
+    AgentCallbackContext,
+    AgentRail,
+)
+
+UserInput = Any
+
+
+class InterruptDecision(BaseModel):
+    """Base decision type for interrupt resume."""
+
+
+class ApproveResult(InterruptDecision):
+    """Decision to continue tool execution."""
+    new_args: Optional[str] = None
+
+
+class RejectResult(InterruptDecision):
+    """Decision to reject tool execution."""
+    tool_result: object = None
+    tool_message: Optional[ToolMessage] = None
+
+
+class InterruptResult(InterruptDecision):
+    """Decision to interrupt and wait for user input."""
+    request: InterruptRequest
+
+
+class BaseInterruptRail(InterruptOwnerMixin, AgentRail):
+    """Base rail for interrupt and resume handling.
+
+    Provides:
+    - Tool name registration
+    - User input extraction from ctx.extra
+    - Decision application (approve/reject/interrupt)
+    - Nested agent interrupt handling
+
+    Subclasses must implement resolve_interrupt() to define
+    the specific interruption logic.
+
+    Interrupt identity: every request a rail raises is stamped with the
+    rail's ``interrupt_owner`` (its class path unless set) and, for hosts,
+    its ``interrupt_kind``. On resume ``_get_user_input`` returns only the
+    answer to an interrupt this rail raised on the call, so rails sharing a
+    tool call never read each other's answers. Answers given in earlier
+    resume rounds of a still-paused call stay visible;
+    ``is_carried_answer`` tells them apart so side effects are not repeated.
+    """
+    priority: int = 90
+
+    def __init__(
+            self,
+            tool_names: Optional[Iterable[str]] = None,
+    ):
+        self._tool_names: Set[str] = set(tool_names or [])
+
+    def approve(self, new_args: Optional[str] = None) -> ApproveResult:
+        """Create an approve decision to continue execution."""
+        return ApproveResult(new_args=new_args)
+
+    def reject(self, tool_result: object = None) -> RejectResult:
+        """Create a reject decision to skip tool execution."""
+        return RejectResult(tool_result=tool_result)
+
+    def interrupt(self, request: InterruptRequest) -> InterruptResult:
+        """Create an interrupt decision to wait for user input."""
+        return InterruptResult(request=request)
+
+    def add_tool(self, tool_name: str) -> None:
+        """Register a tool name to intercept."""
+        self._tool_names.add(tool_name)
+
+    def add_tools(self, tool_names: Iterable[str]) -> None:
+        """Register multiple tool names to intercept."""
+        self._tool_names.update(tool_names)
+
+    def add_policy(self, tool_name: str, _policy=None) -> None:
+        """Deprecated alias of add_tool (policy ignored)."""
+        self.add_tool(tool_name)
+
+    def get_tools(self) -> Set[str]:
+        """Get all registered tool names."""
+        return set(self._tool_names)
+
+    async def before_tool_call(self, ctx: AgentCallbackContext) -> None:
+        """Intercept tool call and handle resume/interrupt."""
+        tool_call: Optional[ToolCall] = ctx.inputs.tool_call
+        tool_name = ctx.inputs.tool_name
+
+        if tool_name not in self._tool_names:
+            return
+
+        tool_call_id = self._resolve_tool_call_id(tool_call)
+        user_input = self._get_user_input(ctx, tool_call_id)
+
+        auto_confirm_config = None
+        if ctx.session:
+            auto_confirm_config = ctx.session.get_state(INTERRUPT_AUTO_CONFIRM_KEY)
+            if not isinstance(auto_confirm_config, dict):
+                auto_confirm_config = {}
+
+        decision = await self.resolve_interrupt(ctx, tool_call, user_input, auto_confirm_config)
+
+        if tool_name == "ask_user":
+            self._record_ask_user_event(ctx, tool_call, user_input, decision)
+
+        self._apply_decision(ctx, tool_call, tool_name, decision)
+
+    @staticmethod
+    def _record_ask_user_event(
+            ctx: AgentCallbackContext,
+            tool_call: ToolCall | None,
+            user_input: UserInput | None,
+            decision: InterruptDecision,
+    ) -> None:
+        requested = isinstance(decision, InterruptResult) and user_input is None
+        resolved = isinstance(decision, RejectResult) and user_input is not None
+        if not requested and not resolved:
+            return
+        try:
+            import json
+            from openjiuwen.extensions.observability.span_context import (
+                get_current_agent_span,
+                get_root_span,
+            )
+            from openjiuwen.extensions.observability.trajectory_events import (
+                record_native_trajectory_log_event,
+            )
+
+            parent_span = get_current_agent_span()
+            if parent_span is None:
+                session_id = ""
+                if ctx.session is not None:
+                    session_id = str(ctx.session.get_session_id() or "")
+                parent_span = get_root_span(session_id=session_id) if session_id else get_root_span()
+            if parent_span is None or not parent_span.is_recording():
+                return
+            tool_call_id = "" if tool_call is None else str(tool_call.id or "")
+            arguments: object = {}
+            if tool_call is not None:
+                arguments = tool_call.arguments
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except (TypeError, ValueError):
+                        pass
+            payload: dict[str, object] = {
+                "interaction_id": tool_call_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": "ask_user",
+            }
+            if requested:
+                card = ctx.agent.ability_manager.get("ask_user")
+                parameters = getattr(card, "input_params", {})
+                if isinstance(parameters, type) and issubclass(parameters, BaseModel):
+                    parameters = parameters.model_json_schema()
+                payload.update({
+                    "arguments": arguments,
+                    "schema": {
+                        "name": "ask_user",
+                        "description": str(getattr(card, "description", "")),
+                        "parameters": parameters,
+                    },
+                    "status": "pending",
+                })
+                event_kind = "ask_user.requested"
+            else:
+                model_answers = getattr(user_input, "answers", None)
+                answers = model_answers if isinstance(model_answers, dict) else (
+                    user_input.model_dump() if isinstance(user_input, BaseModel) else user_input
+                )
+                payload.update({
+                    "answers": answers,
+                    "outcome": "answered",
+                    "result": decision.tool_result,
+                    "status": "completed",
+                })
+                event_kind = "ask_user.resolved"
+            record_native_trajectory_log_event(
+                parent_span=parent_span,
+                event_kind=event_kind,
+                payload=payload,
+            )
+        except Exception as e:
+            # Trajectory bookkeeping must never break the interrupt path.
+            logger.debug("failed to record ask_user trajectory event: {}", e)
+
+    async def resolve_interrupt(
+            self,
+            ctx: AgentCallbackContext,
+            tool_call: Optional[ToolCall],
+            user_input: Optional[UserInput],
+            auto_confirm_config: Optional[dict] = None,
+    ) -> InterruptDecision:
+        """Override to handle resume and return decision.
+
+        Args:
+            ctx: Agent callback context
+            tool_call: The tool call being intercepted
+            user_input: User input from resume (None if first time)
+            auto_confirm_config: Current auto-confirm config from session
+
+        Returns:
+            InterruptDecision: ApproveResult, RejectResult, or InterruptResponse
+        """
+        raise NotImplementedError
+
+    def _apply_decision(
+            self,
+            ctx: AgentCallbackContext,
+            tool_call: Optional[ToolCall],
+            tool_name: str,
+            decision: InterruptDecision,
+    ) -> None:
+        if isinstance(decision, ApproveResult):
+            if decision.new_args is not None:
+                ctx.inputs.tool_args = decision.new_args
+            return
+
+        if isinstance(decision, RejectResult):
+            self._skip_tool(ctx, tool_call, decision.tool_result, decision.tool_message)
+            return
+
+        if isinstance(decision, InterruptResult):
+            self._raise_interrupt(tool_name, tool_call, decision.request)
+            return
+
+    def _raise_interrupt(
+            self,
+            tool_name: str,
+            tool_call: Optional[ToolCall],
+            request: InterruptRequest,
+    ) -> None:
+        self.stamp_interrupt(request)
+        raise AbortError(
+            reason=f"Tool execution interrupted: {tool_name}",
+            cause=ToolInterruptException(request=request, tool_call=tool_call),
+            is_error=False,
+        )
+
+    def _skip_tool(
+            self,
+            ctx: AgentCallbackContext,
+            tool_call: Optional[ToolCall],
+            tool_result: object,
+            tool_message: Optional[ToolMessage] = None,
+    ) -> None:
+        tool_call_id = tool_call.id if tool_call is not None else ""
+        msg = tool_message or ToolMessage(
+            content=str(tool_result),
+            tool_call_id=tool_call_id,
+        )
+        ctx.extra["_skip_tool"] = True
+        ctx.inputs.tool_result = tool_result
+        ctx.inputs.tool_msg = msg
+
+    def _resolve_tool_call_id(self, tool_call: Optional[ToolCall]) -> str:
+        if tool_call is None:
+            return ""
+        return tool_call.id if hasattr(tool_call, "id") else ""
+
+    def _get_user_input(self, ctx: AgentCallbackContext, tool_call_id: str) -> Optional[UserInput]:
+        """Return the answer to this rail's interrupt on the call in the current resume (``None`` when none)."""
+        answer = self.find_own_answer(ctx.extra, tool_call_id)
+        return answer.value if answer is not None else None

@@ -1,0 +1,230 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+import asyncio
+import re
+
+import pytest
+
+from openjiuwen.core.common.exception.errors import BaseError
+from openjiuwen.core.foundation.llm import (
+    AssistantMessageChunk,
+    Model,
+    ModelClientConfig,
+    ModelRequestConfig,
+    ProviderType,
+)
+
+
+def _build_model_with_stream(
+        stream_fn,
+        *,
+        first_timeout: float = 10.0,
+        idle_timeout: float = 10.0,
+) -> Model:
+    model = Model(
+        model_client_config=ModelClientConfig(
+            client_provider=ProviderType.OpenAI,
+            api_key="sk-test",
+            api_base="https://api.openai.com/v1",
+            verify_ssl=False,
+            stream_first_chunk_timeout=first_timeout,
+            stream_idle_timeout=idle_timeout,
+        ),
+        model_config=ModelRequestConfig(model="mock-model"),
+    )
+    model._client.stream = stream_fn
+    return model
+
+
+@pytest.mark.asyncio
+async def test_model_stream_raises_first_chunk_timeout():
+    async def slow_first_chunk_stream(**kwargs):
+        await asyncio.sleep(0.05)
+        yield AssistantMessageChunk(content="late-first")
+
+    model = _build_model_with_stream(
+        slow_first_chunk_stream,
+        first_timeout=0.01,
+        idle_timeout=1.0,
+    )
+
+    with pytest.raises(BaseError) as exc_info:
+        async for _ in model.stream(messages=[]):
+            pass
+
+    message = str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+    assert "LLM stream timeout" in message
+    assert "stage=first_token" in message
+    assert "chunk_count=0" in message
+    assert "first_token_elapsed=" in message
+    assert "total_elapsed=" in message
+    assert "model=mock-model" in message
+
+
+@pytest.mark.asyncio
+async def test_model_stream_raises_idle_timeout_on_third_frame():
+    async def slow_third_frame_stream(**kwargs):
+        yield AssistantMessageChunk(content="frame-1")
+        await asyncio.sleep(0.02)
+        yield AssistantMessageChunk(content="frame-2")
+        await asyncio.sleep(0.12)
+        yield AssistantMessageChunk(content="frame-3")
+
+    model = _build_model_with_stream(
+        slow_third_frame_stream,
+        first_timeout=1.0,
+        idle_timeout=0.1,
+    )
+    received = []
+
+    with pytest.raises(BaseError) as exc_info:
+        async for chunk in model.stream(messages=[]):
+            received.append(chunk.content)
+
+    message = str(exc_info.value)
+    assert received == ["frame-1", "frame-2"]
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+    assert "LLM stream timeout" in message
+    assert "stage=idle_token" in message
+    assert "chunk_count=2" in message
+    assert "idle_elapsed=" in message
+    assert "total_elapsed=" in message
+    assert ", elapsed=" not in message
+    idle_match = re.search(r"idle_elapsed=([0-9.]+)s", message)
+    total_match = re.search(r"total_elapsed=([0-9.]+)s", message)
+    assert idle_match is not None
+    assert total_match is not None
+    assert float(total_match.group(1)) >= float(idle_match.group(1))
+    assert "model=mock-model" in message
+
+
+@pytest.mark.asyncio
+async def test_model_stream_timeout_carries_error_message_into_callback():
+    """The LLM_CALL_ERROR event carries the built detail as error_message.
+
+    The raised asyncio.TimeoutError renders as an empty string, so the span
+    would otherwise record a blank cause even though the stage/timeout/chunk
+    diagnostics were already assembled here.
+    """
+    from openjiuwen.core.runner import Runner
+    from openjiuwen.core.runner.callback.events import LLMCallEvents
+
+    captured: list[dict] = []
+
+    async def capture_error(**kwargs):
+        captured.append(kwargs)
+
+    Runner.callback_framework.on(LLMCallEvents.LLM_CALL_ERROR)(capture_error)
+
+    async def stalled_stream(**kwargs):
+        await asyncio.sleep(1.0)
+        yield AssistantMessageChunk(content="never")
+
+    model = _build_model_with_stream(
+        stalled_stream,
+        first_timeout=0.01,
+        idle_timeout=0.01,
+    )
+
+    with pytest.raises(BaseError):
+        async for _ in model.stream(messages=[]):
+            pass
+
+    assert captured, "LLM_CALL_ERROR must be triggered on stream timeout"
+    event_kwargs = captured[-1]
+    assert isinstance(event_kwargs.get("error"), asyncio.TimeoutError)
+    error_message = event_kwargs.get("error_message")
+    assert isinstance(error_message, str)
+    assert "LLM stream timeout" in error_message
+    assert "stage=first_token" in error_message
+    assert "chunk_count=0" in error_message
+    assert "model=mock-model" in error_message
+
+
+@pytest.mark.asyncio
+async def test_model_stream_role_only_delta_does_not_satisfy_first_token_timeout():
+    async def role_delta_then_stall_stream(**kwargs):
+        yield AssistantMessageChunk(content="")
+        await asyncio.sleep(0.2)
+        yield AssistantMessageChunk(content="late-token")
+
+    model = _build_model_with_stream(
+        role_delta_then_stall_stream,
+        first_timeout=0.05,
+        idle_timeout=1.0,
+    )
+
+    with pytest.raises(BaseError) as exc_info:
+        async for _ in model.stream(messages=[]):
+            pass
+
+    message = str(exc_info.value)
+    assert "stage=first_token" in message
+    assert "chunk_count=1" in message
+    assert "token_chunk_count=0" in message
+
+
+@pytest.mark.asyncio
+async def test_model_stream_heartbeat_deltas_do_not_reset_idle_timeout():
+    async def heartbeat_stream(**kwargs):
+        yield AssistantMessageChunk(content="token")
+        for _ in range(10):
+            await asyncio.sleep(0.03)
+            yield AssistantMessageChunk(content="")
+        yield AssistantMessageChunk(content="never")
+
+    model = _build_model_with_stream(
+        heartbeat_stream,
+        first_timeout=1.0,
+        idle_timeout=0.1,
+    )
+    received = []
+
+    with pytest.raises(BaseError) as exc_info:
+        async for chunk in model.stream(messages=[]):
+            received.append(chunk.content)
+
+    message = str(exc_info.value)
+    assert "never" not in received
+    assert "stage=idle_token" in message
+    assert "token_chunk_count=1" in message
+
+
+@pytest.mark.asyncio
+async def test_model_stream_token_chunks_reset_idle_budget():
+    async def steady_stream(**kwargs):
+        for index in range(5):
+            await asyncio.sleep(0.03)
+            yield AssistantMessageChunk(reasoning_content=f"r{index}")
+
+    model = _build_model_with_stream(
+        steady_stream,
+        first_timeout=1.0,
+        idle_timeout=0.1,
+    )
+
+    received = [chunk.reasoning_content async for chunk in model.stream(messages=[])]
+
+    assert received == ["r0", "r1", "r2", "r3", "r4"]
+
+
+@pytest.mark.asyncio
+async def test_model_stream_consumer_time_does_not_count_against_idle_budget():
+    async def two_token_stream(**kwargs):
+        yield AssistantMessageChunk(content="a")
+        yield AssistantMessageChunk(content="b")
+
+    model = _build_model_with_stream(
+        two_token_stream,
+        first_timeout=1.0,
+        idle_timeout=0.05,
+    )
+    received = []
+
+    async for chunk in model.stream(messages=[]):
+        received.append(chunk.content)
+        await asyncio.sleep(0.1)
+
+    assert received == ["a", "b"]

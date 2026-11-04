@@ -1,0 +1,417 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""XML rendering for inbound team messages and framework events.
+
+A team member's harness input mixes two very different things: the
+*original message* another member or the user sent, and the *framework
+metadata / instructions* the runtime adds around it (message id, time,
+reply hints, event notices). The legacy ``i18n`` templates glue both into
+one flat string, so the LLM cannot tell "who said it" from "what the
+framework added".
+
+This module renders that input as semantic XML instead, giving the LLM a
+clean boundary:
+
+- ``<team-inbound>`` wraps the **original message** verbatim, with the
+  sender / id / type / time as attributes. ``time`` is the absolute send
+  time only: the block stays in the history and is read again later.
+- ``<team-clock>`` is the current-time anchor delivered with each admitted
+  input, so the member can tell how long ago an absolute ``time`` was.
+- ``<team-event>`` wraps a **framework event** (task assignment, plan
+  decision, nudge, completion notice, task board, roster change, ...),
+  with the event type in the ``kind`` attribute.
+- ``<team-context>`` wraps **standing team state** the member is being
+  told about for the first time (its own identity, the team metadata) —
+  a fact about the team rather than something that happened.
+- ``<team-policy>`` wraps the **standing team policy** in an external CLI
+  member's system prompt. It is the one block of this family that is not a
+  conversation message, and it is what lets the other four be described as
+  a family: the tools the policy names without a namespace are the same
+  tools the messages name, so one declaration inside it covers them all.
+- ``<team-note>`` carries a framework-added hint or constraint attached to
+  either of the above (e.g. a reply hint, or the HITT silence constraint).
+  It is rendered **nested inside the block it annotates**, as the last
+  child: which message or event a note is about is then a fact about the
+  tree, not something the LLM has to infer from "the note came right
+  after". A sibling note sitting between two blocks is exactly as close to
+  the one before it as to the one after it.
+- A ``for="controller"`` attribute marks content surfaced to a human
+  agent's controller (HITT), which the avatar must stay silent about.
+- ``from="controller"`` is its counterpart on the way in: the controller
+  itself instructing its avatar. Only a human agent ever sees it.
+
+These are pure structural functions: callers pass the dynamic data plus
+already-localized text fragments (resolved via ``i18n.t``) and get back an
+XML string. Keeping the wording out of this layer means the bilingual
+contract stays in ``i18n`` (one source of truth) while the tag structure
+stays here. The ``type`` / ``kind`` / ``for`` attribute values are stable
+English contract tokens — never localized — because the inbound-tags
+system-prompt section documents them by name.
+"""
+
+from __future__ import annotations
+
+import html
+
+# Stable contract tokens for the <team-inbound> ``type`` attribute.
+INBOUND_TYPE_DIRECT = "direct"
+INBOUND_TYPE_BROADCAST = "broadcast"
+
+# Stable ``from`` value for a human agent's own controller. Not a member
+# name: the controller has no roster entry and no agent process, so the
+# avatar can never address it through ``send_message``.
+CONTROLLER_SENDER = "controller"
+
+# Event kinds whose every occurrence is a *complete* snapshot of one piece of
+# state, so the newest occurrence alone says everything the earlier ones said.
+# Only kinds with that property belong here. A delta (``roster-change``) or an
+# event scoped to one subject (``stale-claim``, which carries a ``task_id``)
+# loses information the moment an earlier occurrence is dropped.
+SNAPSHOT_EVENT_KINDS = frozenset({"task-board"})
+
+# Opening tag of a <team-event> of a given kind. ``render_event`` puts ``kind``
+# first, so this identifies a rendered block from its very first characters.
+_OPEN_TAG = '<team-event kind="%s"'
+
+
+def _esc_text(text: str | None) -> str:
+    """Escape text for an XML element body (leaves quotes intact)."""
+    return html.escape(text or "", quote=False)
+
+
+def _esc_attr(value: object) -> str:
+    """Escape a value for an XML attribute (escapes quotes)."""
+    return html.escape("" if value is None else str(value), quote=True)
+
+
+def _render_note(note_kind: str | None, note_text: str | None) -> str:
+    """Render the nested ``<team-note>`` child, or ``""`` when absent.
+
+    Carries its own trailing newline so the enclosing block needs no branch
+    on whether a note is there.
+    """
+    if not note_kind or not note_text:
+        return ""
+    return f'<team-note kind="{_esc_attr(note_kind)}">\n{_esc_text(note_text)}\n</team-note>\n'
+
+
+def _render_block(tag: str, attrs: list[str], body: str, note: str = "") -> str:
+    """Render one block element around its body and optional nested note.
+
+    Args:
+        tag: The element name (``team-inbound`` / ``team-event`` / ...).
+        attrs: Already-escaped ``name="value"`` fragments, in contract order.
+        body: The element body, escaped here.
+        note: A rendered ``<team-note>`` child (already escaped), or ``""``.
+
+    Returns:
+        The rendered element.
+    """
+    open_tag = " ".join([tag, *attrs])
+    return f"<{open_tag}>\n{_esc_text(body)}\n{note}</{tag}>"
+
+
+def render_inbound(
+    *,
+    content: str,
+    sender: str,
+    message_id: str,
+    msg_type: str,
+    time_info: str,
+    for_controller: bool = False,
+    note_kind: str | None = None,
+    note_text: str | None = None,
+) -> str:
+    """Render one inbound member/user message as ``<team-inbound>`` XML.
+
+    Args:
+        content: The sender's original message body, rendered verbatim
+            inside the element (XML-escaped, never paraphrased).
+        sender: The sending member's ``member_name``.
+        message_id: The message id, so the LLM can reference / mark it.
+        msg_type: A stable contract token — ``INBOUND_TYPE_DIRECT`` or
+            ``INBOUND_TYPE_BROADCAST`` — not a localized label.
+        time_info: Absolute send time (already rendered by
+            ``timefmt.format_absolute_time``). No relative diff: this block
+            is written into the history and read again later.
+        for_controller: When True, add ``for="controller"`` so a HITT
+            avatar treats this as a notification for its human controller.
+        note_kind: Optional ``<team-note>`` kind (e.g. ``"reply-hint"``,
+            ``"hitt-silence"``).
+        note_text: Optional ``<team-note>`` body; rendered only when both
+            ``note_kind`` and ``note_text`` are set.
+
+    Returns:
+        The rendered ``<team-inbound>`` block, with the ``<team-note>``
+        nested inside it as its last child when there is one.
+    """
+    attrs = [
+        f'from="{_esc_attr(sender)}"',
+        f'message_id="{_esc_attr(message_id)}"',
+        f'type="{_esc_attr(msg_type)}"',
+        f'time="{_esc_attr(time_info)}"',
+    ]
+    if for_controller:
+        attrs.append('for="controller"')
+    return _render_block("team-inbound", attrs, content, _render_note(note_kind, note_text))
+
+
+def render_controller_input(*, content: str) -> str:
+    """Render one controller instruction as ``<team-inbound from="controller">``.
+
+    A human agent's harness input carries two things that look identical
+    once they are plain text: its controller instructing it, and the team
+    delivering someone else's message. Without a marker the avatar reads
+    its controller's words as the ordinary "user" turn every harness gets,
+    and answers them the way a teammate answers ``user`` — by messaging
+    ``user``, a different real person on the leader's side. The tag makes
+    the source an attribute rather than a guess.
+
+    No ``message_id`` and no ``time``: a controller instruction is not a
+    bus message (nothing to reference or mark read) and it is consumed the
+    moment it arrives.
+
+    Args:
+        content: The controller's instruction, rendered verbatim (escaped).
+
+    Returns:
+        The rendered ``<team-inbound>`` block.
+    """
+    attrs = [
+        f'from="{CONTROLLER_SENDER}"',
+        f'type="{INBOUND_TYPE_DIRECT}"',
+    ]
+    return _render_block("team-inbound", attrs, content)
+
+
+def render_clock(*, now: str) -> str:
+    """Render the current-time anchor as a self-closing ``<team-clock>``.
+
+    Every ``time`` attribute written into a member's history is an absolute
+    send time. A relative diff ("3 minutes ago") would be true only when it was
+    rendered and would go stale the moment the history is read again, so the
+    member gets the current time instead, once per admitted input, and
+    measures elapsed time against the newest anchor itself. An older anchor
+    records what "now" was back then and is never refreshed.
+
+    Args:
+        now: The current time, already rendered by
+            ``timefmt.format_absolute_time``.
+
+    Returns:
+        The rendered ``<team-clock now="..."/>`` element.
+    """
+    return f'<team-clock now="{_esc_attr(now)}"/>'
+
+
+def render_event(
+    *,
+    kind: str,
+    body: str,
+    task_id: str | None = None,
+    for_controller: bool = False,
+    note_kind: str | None = None,
+    note_text: str | None = None,
+) -> str:
+    """Render one framework event as a ``<team-event>`` XML block.
+
+    Used for task assignments, plan decisions, nudges, completion
+    notices, the task board, etc. The ``body`` is the framework's own
+    instruction text (resolved via ``i18n.t`` by the caller) — there is no
+    "original message" to separate out, so the whole body sits inside the
+    one element.
+
+    Args:
+        kind: A stable contract token for the event type (e.g.
+            ``"task-assigned"``, ``"plan-approved"``, ``"all-done"``,
+            ``"task-board"``, ``"stale-claim"``).
+        body: The framework instruction text, rendered verbatim (escaped).
+        task_id: Optional task id, added as a ``task_id`` attribute.
+        for_controller: When True, add ``for="controller"`` (HITT).
+        note_kind: Optional ``<team-note>`` kind nested inside the event.
+        note_text: Optional ``<team-note>`` body; rendered only when both
+            ``note_kind`` and ``note_text`` are set.
+
+    Returns:
+        The rendered ``<team-event>`` block, with the ``<team-note>`` nested
+        inside it as its last child when there is one.
+    """
+    attrs = [f'kind="{_esc_attr(kind)}"']
+    if task_id is not None:
+        attrs.append(f'task_id="{_esc_attr(task_id)}"')
+    if for_controller:
+        attrs.append('for="controller"')
+    return _render_block("team-event", attrs, body, _render_note(note_kind, note_text))
+
+
+def render_team_context(*, body: str) -> str:
+    """Render standing team state as a ``<team-context>`` XML block.
+
+    Used for the member's own identity and the team metadata: facts about the
+    team rather than events. Unlike the per-round prompt attachment this
+    replaces, the block is written into the conversation once, at the moment the
+    state first exists, and stays there — so it is ordinary history, not a
+    snapshot that is refreshed or withdrawn.
+
+    Args:
+        body: The rendered state text (escaped into the element body).
+
+    Returns:
+        The rendered ``<team-context>`` block.
+    """
+    return _render_block("team-context", [], body)
+
+
+def render_team_context_with_identity(
+    *,
+    identity_body: str,
+    identity_conversion: str | None = None,
+    info_body: str | None = None,
+) -> str:
+    """Render a ``<team-context>`` block with a nested ``<identity>`` sub-block.
+
+    Fork-aware variant of :func:`render_team_context`: the member's own
+    identity is wrapped in a ``<identity>`` element (with an optional
+    ``<identity-conversion>`` child noting the fork source), so the model can
+    tell the *current* identity block apart from an earlier one inherited
+    through fork. Only used when fork is enabled — the plain
+    :func:`render_team_context` stays byte-identical for non-fork teams.
+
+    Args:
+        identity_body: The identity text (escaped into the ``<identity>``
+            element body).
+        identity_conversion: The fork conversion notice, or ``None`` for a
+            member that was not forked from another. Rendered as a nested
+            ``<identity-conversion>`` child when present.
+        info_body: The team-metadata text (sibling of ``<identity>``, same
+            block), or ``None`` when absent.
+
+    Returns:
+        The rendered ``<team-context>`` block.
+    """
+    identity_parts = [_esc_text(identity_body)]
+    if identity_conversion:
+        identity_parts.append(_render_block("identity-conversion", [], identity_conversion))
+    identity = f"<identity>\n{chr(10).join(identity_parts)}\n</identity>"
+    inner = [identity]
+    if info_body:
+        inner.append(_esc_text(info_body))
+    return f"<team-context>\n{chr(10).join(inner)}\n</team-context>"
+
+
+def render_team_policy(*, body: str, tools: str, note: str) -> str:
+    """Render the standing team policy as a ``<team-policy>`` XML block.
+
+    The ``tools`` attribute names the MCP server that provides the team's
+    collaboration tools, and ``note`` states what that means for the bare tool
+    names the policy uses. How one of those tools is actually addressed is not
+    stated here: the name a model calls it by is the harness provider's to
+    state, and the two meet on the server name alone.
+
+    The body is the team's own prompt text rather than something a sender
+    wrote, so, unlike every other block in this module, it is **not escaped**:
+    it is Markdown, and escaping would corrupt the backticks, ampersands and
+    comparison operators the policy templates are written with.
+
+    Args:
+        body: The assembled policy sections, inserted verbatim.
+        tools: Name of the MCP server providing the team's tools.
+        note: The tool-namespace declaration, inserted verbatim as the
+            block's first child.
+
+    Returns:
+        The rendered ``<team-policy>`` block.
+    """
+    declaration = f'<team-note kind="tool-namespace">\n{note}\n</team-note>'
+    return f'<team-policy tools="{_esc_attr(tools)}">\n{declaration}\n\n{body}\n</team-policy>'
+
+
+def render_team_policy_inline(*, body: str) -> str:
+    """Render the standing team policy for an in-process leader (F_122).
+
+    The in-history form of :func:`render_team_policy`: same element, no
+    ``tools`` attribute and no tool-namespace note, because an in-process
+    member calls the team tools by their bare names. Delivered once through
+    the ``TeamContextTracker`` ahead of the leader's first input when the
+    framework built the team and there is no ``build_team`` result to carry
+    the policy. Like the external form, the body is the team's own Markdown
+    and is **not escaped**.
+
+    Args:
+        body: The assembled policy sections, inserted verbatim.
+
+    Returns:
+        The rendered ``<team-policy>`` block.
+    """
+    return f"<team-policy>\n{body}\n</team-policy>"
+
+
+def snapshot_kind_of(text: str) -> str | None:
+    """Return the snapshot kind ``text`` is, or None when it is not one.
+
+    An input qualifies only when a snapshot event is *all* it is: these are
+    delivered one per ``deliver_input`` call, so the whole entry is the block
+    and dropping it takes nothing else with it. A ``<team-note>`` is not
+    "something else" — it is nested inside the block and annotates that block
+    alone, so it goes stale with the snapshot it hangs on and is superseded
+    together with it.
+
+    Args:
+        text: One queued input, as it was handed to ``deliver_input``.
+
+    Returns:
+        The matching kind from :data:`SNAPSHOT_EVENT_KINDS`, or None.
+    """
+    stripped = text.strip()
+    if not stripped.endswith("</team-event>"):
+        return None
+    return next((kind for kind in SNAPSHOT_EVENT_KINDS if stripped.startswith(_OPEN_TAG % kind)), None)
+
+
+def drop_superseded_snapshots(parts: list[str]) -> list[str]:
+    """Return ``parts`` without the snapshot inputs a later one supersedes.
+
+    A member that was busy comes back to everything that queued up meanwhile.
+    The task board can be in there several times, each a full survey taken
+    seconds apart — but only the last describes the board the member is about
+    to act on, and the earlier ones are noise one step away from becoming
+    permanent history.
+
+    Entries are dropped whole, never edited: each is one input, and only the
+    kinds in :data:`SNAPSHOT_EVENT_KINDS` are ever dropped. Everything else,
+    including a roster delta or a per-task nudge, carries something no other
+    entry repeats.
+
+    Args:
+        parts: The queued inputs, oldest first.
+
+    Returns:
+        A new list with the superseded snapshot entries removed.
+    """
+    newest: dict[str, int] = {}
+    for index, part in enumerate(parts):
+        kind = snapshot_kind_of(part)
+        if kind is not None:
+            newest[kind] = index
+    # A non-snapshot entry has no kind, so ``newest.get(None, index)`` gives
+    # back its own index and it survives without a branch of its own.
+    return [part for index, part in enumerate(parts) if newest.get(snapshot_kind_of(part), index) == index]
+
+
+__all__ = [
+    "CONTROLLER_SENDER",
+    "INBOUND_TYPE_BROADCAST",
+    "INBOUND_TYPE_DIRECT",
+    "SNAPSHOT_EVENT_KINDS",
+    "drop_superseded_snapshots",
+    "render_clock",
+    "render_controller_input",
+    "render_event",
+    "render_inbound",
+    "render_team_context",
+    "render_team_context_with_identity",
+    "render_team_policy",
+    "render_team_policy_inline",
+    "snapshot_kind_of",
+]

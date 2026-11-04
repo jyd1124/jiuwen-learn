@@ -1,0 +1,87 @@
+/**
+ * WebSocket 事件去重键。
+ *
+ * 有 request_id 时用它区分「同一次操作的重复投递」和「不同操作但内容碰巧相同」
+ * （bug001：两次 resume 的 goal.snapshot 内容经常完全一样）。
+ * chat.tool_call/chat.tool_result 同一 request_id 可能包含多个工具调用，需再按 tool_call_id 区分。
+ *
+ * chat.processing_status 同一 request_id 会连发 true / false。只认 request_id
+ * 会把「忙完了」当成「开始忙」的重复扔掉；计划「执行」的补发消息就挂在 false 上。
+ */
+
+function stringifyPayloadForDedup(payload: Record<string, unknown>): string {
+  try {
+    const serialized = JSON.stringify(payload);
+    if (!serialized) {
+      return '';
+    }
+    return serialized.length > 800 ? serialized.slice(0, 800) : serialized;
+  } catch {
+    return '';
+  }
+}
+
+export function makeEventDedupKey(eventName: string, payload: Record<string, unknown>): string {
+  const payloadSessionId =
+    typeof payload.session_id === 'string' ? payload.session_id : '';
+  const payloadEventType =
+    typeof payload.event_type === 'string' ? payload.event_type : '';
+  const payloadRequestId =
+    typeof payload.request_id === 'string' ? payload.request_id : '';
+  const nestedToolCall =
+    eventName === 'chat.tool_call' &&
+    payload.tool_call &&
+    typeof payload.tool_call === 'object' &&
+    !Array.isArray(payload.tool_call)
+      ? (payload.tool_call as Record<string, unknown>)
+      : undefined;
+  const toolCallId =
+    eventName === 'chat.tool_call'
+      ? typeof nestedToolCall?.tool_call_id === 'string'
+        ? nestedToolCall.tool_call_id
+        : typeof nestedToolCall?.toolCallId === 'string'
+          ? nestedToolCall.toolCallId
+          : typeof nestedToolCall?.id === 'string'
+            ? nestedToolCall.id
+            : ''
+      : eventName === 'chat.tool_result'
+        ? typeof payload.tool_call_id === 'string'
+          ? payload.tool_call_id
+          : typeof payload.toolCallId === 'string'
+            ? payload.toolCallId
+            : ''
+        : '';
+  const contentKey = payloadRequestId
+    ? eventName === 'chat.tool_result'
+      ? `rid:${payloadRequestId}::tool:${toolCallId || stringifyPayloadForDedup(payload)}`
+      : eventName === 'chat.tool_call' && toolCallId
+        ? `rid:${payloadRequestId}::tool:${toolCallId}`
+        : `rid:${payloadRequestId}`
+    : stringifyPayloadForDedup(payload);
+  const processingFlag =
+    eventName === 'chat.processing_status'
+      ? `::proc:${payload.is_processing === true ? '1' : '0'}`
+      : '';
+  // A retry notice updates one status message throughout the request. Do not
+  // mistake a new attempt or another member's retry for a duplicate delivery.
+  const modelRetryKey =
+    eventName === 'chat.notice' && payload.notice_type === 'model_retry'
+      ? `::retry:${stringifyPayloadForDedup({
+        attempt: payload.attempt,
+        max_attempts: payload.max_attempts,
+        member_name: payload.member_name,
+        content: payload.content,
+      })}`
+      : '';
+  // chat.error 同一 request_id 可能先后到达两条不同来源的错误：流失败时
+  // gateway 即时补发一帧（_finish_failed_stream），cron 失败后调度器还会
+  // 补一条失败记录推送（scheduler 的 cron-failure 帧）。二者 request_id 相同
+  // 但文案不同，只认 rid 会把第二条当重复投递吞掉——失败记录常在会话历史
+  // 加载重建之后才到达，被吞后用户在整个执行期间看不到任何报错。错误文案
+  // 进键：真重复投递（同 request_id 同文案）仍去重，不同错误各自成帧。
+  const chatErrorKey =
+    eventName === 'chat.error' && typeof payload.error === 'string'
+      ? `::err:${payload.error}`
+      : '';
+  return `${eventName}::${payloadSessionId}::${payloadEventType}::${contentKey}${processingFlag}${modelRetryKey}${chatErrorKey}`;
+}

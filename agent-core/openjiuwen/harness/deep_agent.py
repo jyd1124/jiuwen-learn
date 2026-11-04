@@ -1,0 +1,4574 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+"""DeepAgent implementation."""
+from __future__ import annotations
+
+import asyncio
+import copy
+import os
+import uuid
+from dataclasses import replace
+from contextlib import AbstractAsyncContextManager, ExitStack, aclosing, contextmanager, suppress
+import warnings
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    cast,
+)
+
+import anyio
+
+from openjiuwen.core.common.constants.constant import INTERACTION
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import build_error
+from openjiuwen.core.common.logging import logger
+from openjiuwen.core.common.logging.invocation import invocation_log_scope
+from openjiuwen.core.common.run_context import normalize_run_context
+from openjiuwen.core.common.security.user_config import UserConfig
+from openjiuwen.core.context_engine import ContextEngine
+from openjiuwen.core.context_engine.context.context_utils import ContextUtils
+from openjiuwen.core.controller.config import ControllerConfig
+from openjiuwen.core.controller.modules.task_manager import TaskFilter
+from openjiuwen.core.controller.schema.event import (
+    FollowUpEvent,
+    TaskInteractionEvent,
+)
+from openjiuwen.core.controller.schema.task import TaskStatus
+from openjiuwen.core.foundation.llm import BaseMessage, SystemMessage
+from openjiuwen.core.foundation.tool import Tool, ToolCard
+from openjiuwen.core.kv_cache.kv_cache_metadata import KV_CACHE_AFFINITY_PARENT_SESSION_ID_ENV
+from openjiuwen.core.runner import Runner
+from openjiuwen.core.session.agent import Session, create_agent_session
+from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
+from openjiuwen.core.session.stream.base import OutputSchema, StreamMode
+from openjiuwen.core.single_agent.agents.react_agent import ReActAgent, ReActAgentConfig
+from openjiuwen.core.single_agent.base import BaseAgent
+from openjiuwen.core.single_agent.rail.base import (
+    AgentCallbackContext,
+    AgentCallbackEvent,
+    AgentRail,
+    InvokeInputs,
+    RunContext,
+    RunKind,
+    init_rail,
+    log_rail_init_breakdown,
+)
+from openjiuwen.core.single_agent.schema.agent_card import AgentCard
+from openjiuwen.harness.image_modality_probe import (
+    get_cached_image_support,
+    schedule_image_support_probe,
+)
+from openjiuwen.harness.rails import DeepAgentRail
+from openjiuwen.harness.rails.progressive_tool_rail import ProgressiveToolRail
+from openjiuwen.harness.rails.task_completion_rail import (
+    TaskCompletionRail,
+)
+from openjiuwen.harness.schema.config import (
+    DeepAgentConfig,
+    resolve_inner_react_max_iterations,
+)
+from openjiuwen.harness.schema.stop_condition import (
+    NoProgressAnswerEvaluator,
+    StopConditionEvaluator,
+)
+from openjiuwen.harness.schema.state import (
+    _SESSION_RUNTIME_ATTR,
+    _SESSION_STATE_KEY,
+    DeepAgentState,
+)
+from openjiuwen.harness.security.factory import build_permission_interrupt_rail
+from openjiuwen.harness.task_loop.loop_coordinator import (
+    LoopCoordinator,
+)
+from openjiuwen.harness.task_loop.loop_queues import (
+    LoopQueues,
+)
+from openjiuwen.harness.task_loop.task_loop_controller import (
+    TaskLoopController,
+)
+from openjiuwen.harness.task_loop.task_loop_event_executor import (
+    DEEP_TASK_TYPE,
+    build_deep_executor,
+)
+from openjiuwen.harness.task_loop.task_loop_event_handler import (
+    TaskLoopEventHandler,
+)
+from openjiuwen.harness.tools import SessionToolkit, is_free_search_enabled, is_paid_search_enabled
+from openjiuwen.harness.tools.subagent._control_registry import release_subagent_control
+from openjiuwen.harness.goal.manager import GoalManager
+from openjiuwen.harness.goal.schema import GoalRecord, GoalStatus
+from openjiuwen.harness.schema.interaction import (
+    ActiveInteractionRound,
+    InteractionEvent,
+    InteractionPhase,
+    InteractionOutputStream,
+    OutputLease,
+    OutputLeaseManager,
+    InputDispatchMode,
+    RoundOutcome,
+    RoundWorkItem,
+    SendInputRequest,
+)
+from openjiuwen.harness.task_loop.event_manager import EventManager
+
+if TYPE_CHECKING:
+    from openjiuwen.core.controller.modules.event_queue import (
+        EventQueue,
+    )
+    from openjiuwen.harness.schema.config import SubAgentConfig
+
+from openjiuwen.harness.prompts import (
+    PromptSection,
+    SystemPromptBuilder,
+    resolve_language,
+    resolve_mode,
+)
+from openjiuwen.harness.prompts.prompt_attachment_manager import (
+    PromptAttachmentKind,
+    PromptAttachmentManager,
+)
+from openjiuwen.harness.prompts.sections import SectionName
+from openjiuwen.harness.prompts.sections.identity import build_identity_section
+from openjiuwen.harness.resources import (
+    LoadRecord,
+    find_agent_template_manifest,
+    find_plugin_manifest,
+    load_agent_template_package,
+    load_plugin_package,
+)
+from openjiuwen.harness.resources.extension_resolver import (
+    ExtensionParts,
+    ResolvedSkill,
+    ResourceKind,
+    resolve_agent_template_parts,
+    resolve_plugin_parts,
+)
+from openjiuwen.harness.schema.build_context import BuildContext
+from openjiuwen.harness.schema.extension_spec import AgentTemplateSpec, PluginSpec
+from openjiuwen.harness.workspace.workspace import Workspace
+
+# Events bridged to the inner ReActAgent.
+_BRIDGE_EVENTS = frozenset(
+    {
+        AgentCallbackEvent.BEFORE_MODEL_CALL,
+        AgentCallbackEvent.AFTER_MODEL_CALL,
+        AgentCallbackEvent.ON_MODEL_EXCEPTION,
+        AgentCallbackEvent.BEFORE_TOOL_CALL,
+        AgentCallbackEvent.AFTER_TOOL_CALL,
+        AgentCallbackEvent.ON_TOOL_EXCEPTION,
+        # Fired by the inner ReActAgent at each successful iteration end, so a
+        # rail registered via DeepAgent.register_rail must bridge to the inner
+        # agent (same callback-manager namespace) rather than the outer one.
+        AgentCallbackEvent.AFTER_REACT_ITERATION,
+        # Same reason: the inner agent is what admits consumed inputs into the
+        # conversation, so it is what fires this.
+        AgentCallbackEvent.ON_USER_MESSAGE,
+        # And it is what takes them off the steering queue, one model call
+        # before that.
+        AgentCallbackEvent.BEFORE_STEERING_DRAIN,
+    }
+)
+
+# Events that stay on the outer DeepAgent only.
+_OUTER_ONLY_EVENTS = frozenset(
+    {
+        AgentCallbackEvent.BEFORE_INVOKE,
+        AgentCallbackEvent.AFTER_INVOKE,
+    }
+)
+
+# Deep extension events.
+_DEEP_EVENTS = frozenset(
+    {
+        AgentCallbackEvent.BEFORE_TASK_ITERATION,
+        AgentCallbackEvent.AFTER_TASK_ITERATION,
+    }
+)
+
+_SUB_AGENTS_DIR = "sub_agents"
+_EXPERT_ROLE_SECTION = "expert_role"
+_EXPERT_ROLE_SOURCE = "deep_agent.agent_template"
+
+# Tools that remain visible to the model when progressive tool loading is
+# enabled.  The registration switch still decides whether a tool exists at
+# all; this list only controls exposure for tools that are registered.
+_DEFAULT_DIRECT_TOOL_NAMES = frozenset(
+    {
+        "tool_search",
+        "tool_call",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "grep",
+        "bash",
+        "task_tool",
+        "subagent_spawn",
+        "subagent_wait",
+        "subagent_list",
+        "subagent_send_input",
+        "subagent_close",
+        "subagent_resume",
+        "ask_user",
+        "todo_create",
+        "todo_list",
+        "todo_get",
+        "todo_modify",
+        "skill_tool",
+        "memory_search",
+        "memory_get",
+        "free_search",
+        "paid_search",
+        "fetch_webpage",
+        "write_memory",
+        "edit_memory",
+        "read_memory",
+        "ltm_search",
+        "ltm_search_summary",
+        "send_file_to_user",
+        "enter_plan_mode",
+        "exit_plan_mode",
+        "skill_branch_explore",
+        "skill_index_build",
+    }
+)
+
+
+_ROUND_BOUNDARY = object()
+
+FreshInputContextFactory = Callable[[], AbstractAsyncContextManager[None]]
+
+
+def _bind_inner_react_max_iterations(
+    react_config: ReActAgentConfig,
+    max_iterations: Optional[int],
+) -> int:
+    """Apply the inner ReAct cap and log the resolved value once."""
+    resolved = resolve_inner_react_max_iterations(max_iterations)
+    react_config.max_iterations = resolved
+    if max_iterations is None:
+        logger.info("[DeepAgent] inner ReAct max_iterations=unbounded (default)")
+    else:
+        logger.info("[DeepAgent] inner ReAct max_iterations=%s (configured)", resolved)
+    return resolved
+
+
+def _render_identity_prompt(prompt_builder: SystemPromptBuilder, language: str) -> str:
+    """Render the identity section alone, for ReActAgent's prompt template.
+
+    ``ReActAgent`` re-reads ``prompt_template`` into its own identity section on
+    every round (see ``ReActAgent._inner_invoke``) and, because DeepAgent shares
+    its builder with the ReActAgent, that builder still contributes the other
+    sections itself. Handing over the fully built prompt would therefore fold
+    every section present at configure time into identity and emit them twice.
+
+    Args:
+        prompt_builder: The builder holding the sections for this agent.
+        language: Language the section is rendered in.
+
+    Returns:
+        The rendered identity text, or an empty string when there is none.
+    """
+    identity_section = prompt_builder.get_section(SectionName.IDENTITY)
+    if identity_section is None:
+        return ""
+    return identity_section.render(language)
+
+
+def _expert_role_load_content(role_name: str, language: str = "cn") -> str:
+    """Build the model-visible load notice for one expert role."""
+    if language == "en":
+        return (
+            f"The user selected the {role_name} expert. You are {role_name}. "
+            "Previous expert roles are cancelled; do not use their persona or related capabilities."
+        )
+    return (
+        f"用户选择了{role_name}专家，你是{role_name}。"
+        "此前专家角色已取消，不再使用其角色设定和相关能力。"
+    )
+
+
+def _expert_role_unload_content(role_name: str, language: str = "cn") -> str:
+    """Build the model-visible unload notice for one expert role."""
+    if language == "en":
+        return (
+            f"The user cancelled the {role_name} expert selection. Immediately stop using that "
+            "expert's role, workflows, and exclusive capabilities, and fall back to your default "
+            "role and capabilities."
+        )
+    return (
+        f"用户取消了{role_name}专家选择，立即停止使用之前该专家的角色、工作流和独有能力，"
+        "回退到你的默认角色和能力。"
+    )
+
+
+class DeepAgent(BaseAgent):
+    """High-level agent that delegates to an internal ReActAgent."""
+
+    def __init__(self, card: AgentCard):
+        self._deep_config: Optional[DeepAgentConfig] = None
+        self._react_agent: Optional[ReActAgent] = None
+        self._pending_rails: List[AgentRail] = []
+        self._stale_rails: List[AgentRail] = []
+        self._registered_rails: List[AgentRail] = []
+        self._loop_coordinator: Optional[LoopCoordinator] = None
+        self._loop_controller: Optional[TaskLoopController] = None
+        self._loop_session: Optional[Session] = None
+        self._task_completion_rail: Optional[TaskCompletionRail] = None
+        self._initialized = False
+        self.system_prompt_builder: Optional[SystemPromptBuilder] = None
+        self._invoke_active: bool = False
+        self._stream_process_task: Optional[asyncio.Task] = None
+        self._auto_invoke_scheduled: bool = False
+        self._bound_session_id: Optional[str] = None
+        self._load_records: dict[str, LoadRecord] = {}
+        self._active_agent_template: tuple[str, str] | None = None
+        self._session_toolkit: SessionToolkit | None = None
+        self._pending_harness_configs: List[str] = []
+        self.prompt_attachment_manager: PromptAttachmentManager = PromptAttachmentManager()
+        self._interaction_session: Optional[Session] = None
+        self._interaction_phase = InteractionPhase.IDLE
+        self._active_interaction_round: Optional[ActiveInteractionRound] = None
+        self._event_manager = EventManager()
+        self._inherited_artifact_root: Optional[str] = None
+        self.goal_manager: Optional[GoalManager] = None
+        self._interaction_output = OutputLeaseManager()
+        self._interaction_supervisor_task: Optional[asyncio.Task[None]] = None
+        self._interaction_forwarder_task: Optional[asyncio.Task[None]] = None
+        self._interaction_round_task: Optional[asyncio.Task[None]] = None
+        self._interaction_emit_tasks: set[asyncio.Task[Any]] = set()
+        self._interaction_round_forwarded: Optional[asyncio.Event] = None
+        self._interaction_start_lock = asyncio.Lock()
+        self._interaction_control_lock = asyncio.Lock()
+        self._interaction_send_lock = asyncio.Lock()
+        self._interaction_wakeup = asyncio.Event()
+        self._interaction_started = False
+        self._fresh_input_context_factory: Optional[FreshInputContextFactory] = None
+        self._task_resource_prepares: list[Callable[[], Awaitable[None]]] = []
+        self._task_resource_cleanups: list[Callable[[], Awaitable[None]]] = []
+        self._moa_scope_owner: Any = None
+        super().__init__(card)
+
+    def _proposal_owner(self) -> Any:
+        """Resolve the in-memory advice owner only when MoA is configured."""
+        if self._deep_config is None or self._deep_config.moa is None:
+            return None
+        if self._moa_scope_owner is None:
+            from openjiuwen.harness.moa.integration import MoAProposalOwner
+
+            self._moa_scope_owner = MoAProposalOwner()
+        return self._moa_scope_owner
+
+    def set_session_toolkit(self, toolkit: SessionToolkit | None) -> None:
+        """Attach or clear the session toolkit (wired by SubagentRail async)."""
+        self._session_toolkit = toolkit
+
+    def set_fresh_input_context_factory(
+        self,
+        factory: Optional[FreshInputContextFactory],
+    ) -> None:
+        """Set or clear the host context entered around fresh input enqueue.
+
+        The context runs while the interaction send and control locks are held.
+        It must not re-enter interaction or goal-control APIs that acquire them.
+        """
+        if factory is not None and not callable(factory):
+            raise TypeError("fresh input context factory must be callable")
+        self._fresh_input_context_factory = factory
+
+    def register_task_resource_cleanup(
+        self,
+        cleanup: Callable[[], Awaitable[None]],
+        *,
+        prepare: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
+        """Register an idempotent cleanup for ephemeral subagent resources."""
+        if prepare is not None and prepare not in self._task_resource_prepares:
+            self._task_resource_prepares.append(prepare)
+        if cleanup not in self._task_resource_cleanups:
+            self._task_resource_cleanups.append(cleanup)
+
+    async def prepare_task_resources(self) -> None:
+        """Acquire task-scoped resource references before subagent invocation."""
+        for prepare in self._task_resource_prepares:
+            await prepare()
+
+    async def cleanup_task_resources(self) -> None:
+        """Release task-scoped resources without discarding persistent data."""
+        for cleanup in reversed(self._task_resource_cleanups):
+            try:
+                await cleanup()
+            except Exception:
+                logger.exception("[DeepAgent] task resource cleanup failed")
+
+    def configure(self, config: DeepAgentConfig) -> "DeepAgent":
+        """Apply configuration and rebuild the internal ReActAgent."""
+        # Factory config_kwargs are applied after dataclass construction.
+        config.__post_init__()
+
+        if self._deep_config is not None and config.moa != self._deep_config.moa:
+            raise build_error(
+                StatusCode.DEEPAGENT_CONFIG_PARAM_ERROR,
+                error_msg="MoA configuration cannot change after DeepAgent construction",
+            )
+
+        self._filter_disabled_tools(config)
+        if self._deep_config is None:
+            self._initial_configure(config)
+        else:
+            self._hot_reconfigure(config)
+
+        self._initialized = False
+        return self
+
+    @staticmethod
+    def _filter_disabled_tools(config: DeepAgentConfig) -> None:
+        if config.tools is None:
+            return
+        disabled_tool_names: set[str] = set()
+        if not is_free_search_enabled():
+            disabled_tool_names.add("free_search")
+        if not is_paid_search_enabled():
+            disabled_tool_names.add("paid_search")
+        if not disabled_tool_names:
+            return
+        config.tools = [
+            card for card in config.tools
+            if not (isinstance(card, ToolCard) and card.name in disabled_tool_names)
+        ]
+
+    def _unregister_tool_resource(self, card: ToolCard) -> None:
+        if card.name not in {"free_search", "paid_search"}:
+            return
+        if not getattr(card, "id", None):
+            return
+        if Runner.resource_mgr.get_tool(card.id) is None:
+            return
+        result = Runner.resource_mgr.remove_tool(card.id)
+        if result.is_err():
+            logger.warning(
+                "[DeepAgent] Failed to unregister tool during hot reload: %s",
+                result.msg(),
+            )
+
+    def _ensure_builtin_tool_resource(self, card: ToolCard, config: DeepAgentConfig) -> None:
+        if card.name not in {"free_search", "paid_search"}:
+            return
+        # Builtin search tools are not shared across agents; a hit here means
+        # this agent already registered the same card on a prior reconfigure.
+        if Runner.resource_mgr.get_tool(card.id) is not None:
+            return
+
+        from openjiuwen.harness.tools import WebFreeSearchTool, WebPaidSearchTool
+
+        tool_cls = WebPaidSearchTool if card.name == "paid_search" else WebFreeSearchTool
+        tool = tool_cls(language=resolve_language(config.language), card=card)
+        result = Runner.resource_mgr.add_tool(tool, tag=self.card.id)
+        if result.is_err():
+            logger.warning(
+                "[DeepAgent] Failed to register free_search during hot reload: %s",
+                result.msg(),
+            )
+
+    @staticmethod
+    def _resolve_tool_owner_id(config: DeepAgentConfig) -> str:
+        """Return the owner id qualifying this agent's stateful tool registrations.
+
+        Tool ownership and persistence identity are separate concerns: the
+        checkpointer keys state by ``card.id``, so that id has to stay stable,
+        while the process-global resource manager needs one owner per live agent
+        or concurrent agents sharing a card silently overwrite each other's tool
+        instances. ``tool_owner_id`` lets a host separate the two; omitting it
+        keeps the historical behaviour of reusing ``card.id``.
+
+        Args:
+            config: The configuration being applied.
+
+        Returns:
+            The explicit ``tool_owner_id`` when set, otherwise the card id.
+        """
+        return config.tool_owner_id or config.card.id
+
+    def _initial_configure(self, config: DeepAgentConfig) -> None:
+        """First-time setup: persist config, create the inner ReActAgent, and queue rails."""
+        self._deep_config = config
+        # Exposure is an agent-level registration policy.  Configure it before
+        # the factory adds ``config.tools`` and before rails can register their
+        # own tools; the AbilityManager then resolves each card exactly once at
+        # registration time.
+        self.ability_manager.set_tool_exposure_policy(
+            config.progressive_tool_enabled,
+            direct_tool_names=_DEFAULT_DIRECT_TOOL_NAMES,
+        )
+        if config.card is not None:
+            self.card = config.card
+            self.ability_manager.set_owner_id(self._resolve_tool_owner_id(config))
+
+        self._react_agent = self._create_react_agent()
+        self._queue_pending_rails(config)
+
+    def _goal_prompt_language(
+        self, config: Optional[DeepAgentConfig] = None
+    ) -> str:
+        """Resolve cn/en for GoalManager and the auto TaskCompletionRail."""
+        cfg = config if config is not None else self._deep_config
+        return resolve_language(None if cfg is None else cfg.language)
+
+    def _hot_reconfigure(self, config: DeepAgentConfig) -> None:
+        """Hot-reconfigure an already-running agent without restarting it."""
+        previous_config = self._deep_config
+        self._deep_config = config
+        self.ability_manager.set_tool_exposure_policy(
+            config.progressive_tool_enabled,
+            direct_tool_names=_DEFAULT_DIRECT_TOOL_NAMES,
+        )
+        if config.card is not None:
+            self.card = config.card
+            self.ability_manager.set_owner_id(self._resolve_tool_owner_id(config))
+
+        self._hot_reload_rails(config)
+
+        if config.model is not None:
+            self._hot_reload_model(config)
+
+        if config.tools is not None and self._react_agent is not None:
+            self._hot_reload_tools(
+                config,
+                previous_tools=(previous_config.tools if previous_config is not None else None),
+            )
+
+        if config.system_prompt is not None and self._react_agent is not None:
+            self._hot_reload_system_prompt(config)
+
+        self._queue_pending_rails(config)
+        self._sync_prompt_builder_references()
+        # SubagentRail is intentionally retained across partial hot reloads so
+        # its task/session tools and running subagents survive. Refresh the
+        # model-facing available-agents text after the parent registry and
+        # subagent configuration have changed, otherwise task_tool can keep
+        # advertising a stale tool-name snapshot.
+        self._refresh_subagent_tool_descriptions()
+
+    def _refresh_subagent_tool_descriptions(self) -> None:
+        """Refresh dynamic tool names embedded in subagent tool metadata."""
+
+        for rail in (*self._pending_rails, *self._registered_rails):
+            refresh = getattr(rail, "refresh_available_agents", None)
+            if not callable(refresh):
+                continue
+            try:
+                refresh(self)
+            except Exception as exc:
+                logger.warning(
+                    "[DeepAgent] Failed to refresh subagent tool descriptions: %s",
+                    exc,
+                )
+
+    def _hot_reload_rails(self, config: DeepAgentConfig) -> None:
+        """Cycle stale rails out and prepare replacement rails during hot-reconfigure.
+
+        config.rails is not None - partial update: only rails whose type appears
+        in the new list are retired; others are retained.
+        config.rails is None - full replacement: all existing rails become stale.
+        config.rails == [] - nothing to replace; keep all existing rails.
+        """
+        if config.rails is not None:
+            # Partial update: only cycle rails whose type appears in the new list.
+            replacing_types = {type(r) for r in config.rails}
+            retained = []
+            for rail in self._registered_rails:
+                if type(rail) in replacing_types:
+                    self._stale_rails.append(rail)
+                else:
+                    retained.append(rail)
+            self._registered_rails = retained
+            self._pending_rails = [
+                rail for rail in self._pending_rails
+                if type(rail) not in replacing_types
+            ]
+        else:
+            # Full replacement: all existing rails become stale.
+            self._stale_rails.extend(self._registered_rails)
+            self._registered_rails.clear()
+            self._pending_rails.clear()
+
+    def _hot_reload_model(self, config: DeepAgentConfig) -> None:
+        """Apply updated model/iteration config to the live inner ReActAgent.
+
+        Mutates a copy of the existing ReActAgentConfig with the new model
+        fields, then drives the update through react_agent.configure() so that
+        all side-effects (LLM reset, context-engine rebuild, etc.) fire correctly.
+        """
+        if self._react_agent is None:
+            return
+        new_react_config = self._react_agent.config.model_copy()
+        if config.model is not None:
+            new_react_config.model_client_config = config.model.model_client_config
+            new_react_config.model_config_obj = config.model.model_config
+            if config.model.model_config is not None and config.model.model_config.model_name:
+                new_react_config.model_name = config.model.model_config.model_name
+            # Sync direct fields so configure()'s LLM-reset condition fires correctly.
+            if config.model.model_client_config is not None:
+                client_cfg = config.model.model_client_config
+                new_react_config.api_base = client_cfg.api_base
+                new_react_config.api_key = client_cfg.api_key
+                new_react_config.model_provider = str(
+                    client_cfg.client_provider.value
+                    if hasattr(client_cfg.client_provider, "value")
+                    else client_cfg.client_provider
+                )
+        _bind_inner_react_max_iterations(new_react_config, config.max_iterations)
+        new_react_config.on_max_iterations = config.on_max_iterations
+        new_react_config.max_iterations_hard_limit = config.max_iterations_hard_limit
+        if config.context_engine_config is not None:
+            new_react_config.context_engine_config = config.context_engine_config
+        if config.kv_cache_affinity_config is not None:
+            new_react_config.kv_cache_affinity_config = config.kv_cache_affinity_config
+        # Explicit browser policy instances must survive reconfiguration. Replace
+        # their generative delegate when the caller supplies a new ordinary model.
+        current_model = getattr(self._react_agent, "_llm", None)
+        bind_fallback = getattr(type(current_model), "bind_fallback", None)
+        explicit_model = config.model
+        if callable(bind_fallback) and not callable(getattr(type(explicit_model), "bind_fallback", None)):
+            if explicit_model is not None:
+                current_model.bind_fallback(explicit_model)
+            explicit_model = current_model
+        self._react_agent.configure(new_react_config)
+        # Ordinary agents keep configure()'s model selection and lazy reset.
+        # MoA also needs to retain the caller's pre-built model instance.
+        restore_model = callable(getattr(type(explicit_model), "bind_fallback", None)) or (
+            config.moa is not None and explicit_model is not None
+        )
+        if restore_model:
+            context_window = self._react_agent.config.context_engine_config.model_context_window_tokens_override
+            self._react_agent.set_llm(explicit_model)
+            if config.moa is not None and (
+                self._react_agent.config.context_engine_config.model_context_window_tokens_override != context_window
+            ):
+                # set_llm() may clear an explicit window when model metadata
+                # omits it. Restore configure()'s resolved value in cached contexts too.
+                self._react_agent.update_model_context(
+                    model_name=self._react_agent.config.model_name,
+                    context_window_tokens=context_window,
+                    model=explicit_model,
+                )
+        self._sync_prompt_builder_references()
+        # Propagate the new model to context processors (compressors,
+        # offloaders) so they don't stay pinned to the model that was active
+        # when ContextProcessorRail.init() first injected them. Without this,
+        # a hot-reload that switches the primary model leaves compressors using
+        # the old model — if that endpoint is down, compression silently fails
+        # (status=noop) and the context window grows unbounded. set_llm()
+        # already rebinds cached processors on the restore_model path.
+        self._hot_reload_context_processor_models(config, rebind_cached=not restore_model)
+        logger.info("[DeepAgent] Model configuration hot reloaded")
+
+    def _hot_reload_context_processor_models(
+        self,
+        config: DeepAgentConfig,
+        *,
+        rebind_cached: bool = True,
+    ) -> None:
+        """Make context processors follow the hot-reloaded primary model.
+
+        ``ContextProcessorRail.init()`` injects the primary model into each
+        processor config (compressors, offloaders) only while ``model`` is
+        ``None``, and each model-backed processor builds its ``Model`` once in
+        ``__init__``. Two things therefore go stale on a model switch:
+
+        1. The processor config templates in ``react_agent.config.context_processors``,
+           which seed processors for contexts created later. Only configs that
+           already carry a model are updated, keeping the rail's injection semantics.
+        2. Processors already instantiated in the ``ContextEngine`` context pool.
+           These are rebound through the public chain
+           ``ReActAgent.update_model_context`` → ``ContextEngine.update_model_context``
+           → ``ModelContext.rebind_model`` → ``ContextProcessor.rebind_model``.
+           Errors propagate so an incomplete rebind is not silently masked.
+
+        Args:
+            config: The incoming DeepAgent config carrying the new model.
+            rebind_cached: Whether to rebind cached processors. ``False`` when the
+                caller already rebound them via ``ReActAgent.set_llm``.
+        """
+        if self._react_agent is None or config.model is None:
+            return
+        new_model_config = config.model.model_config
+        new_model_client_config = config.model.model_client_config
+        react_config = self._react_agent.config
+        updated = 0
+        for _key, cfg in getattr(react_config, "context_processors", None) or []:
+            changed = False
+            if getattr(cfg, "model", None) is not None:
+                cfg.model = new_model_config
+                changed = True
+            if getattr(cfg, "model_client", None) is not None:
+                cfg.model_client = new_model_client_config
+                changed = True
+            if changed:
+                updated += 1
+        if updated:
+            logger.info(
+                "[DeepAgent] Context processor configs rebound to new primary model: %d", updated,
+            )
+
+        update_model_context = getattr(self._react_agent, "update_model_context", None)
+        if not rebind_cached or not callable(update_model_context):
+            return
+        # Keep configure()'s resolved model name / window: update_model_context()
+        # overwrites both on the context engine and every cached context.
+        update_model_context(
+            model_name=react_config.model_name,
+            context_window_tokens=react_config.context_engine_config.model_context_window_tokens_override,
+            model=config.model,
+            model_config=new_model_config,
+            model_client_config=new_model_client_config,
+        )
+
+    def _extension_bound_tool_names(self) -> set[str]:
+        """Return tool names owned by successful Plugin / AgentTemplate loads."""
+        names: set[str] = set()
+        for record in self._load_records.values():
+            for ref in record.refs:
+                if ref.kind != ResourceKind.TOOL:
+                    continue
+                for name in ref.extra.get("ability_names") or ():
+                    if name:
+                        names.add(str(name))
+        return names
+
+    def _hot_reload_tools(
+        self,
+        config: DeepAgentConfig,
+        *,
+        previous_tools: Optional[List[ToolCard]] = None,
+    ) -> None:
+        """Sync tool cards in the shared AbilityManager during hot-reconfigure.
+
+        Tools are matched by id: a card whose id already exists in the
+        AbilityManager is left untouched, except paid-search cards whose
+        configured-provider metadata has changed. Cards with a new id replace any
+        existing entry with the same name, or are added fresh.  Tools present
+        in the AbilityManager but absent from config.tools are removed.
+        MCP server registrations and other ability types are not affected.
+        """
+        new_by_name = {card.name: card for card in (config.tools or [])}
+        previous_by_name = {
+            card.name: card for card in (previous_tools or []) if isinstance(card, ToolCard)
+        }
+
+        # Only remove tools that were previously managed by config.tools.
+        # Rail-registered tools such as task_tool, and extension/plugin tools
+        # recorded in ``_load_records``, must survive hot reload.
+        managed_tool_names = set(previous_by_name)
+        if not managed_tool_names:
+            managed_tool_names = set(new_by_name)
+        extension_tool_names = self._extension_bound_tool_names()
+        stale = [
+            name
+            for name in managed_tool_names
+            if name not in new_by_name and name not in extension_tool_names
+        ]
+        if stale:
+            for name in stale:
+                card = previous_by_name.get(name)
+                if card is not None:
+                    self._unregister_tool_resource(card)
+            self.ability_manager.remove(stale)
+
+        # Add or replace tools whose id has changed (or are new).
+        for name, card in new_by_name.items():
+            existing = self.ability_manager.get(name)
+            existing_tool = existing if isinstance(existing, ToolCard) else None
+            same_card = existing_tool is not None and existing_tool.id == card.id
+            if same_card and (name != "paid_search" or existing_tool == card):
+                self._ensure_builtin_tool_resource(card, config)
+                continue  # Same id - no update needed.
+            if existing_tool is not None:
+                self._unregister_tool_resource(existing_tool)
+                self.ability_manager.remove(name)
+            self.ability_manager.add(card)
+            self._ensure_builtin_tool_resource(card, config)
+        self.ability_manager.reorder_tools(list(new_by_name))
+
+    def _hot_reload_system_prompt(self, config: DeepAgentConfig) -> None:
+        """Rebuild the SystemPromptBuilder and update both agents during hot-reconfigure.
+
+        The same builder object must be referenced by both DeepAgent.system_prompt_builder
+        and react_agent.system_prompt_builder so that rails mutating the builder before
+        model calls see a consistent view.
+        """
+        language = resolve_language(config.language)
+        mode = resolve_mode(config.prompt_mode)
+        self.prompt_attachment_manager.language = language
+        priority_registry = getattr(self.system_prompt_builder, "priority_registry", None)
+        prompt_builder = SystemPromptBuilder(language=language, mode=mode)
+        if priority_registry is not None:
+            prompt_builder.set_priority_registry(priority_registry)
+        if config.system_prompt:
+            prompt_builder.add_section(PromptSection(
+                name=SectionName.IDENTITY,
+                content={"cn": config.system_prompt, "en": config.system_prompt},
+                priority=10,
+            ))
+        else:
+            prompt_builder.add_section(build_identity_section(language))
+        new_react_config = self._react_agent.config.model_copy()
+        new_react_config.prompt_template = [
+            {"role": "system", "content": _render_identity_prompt(prompt_builder, language)}
+        ]
+        self._react_agent.configure(new_react_config)
+        self.system_prompt_builder = prompt_builder
+        self._sync_prompt_builder_references()
+        if isinstance(self._task_completion_rail, TaskCompletionRail):
+            self._task_completion_rail.goal_language = language
+        if self.goal_manager is not None:
+            self.goal_manager.language = language
+        logger.info("[DeepAgent] System prompt hot reloaded")
+
+    def _sync_prompt_builder_references(self) -> None:
+        """Push the current system_prompt_builder reference everywhere.
+
+        ReActAgent.configure() may rebuild its prompt_builder, and rails can be
+        registered, pending, or stale across hot-reconfigure cycles.  Keep every
+        mutable prompt participant on the same builder object so callbacks never
+        write to a builder different from the one used for the final model call.
+        """
+        builder = self.system_prompt_builder
+        if builder is None:
+            return
+
+        if self._react_agent is not None:
+            self._react_agent.prompt_builder = builder
+            self._react_agent.system_prompt_builder = builder
+            self._react_agent.prompt_attachment_manager = self.prompt_attachment_manager
+
+        for rail in (*self._pending_rails, *self._registered_rails, *self._stale_rails):
+            if hasattr(rail, "system_prompt_builder"):
+                rail.system_prompt_builder = builder
+            if hasattr(rail, "_system_prompt_builder"):
+                setattr(rail, "_system_prompt_builder", builder)
+
+    def apply_prompt_builder_to_react_agent(self) -> None:
+        """Re-render the current system_prompt_builder into the inner ReActAgent.
+
+        Public entry point for resource binding targets after a prompt section
+        mutation: rebuilds ``react_agent.config.prompt_template`` from the
+        builder's identity section and reconfigures the ReActAgent, then syncs
+        every prompt participant to the same builder reference via
+        :meth:`_sync_prompt_builder_references`. Keeps the binding target from
+        touching ``react_agent.config`` / ``react_agent.configure`` directly.
+
+        The template carries the identity alone, for the same reason it does in
+        :meth:`_hot_reload_system_prompt` -- see :func:`_render_identity_prompt`.
+        """
+        builder = self.system_prompt_builder
+        if builder is None or self._react_agent is None:
+            return
+        language = resolve_language(
+            self._deep_config.language if self._deep_config is not None else None
+        )
+        new_react_config = self._react_agent.config.model_copy()
+        new_react_config.prompt_template = [
+            {"role": "system", "content": _render_identity_prompt(builder, language)}
+        ]
+        self._react_agent.configure(new_react_config)
+        self._sync_prompt_builder_references()
+
+    def _queue_pending_rails(self, config: DeepAgentConfig) -> None:
+        """Append config-driven rails to _pending_rails for lazy registration."""
+        if config.rails is not None:
+            self._pending_rails.extend(config.rails)
+
+        if config.moa is not None:
+            from openjiuwen.harness.rails.moa_rail import MoARail
+
+            if not any(isinstance(rail, MoARail) for rail in (*self._pending_rails, *self._registered_rails)):
+                self._pending_rails.append(MoARail(config.moa))
+
+        self._task_completion_rail = None
+
+        if config.progressive_tool_enabled:
+            self._pending_rails.append(
+                ProgressiveToolRail(config=config)
+            )
+
+        # Auto-inject a default TaskCompletionRail when the outer
+        # task loop is enabled.  Users can override it by passing
+        # their own TaskCompletionRail via add_rail() or the
+        # factory's rails= argument.
+        if config.enable_task_loop:
+            self._pending_rails.append(
+                TaskCompletionRail(
+                    goal_language=self._goal_prompt_language(config),
+                )
+            )
+
+        if isinstance(config.permissions, dict) and config.permissions.get("enabled"):
+            ws_root = None
+            if config.workspace is not None:
+                ws_root = Path(config.workspace.root_path).resolve()
+            model_name = None
+            if config.model is not None:
+                model_name = getattr(config.model, "model_name", None)
+            prail = build_permission_interrupt_rail(
+                permissions=config.permissions,
+                llm=config.model,
+                model_name=model_name,
+                host=config.permission_host,
+                workspace_root=ws_root,
+            )
+            if prail is not None:
+                self._pending_rails.append(prail)
+
+        self._queue_online_training_rail_from_env()
+
+    def _queue_online_training_rail_from_env(self) -> None:
+        """Queue the env-selected online training Rail when enabled by the host process."""
+
+        rail = self._build_online_training_rail_from_env()
+        if rail is None:
+            return
+        self._pending_rails.append(rail)
+        logger.info("[DeepAgent] %s added from environment", type(rail).__name__)
+
+    def _build_online_training_rail_from_env(self) -> AgentRail | None:
+        """Build the env-selected online training Rail without duplicating existing rails."""
+
+        try:
+            from openjiuwen.agent_evolving.agent_rl.online.core.rail_factory import (
+                build_online_training_rail_from_env,
+            )
+        except Exception as exc:
+            logger.warning("[DeepAgent] online training rail factory unavailable: %s", exc)
+            return None
+
+        return build_online_training_rail_from_env(self.configured_rails())
+
+    def set_react_agent(
+        self,
+        react_agent: Any,
+        initialized: bool = False,
+    ) -> "DeepAgent":
+        """Inject an inner agent implementation for runtime wiring/tests."""
+        self._react_agent = cast(ReActAgent, react_agent)
+        self._initialized = initialized
+        return self
+
+    @property
+    def is_initialized(self) -> bool:
+        """Whether lazy rail initialization is completed."""
+        return self._initialized
+
+    @property
+    def is_invoke_active(self) -> bool:
+        """Whether is invoke_active."""
+        return self._invoke_active
+
+    @property
+    def is_auto_invoke_scheduled(self) -> bool:
+        """Whether is auto_invoke_scheduled."""
+        return self._auto_invoke_scheduled
+
+    def set_auto_invoke_scheduled(self, is_scheduled: bool) -> None:
+        """Set auto_invoke_scheduled."""
+        self._auto_invoke_scheduled = is_scheduled
+
+    @property
+    def deep_config(self) -> DeepAgentConfig:
+        """deep_config carried by this agent."""
+        return self._deep_config
+
+    @property
+    def react_agent(self) -> Optional[ReActAgent]:
+        """The internal ReActAgent instance."""
+        return self._react_agent
+
+    def _resolve_context_session_id(self, session_id: Optional[str] = None) -> str:
+        """Resolve the session id used by context inspection APIs."""
+        resolved = (
+            session_id
+            or self._bound_session_id
+            or (
+                self._loop_session.get_session_id()
+                if self._loop_session is not None
+                else None
+            )
+        )
+        if not resolved:
+            raise build_error(
+                StatusCode.DEEPAGENT_CONTEXT_PARAM_ERROR,
+                error_msg="session_id is required when no context is bound.",
+            )
+        return resolved
+
+    def _get_context_or_error(
+        self,
+        session_id: Optional[str] = None,
+        context_id: str = "default_context_id",
+    ):
+        """Return the inner ReAct context for a session, or raise."""
+        if self._react_agent is None:
+            raise build_error(
+                StatusCode.DEEPAGENT_RUNTIME_ERROR,
+                error_msg="DeepAgent not configured. Call configure() first.",
+            )
+
+        resolved_session_id = self._resolve_context_session_id(session_id)
+        context = self._react_agent.context_engine.get_context(
+            context_id=context_id,
+            session_id=resolved_session_id,
+        )
+        if context is None:
+            raise build_error(
+                StatusCode.DEEPAGENT_CONTEXT_PARAM_ERROR,
+                error_msg=(
+                    f"cannot find context '{context_id}' "
+                    f"in session '{resolved_session_id}'"
+                ),
+        )
+        return context
+
+    def _get_react_config(self) -> ReActAgentConfig:
+        """Return inner ReActAgent config for real and test agents."""
+        if self._react_agent is None:
+            raise build_error(
+                StatusCode.DEEPAGENT_RUNTIME_ERROR,
+                error_msg="DeepAgent not configured. Call configure() first.",
+            )
+        config = getattr(
+            self._react_agent,
+            "config",
+            getattr(self._react_agent, "_config", None),
+        )
+        if config is None:
+            raise build_error(
+                StatusCode.DEEPAGENT_RUNTIME_ERROR,
+                error_msg="Inner ReActAgent config is not available.",
+            )
+        return config
+
+    def _resolve_context_window_tokens(self) -> int:
+        """Resolve the configured model context window size."""
+        react_config = self._get_react_config()
+        config = react_config.context_engine_config
+        model_config = getattr(react_config, "model_config_obj", None)
+        model_name = (
+            getattr(react_config, "model_name", None)
+            or getattr(model_config, "model_name", None)
+            or getattr(config, "model_name", None)
+        )
+        global_context_window = getattr(config, "context_window_tokens", None)
+        model_context_window = getattr(model_config, "context_window", None)
+        if not (
+            isinstance(global_context_window, int)
+            and global_context_window > 0
+        ):
+            model_context_window_override = getattr(
+                config,
+                "model_context_window_tokens_override",
+                None,
+            )
+            global_context_window = (
+                model_context_window_override
+                if isinstance(model_context_window_override, int)
+                and model_context_window_override > 0
+                else model_context_window
+            )
+
+        return ContextUtils.resolve_context_max(
+            model_name=model_name,
+            fallback_context_window_tokens=global_context_window,
+            model_context_window_tokens=(
+                config.model_context_window_tokens if config is not None else None
+            ),
+        )
+
+    def update_model_context(
+        self,
+        *,
+        model_name: Optional[str] = None,
+        context_window_tokens: Optional[int] = None,
+    ) -> None:
+        """Refresh selected-model context metadata on the live inner agent."""
+        if self._react_agent is None:
+            return
+        update_context = getattr(self._react_agent, "update_model_context", None)
+        if callable(update_context):
+            update_context(
+                model_name=model_name,
+                context_window_tokens=context_window_tokens,
+            )
+
+    def get_context_usage(
+        self,
+        session_id: Optional[str] = None,
+        context_id: str = "default_context_id",
+    ) -> Dict[str, Any]:
+        """Get current context occupancy statistics.
+
+        The underlying ``ContextStats`` already prefers the latest
+        ``AssistantMessage.usage_metadata`` returned by the real model when
+        present; otherwise it falls back to local token counting.
+        """
+        context = self._get_context_or_error(session_id, context_id)
+        resolved_session_id = self._resolve_context_session_id(session_id)
+        stats = context.statistic()
+        context_window_tokens = self._resolve_context_window_tokens()
+        usage_ratio = (
+            stats.total_tokens / context_window_tokens
+            if context_window_tokens > 0
+            else 0.0
+        )
+        return {
+            "session_id": resolved_session_id,
+            "context_id": context.context_id(),
+            "total_tokens": stats.total_tokens,
+            "context_window_tokens": context_window_tokens,
+            "usage_ratio": usage_ratio,
+            "usage_percent": round(usage_ratio * 100, 2),
+            "stats": stats.model_dump(),
+        }
+
+    def get_context_occupancy(
+        self,
+        session_id: Optional[str] = None,
+        context_id: str = "default_context_id",
+    ) -> Dict[str, Any]:
+        """Alias for ``get_context_usage``."""
+        return self.get_context_usage(session_id, context_id)
+
+    def get_current_context(
+        self,
+        session_id: Optional[str] = None,
+        context_id: str = "default_context_id",
+    ) -> List[Any]:
+        """Return current context messages for the given session/context."""
+        context = self._get_context_or_error(session_id, context_id)
+        return context.get_messages()
+
+    @staticmethod
+    def _normalize_context_messages(
+        messages: Optional[List[Any] | Any] = None,
+    ) -> List[BaseMessage]:
+        """Normalize initial message inputs for a fresh context."""
+        if messages is None:
+            return []
+        raw_messages = (
+            messages
+            if isinstance(messages, list)
+            else [messages]
+        )
+        normalized: List[BaseMessage] = []
+        for message in raw_messages:
+            if isinstance(message, BaseMessage):
+                normalized.append(message)
+            elif isinstance(message, str):
+                normalized.append(SystemMessage(content=message))
+            elif isinstance(message, dict):
+                normalized.append(SystemMessage(**message))
+            else:
+                raise build_error(
+                    StatusCode.DEEPAGENT_CONTEXT_PARAM_ERROR,
+                    error_msg=(
+                        "messages must be a string, dict, "
+                        "BaseMessage, or a list of those values."
+                    ),
+                )
+        return normalized
+
+    async def create_new_context_engine(
+        self,
+        session_id: Optional[str] = None,
+        messages: Optional[List[Any] | Any] = None,
+    ) -> str:
+        """Create a fresh context in the inner ContextEngine and return its session id."""
+        if self._react_agent is None:
+            raise build_error(
+                StatusCode.DEEPAGENT_RUNTIME_ERROR,
+                error_msg="DeepAgent not configured. Call configure() first.",
+            )
+
+        new_session_id = session_id or str(uuid.uuid4())
+        normalized_messages = self._normalize_context_messages(
+            messages
+        )
+        await self._react_agent.context_engine.create_context(
+            session=Session(session_id=new_session_id, card=self.card),
+            history_messages=normalized_messages,
+        )
+        return new_session_id
+
+    async def new_context_engine(
+        self,
+        session_id: Optional[str] = None,
+        messages: Optional[List[Any] | Any] = None,
+    ) -> str:
+        """Alias for ``create_new_context_engine``."""
+        return await self.create_new_context_engine(
+            session_id,
+            messages,
+        )
+
+    @property
+    def loop_coordinator(self) -> Optional[LoopCoordinator]:
+        """LoopCoordinator for the outer task loop."""
+        return self._loop_coordinator
+
+    @property
+    def loop_controller(self) -> Optional[TaskLoopController]:
+        """LoopController for the outer task loop."""
+        return self._loop_controller
+
+    @property
+    def event_queue(self) -> Optional["EventQueue"]:
+        """EventQueue for the current task loop."""
+        if self._loop_controller is None:
+            return None
+        return self._loop_controller.event_queue
+
+    @property
+    def event_handler(self) -> Optional[TaskLoopEventHandler]:
+        """EventHandler for the current task loop."""
+        if self._loop_controller is None:
+            return None
+        return cast(
+            TaskLoopEventHandler,
+            self._loop_controller.event_handler,
+        )
+
+    def _create_react_agent(self) -> ReActAgent:
+        """Build the internal ReActAgent from current DeepAgentConfig."""
+        cfg = self._deep_config
+        if cfg is None:
+            raise build_error(
+                StatusCode.DEEPAGENT_CONFIG_PARAM_ERROR,
+                error_msg="DeepAgentConfig is required. Call configure() first.",
+            )
+
+        inner_card = AgentCard(
+            id=self.card.id,
+            name=f"{self.card.name}_react",
+            description=self.card.description or "",
+        )
+
+        react_config = ReActAgentConfig()
+        _bind_inner_react_max_iterations(react_config, cfg.max_iterations)
+        react_config.on_max_iterations = cfg.on_max_iterations
+        react_config.max_iterations_hard_limit = cfg.max_iterations_hard_limit
+        if cfg.context_engine_config is not None:
+            react_config.context_engine_config = cfg.context_engine_config
+        if cfg.kv_cache_affinity_config is not None:
+            react_config.kv_cache_affinity_config = cfg.kv_cache_affinity_config
+        react_config.workspace = cfg.workspace
+        if cfg.sys_operation is not None:
+            react_config.sys_operation_id = cfg.sys_operation.id
+
+        react_config.parallel_tool_calls = cfg.parallel_tool_calls
+
+        language = resolve_language(cfg.language)
+        mode = resolve_mode(cfg.prompt_mode)
+        self.prompt_attachment_manager.language = language
+        prompt_builder = SystemPromptBuilder(language=language, mode=mode)
+        if cfg.system_prompt:
+            # Wrap the provided prompt as the identity section so all
+            # rails can consistently operate on prompt_builder.
+            prompt_builder.add_section(PromptSection(
+                name=SectionName.IDENTITY,
+                content={"cn": cfg.system_prompt, "en": cfg.system_prompt},
+                priority=10,
+            ))
+        else:
+            prompt_builder.add_section(build_identity_section(language))
+        prompt = prompt_builder.build()
+        react_config.prompt_template = [{"role": "system", "content": prompt}]
+
+        if cfg.model is not None:
+            model = cfg.model
+            if model.model_client_config is not None:
+                react_config.model_client_config = model.model_client_config
+            if model.model_config is not None:
+                react_config.model_config_obj = model.model_config
+                if model.model_config.model_name:
+                    react_config.model_name = model.model_config.model_name
+
+        agent = ReActAgent(inner_card)
+        agent.configure(react_config)
+
+        # Store builder on both agents (same object):
+        #   - DeepAgent.system_prompt_builder: rails initialized on the outer
+        #     agent pick it up as the public contract.
+        #   - ReActAgent.system_prompt_builder: bridged BEFORE_MODEL_CALL rails
+        #     mutate the same builder object before _railed_model_call builds it.
+        self.system_prompt_builder = prompt_builder
+        agent.prompt_builder = prompt_builder
+        agent.system_prompt_builder = prompt_builder
+        agent.prompt_attachment_manager = self.prompt_attachment_manager
+
+        # Share ability manager so tools registered on DeepAgent are visible inside.
+        agent.ability_manager = self.ability_manager
+
+        # Inject pre-built Model to bypass lazy init.
+        if cfg.model is not None:
+            agent.set_llm(cfg.model)
+
+        return agent
+
+    async def _register_pending_mcps(self) -> None:
+        """Register configured MCP servers before rails initialize."""
+        cfg = self._deep_config
+        if cfg is None or not cfg.mcps:
+            return
+
+        for mcp_config in cfg.mcps:
+            existing_config = Runner.resource_mgr.get_mcp_server_config(mcp_config.server_id)
+            if existing_config is None:
+                result = await Runner.resource_mgr.add_mcp_server(
+                    mcp_config,
+                    tag=self.card.id,
+                )
+                if result.is_err():
+                    raise result.msg()
+            else:
+                if existing_config.model_dump() != mcp_config.model_dump():
+                    raise build_error(
+                        StatusCode.RESOURCE_MCP_SERVER_ADD_ERROR,
+                        server_config=mcp_config,
+                        reason=(
+                            f"server_id '{mcp_config.server_id}' is already registered "
+                            "with a different config"
+                        ),
+                    )
+
+                tag_result = Runner.resource_mgr.add_resource_tag(
+                    mcp_config.server_id,
+                    self.card.id,
+                )
+                if tag_result.is_err():
+                    raise tag_result.msg()
+
+                for tool_id in Runner.resource_mgr.get_mcp_tool_ids(mcp_config.server_id):
+                    tag_result = Runner.resource_mgr.add_resource_tag(tool_id, self.card.id)
+                    if tag_result.is_err():
+                        raise tag_result.msg()
+
+            self.ability_manager.add(mcp_config)
+
+    async def _resolve_read_image_multimodal(self) -> None:
+        """Warm the native-image capability decision when it is set to auto.
+
+        A probe costs a full LLM round-trip, so it never blocks startup: a
+        cached verdict is consumed dynamically by image-input call sites;
+        otherwise the probe runs in the background. The config remains ``None``
+        so auto mode follows later probe completion and main-model changes.
+        """
+        config = self._deep_config
+        if config is None or config.enable_read_image_multimodal is not None:
+            return
+
+        if config.model is None:
+            logger.debug(
+                "[DeepAgent] no model configured; native image input remains unavailable",
+            )
+            return
+
+        cached = get_cached_image_support(config.model)
+        if cached is not None:
+            logger.info(
+                "[DeepAgent] read_file image multimodal from probe cache: %s",
+                cached,
+            )
+            return
+
+        logger.info(
+            "[DeepAgent] read_file image multimodal not probed yet; "
+            "probing in background and using metadata-only until resolved",
+        )
+        schedule_image_support_probe(config.model)
+
+    def _apply_inherited_artifact_cwd(self) -> None:
+        """Set cwd from ``_inherited_artifact_root`` for a reused subagent.
+
+        No-op on the main agent (field is unset), so host-seeded runtime cwd
+        is not overwritten on every invoke.
+        """
+        if not self._inherited_artifact_root:
+            return
+        if not (self._deep_config and self._deep_config.workspace):
+            return
+        from openjiuwen.core.sys_operation.cwd import init_cwd
+
+        init_root = self._deep_config.workspace.root_path or os.getcwd()
+        init_cwd(
+            self._inherited_artifact_root,
+            project_root=self._inherited_artifact_root,
+            workspace=init_root,
+        )
+
+    async def _ensure_initialized(self) -> None:
+        """Perform lazy async initialization."""
+        if self._initialized:
+            # Reused subagent instances skip full init; still refresh cwd so
+            # create_subagent does not have to mutate the parent's ContextVar.
+            self._apply_inherited_artifact_cwd()
+            await self._register_online_training_rail_from_env_if_needed()
+            return
+
+        if self._deep_config is None:
+            raise build_error(
+                StatusCode.DEEPAGENT_RUNTIME_ERROR,
+                error_msg="DeepAgent not configured. Call configure() first.",
+            )
+
+        self._queue_online_training_rail_from_env()
+
+        # Initialize ContextVar CWD in the current asyncio Task context.
+        # Each agent sets its own CWD unconditionally — ContextVar copies
+        # are per-Task, so this won't affect the parent agent.
+        if self._deep_config and (self._deep_config.workspace or self._deep_config.cwd):
+            from openjiuwen.core.sys_operation.cwd import init_cwd
+
+            workspace = self._deep_config.workspace
+            workspace_root = (workspace.root_path if workspace else None) or os.getcwd()
+            if self._inherited_artifact_root:
+                init_cwd(
+                    self._inherited_artifact_root,
+                    project_root=self._inherited_artifact_root,
+                    workspace=workspace_root,
+                )
+            else:
+                # cwd and workspace are separate layers: the workspace holds
+                # this agent's artifacts, cwd is where shell runs and relative
+                # paths resolve. They coincide unless the host says otherwise
+                # (team members run in the project dir / their worktree while
+                # keeping a private workspace).
+                cwd_root = self._deep_config.cwd or workspace_root
+                project_root = self._deep_config.project_root or cwd_root
+                init_cwd(cwd_root, project_root=project_root, workspace=workspace_root)
+
+        await self._register_pending_mcps()
+
+        if self._needs_workspace_init():
+            await self.init_workspace()
+
+        await self._resolve_read_image_multimodal()
+
+        self._sync_prompt_builder_references()
+
+        # Unregister stale rails left over from a previous configure() cycle.
+        # Skip rails that are also in pending (same instance): they will be
+        # re-initialized by the pending loop below without needing a full retire.
+        for stale_rail in self._stale_rails:
+            if stale_rail not in self._pending_rails:
+                await self.unregister_rail(stale_rail)
+        self._stale_rails.clear()
+
+        moa_integration = None
+        if self._deep_config.moa is not None:
+            from openjiuwen.harness.moa.integration import MoAIntegration
+
+            moa_integration = MoAIntegration(self)
+
+        # Initialize in the same order callbacks run in: highest priority
+        # first. A rail's init registers its tools and prompt sections, so
+        # "run my hook after that rail's" and "see that rail's tools at init
+        # time" are the same question, and one number now answers both. The
+        # sort is stable, so rails sharing a priority keep the order the
+        # caller listed them in.
+        rail_init_timings: List[tuple] = []
+        initializing_rail = None
+        try:
+            if moa_integration is not None:
+                moa_integration.prepare()
+            initialized_rails = sorted(
+                self._pending_rails,
+                key=lambda r: r.priority,
+                reverse=True,
+            )
+            for rail_inst in initialized_rails:
+                initializing_rail = rail_inst
+                if isinstance(rail_inst, TaskCompletionRail):
+                    self._task_completion_rail = rail_inst
+                    self._bind_live_goal_manager(rail_inst)
+                if isinstance(rail_inst, DeepAgentRail):
+                    rail_inst.set_sys_operation(self._deep_config.sys_operation)
+                    rail_inst.set_workspace(self._deep_config.workspace)
+                rail_init_timings.append(
+                    (type(rail_inst).__name__, init_rail(rail_inst, self))
+                )
+                await self._register_rail_selective(rail_inst)
+                initializing_rail = None
+            if moa_integration is not None:
+                await moa_integration.finalize(initialized_rails)
+        except BaseException:
+            if moa_integration is not None:
+                await moa_integration.rollback(initializing_rail)
+            raise
+
+        # ProgressiveToolRail owns the BM25 catalog. Build its initial
+        # snapshot only after every pending startup rail has registered its
+        # tools. Tools registered later are handled by the deferred-tool
+        # registry-version check on the next tool_search call.
+        seen_rails: set[int] = set()
+        for rail_inst in self._registered_rails:
+            if id(rail_inst) in seen_rails:
+                continue
+            seen_rails.add(id(rail_inst))
+            if isinstance(rail_inst, ProgressiveToolRail):
+                await rail_inst.finalize_startup_async(self)
+        log_rail_init_breakdown(rail_init_timings)
+        self._pending_rails.clear()
+        self._sync_prompt_builder_references()
+        self._initialized = True
+
+    async def _register_online_training_rail_from_env_if_needed(self) -> None:
+        """Register the env-selected online Rail if env became available after configure()."""
+
+        if not self._initialized:
+            return
+
+        rail = self._build_online_training_rail_from_env()
+        if rail is None:
+            return
+        await self.register_rail(rail)
+        logger.info("[DeepAgent] %s registered from environment", type(rail).__name__)
+
+    def _needs_workspace_init(self) -> bool:
+        """Check if workspace initialization is needed."""
+        config = self._deep_config
+        if config:
+            return (
+                    config.workspace is not None
+                    and config.sys_operation is not None
+                    and config.auto_create_workspace
+            )
+        return False
+
+    async def ensure_initialized(self) -> None:
+        """Perform lazy initialization. For testing only."""
+        await self._ensure_initialized()
+
+    async def init_workspace(self) -> None:
+        """Initialize the workspace with directory structure and default content.
+
+        Only creates directories/files if they don't exist, so it's safe to call
+        multiple times.
+        """
+        from openjiuwen.harness.workspace.directory_builder import DirectoryBuilder
+
+        if self._deep_config and self._deep_config.workspace:
+            root = Path(self._deep_config.workspace.root_path)
+            if (root / ".workspace").exists():
+                return
+
+            builder = DirectoryBuilder(
+                sys_operation=self._deep_config.sys_operation,
+                root_path=self._deep_config.workspace.root_path,
+            )
+            await builder.build(self._deep_config.workspace.directories)
+
+    @property
+    def loop_session(self) -> Optional[Session]:
+        """The active loop session, or None if no session is running."""
+        return self._loop_session
+
+    @property
+    def react_config(self) -> ReActAgentConfig:
+        """React agent config. For testing only."""
+        return self._react_agent.config
+
+    def inherit_invocation_log_dir(self, parent_dir: str | None) -> None:
+        """Copy a parent invocation log directory when this agent has none."""
+        if (
+            parent_dir is None
+            or self._deep_config is None
+            or self._deep_config.invocation_log_dir is not None
+        ):
+            return
+        # Assign the field directly. configure() hot-reloads rails and the model.
+        self._deep_config = replace(self._deep_config, invocation_log_dir=parent_dir)
+
+    @staticmethod
+    def _bind_inherited_artifact_root(subagent: Any) -> Any:
+        """Point subagent file writes at the parent's current artifact root.
+
+        Prefer ``get_cwd()``: after a sibling subagent runs in the same Task,
+        ambient ``get_workspace()`` may point at that sibling's ``sub_agents/``
+        tree while cwd remains the shared artifact root.
+        """
+        from openjiuwen.core.sys_operation.cwd import get_cwd, get_workspace
+
+        artifact_root = get_cwd() or get_workspace()
+        try:
+            setattr(subagent, "_inherited_artifact_root", artifact_root)
+        except (AttributeError, TypeError):
+            # Test mocks may return bare object(); real DeepAgent always accepts it.
+            pass
+        return subagent
+
+    def create_subagent(
+        self,
+        subagent_type: str,
+        subsession_id: str,
+        browser_capabilities: Optional[List[str]] = None,
+    ) -> "DeepAgent":
+        """Create a subagent instance (shared by TaskTool and SessionSpawnExecutor).
+
+        Args:
+            subagent_type: Type of subagent to create (e.g., "general-purpose").
+            subsession_id: The session id for the subagent.
+            browser_capabilities: Task-scoped browser capability categories.
+
+        Returns:
+            Configured DeepAgent instance.
+
+        Raises:
+            BaseError: If subagent spec not found.
+        """
+        spec = self._find_subagent_spec(subagent_type)
+        if spec is None:
+            raise build_error(
+                StatusCode.DEEPAGENT_CREATE_SUBAGENT_NOT_FOUND,
+                error_msg=f"Subagent spec not found: {subagent_type}",
+            )
+
+        if isinstance(spec, DeepAgent):
+            logger.info("already get deepagent instance, return it")
+            # Only bind the field here; cwd is applied in _ensure_initialized
+            # so create_subagent does not mutate the parent's ContextVar.
+            spec = self._bind_inherited_artifact_root(spec)
+            parent_log_dir = self._deep_config.invocation_log_dir if self._deep_config is not None else None
+            spec.inherit_invocation_log_dir(parent_log_dir)
+            return spec
+
+        if not self._deep_config.workspace or isinstance(self._deep_config.workspace, str):
+            workspace_path = (
+                str(Path(self._deep_config.workspace) / _SUB_AGENTS_DIR / subsession_id)
+                if self._deep_config.workspace
+                else str(Path(".") / _SUB_AGENTS_DIR / subsession_id)
+            )
+            workspace = Workspace(
+                root_path=workspace_path,
+                language=self._deep_config.language
+            )
+        else:
+            workspace = Workspace(
+                root_path=Path(self._deep_config.workspace.root_path) / _SUB_AGENTS_DIR / subsession_id,
+                language=self._deep_config.language
+            )
+
+        subagent_rails = None
+        if spec.rails is not None:
+            subagent_rails = []
+            for rail in spec.rails:
+                fork_for_agent = getattr(rail, "fork_for_agent", None)
+                subagent_rails.append(
+                    fork_for_agent() if callable(fork_for_agent) else rail
+                )
+
+        create_kwargs = {
+            "model": spec.model or self._deep_config.model,
+            "card": spec.agent_card,
+            "system_prompt": spec.system_prompt,
+            "tools": spec.tools,
+            "mcps": spec.mcps,
+            "rails": subagent_rails,
+            "enable_task_loop": spec.enable_task_loop,
+            "invocation_log_dir": (
+                spec.invocation_log_dir if spec.invocation_log_dir is not None else self._deep_config.invocation_log_dir
+            ),
+            "max_iterations": (
+                spec.max_iterations
+                if spec.max_iterations is not None
+                else self._deep_config.max_iterations
+            ),
+            "workspace": (
+                spec.workspace
+                if spec.workspace is not None
+                else workspace
+            ),
+            "skills": spec.skills,
+            "backend": (
+                spec.backend
+                if spec.backend is not None
+                else self._deep_config.backend
+            ),
+            "sys_operation": (
+                spec.sys_operation
+                if spec.sys_operation is not None and spec.workspace is not None
+                else None
+            ),
+            "language": (
+                spec.language
+                if spec.language is not None
+                else self._deep_config.language
+            ),
+            "prompt_mode": (
+                spec.prompt_mode
+                if spec.prompt_mode is not None
+                else self._deep_config.prompt_mode
+            ),
+            # Preserve the parent's explicit decision by default.  A child
+            # using a model with different image capabilities may override it.
+            "enable_read_image_multimodal": (
+                spec.enable_read_image_multimodal
+                if spec.enable_read_image_multimodal is not None
+                else self._deep_config.enable_read_image_multimodal
+            ),
+            # A dynamically created subagent runs under its own conversation
+            # ID, but it remains part of the parent's KVC-affinity lifecycle.
+            # Without inheriting this config the child ReActAgent never
+            # installs the affinity hooks, so its normal model requests omit
+            # agent_hint even though TaskTool supplies conversation_id and
+            # parent_session_id.
+            "kv_cache_affinity_config": (
+                self._deep_config.kv_cache_affinity_config
+            ),
+            "subagents": None,
+            "enable_async_subagent": False,
+            "add_general_purpose_agent": False,
+            "enable_plan_mode": spec.enable_plan_mode,
+            "parallel_tool_calls": spec.parallel_tool_calls,
+            "restrict_to_work_dir": spec.restrict_to_work_dir or self._deep_config.restrict_to_work_dir,
+        }
+
+        if spec.factory_name:
+            normalized_factory = (spec.factory_name or "").strip().lower()
+            if normalized_factory in {"browser_agent", "browser_runtime"}:
+                from openjiuwen.harness.subagents.browser_agent import (
+                    create_browser_agent,
+                )
+
+                factory_kwargs = dict(spec.factory_kwargs or {})
+                # Browser models may be independent from the parent model and
+                # therefore retain their factory's automatic image-capability
+                # probe.  Do not forward the generic inherited value twice.
+                browser_create_kwargs = dict(create_kwargs)
+                browser_create_kwargs.pop("enable_read_image_multimodal", None)
+                browser_model = create_kwargs["model"]
+                browser_parent_model = getattr(
+                    browser_model,
+                    "_browser_agent_parent_model",
+                    None,
+                )
+                if spec.enable_read_image_multimodal is not None:
+                    factory_kwargs.setdefault(
+                        "enable_read_image_multimodal",
+                        spec.enable_read_image_multimodal,
+                    )
+                elif (
+                    browser_model is self._deep_config.model
+                    or browser_parent_model is self._deep_config.model
+                ):
+                    parent_image_support = getattr(
+                        self._deep_config,
+                        "enable_read_image_multimodal",
+                        None,
+                    )
+                    factory_kwargs.setdefault(
+                        "enable_read_image_multimodal",
+                        parent_image_support,
+                    )
+                if browser_capabilities is not None:
+                    factory_kwargs["browser_capabilities"] = list(browser_capabilities)
+                return self._bind_inherited_artifact_root(
+                    create_browser_agent(
+                        **browser_create_kwargs,
+                        **factory_kwargs,
+                    )
+                )
+            if normalized_factory == "code_agent":
+                from openjiuwen.harness.subagents.code_agent import (
+                    create_code_agent,
+                )
+
+                return self._bind_inherited_artifact_root(
+                    create_code_agent(
+                        **create_kwargs,
+                        **dict(spec.factory_kwargs or {}),
+                    )
+                )
+            if normalized_factory == "research_agent":
+                from openjiuwen.harness.subagents.research_agent import (
+                    create_research_agent,
+                )
+
+                return self._bind_inherited_artifact_root(
+                    create_research_agent(
+                        **create_kwargs,
+                        **dict(spec.factory_kwargs or {}),
+                    )
+                )
+            if normalized_factory in {"mobile_gui_agent", "mobile_agent"}:
+                from openjiuwen.harness.subagents.mobile_gui_agent import (
+                    create_mobile_gui_agent,
+                )
+
+                return self._bind_inherited_artifact_root(
+                    create_mobile_gui_agent(
+                        **create_kwargs,
+                        **dict(spec.factory_kwargs or {}),
+                    )
+                )
+            if normalized_factory in {"cua_agent", "desktop_agent"}:
+                from openjiuwen.harness.subagents.cua_agent import (
+                    create_cua_agent,
+                )
+
+                return self._bind_inherited_artifact_root(
+                    create_cua_agent(
+                        **create_kwargs,
+                        **dict(spec.factory_kwargs or {}),
+                    )
+                )
+
+            raise build_error(
+                StatusCode.DEEPAGENT_CREATE_SUBAGENT_NOT_FOUND,
+                error_msg=f"Unsupported subagent factory: {spec.factory_name}",
+            )
+
+        from openjiuwen.harness.factory import create_deep_agent
+
+        return self._bind_inherited_artifact_root(
+            create_deep_agent(**create_kwargs, **dict(spec.factory_kwargs or {}))
+        )
+
+    def _find_subagent_spec(self, subagent_type: str) -> Optional["SubAgentConfig | DeepAgent"]:
+        """Find SubAgentConfig matching subagent_type.
+
+        Args:
+            subagent_type: Type of subagent to find.
+
+        Returns:
+            Matching SubAgentConfig or DeepAgent instance, or None.
+        """
+        if self._deep_config is None:
+            return None
+
+        from openjiuwen.harness.schema.config import SubAgentConfig
+
+        for spec in self._deep_config.subagents or []:
+            if isinstance(spec, SubAgentConfig) and spec.agent_card.name == subagent_type:
+                return spec
+            if isinstance(spec, DeepAgent):
+                card = getattr(spec, "card", None)
+                if getattr(card, "name", None) == subagent_type:
+                    return spec
+
+        return None
+
+    def _normalize_inputs(self, inputs: Any) -> InvokeInputs:
+        """Parse user inputs into typed InvokeInputs."""
+        if isinstance(inputs, dict):
+            query = inputs.get("query", "")
+            conversation_id = inputs.get("conversation_id")
+            parent_session_id = inputs.get("parent_session_id")
+            invocation_id = inputs.get("invocation_id")
+            parent_invocation_id = inputs.get("parent_invocation_id")
+            delegation_id = inputs.get("delegation_id")
+            agent_path = inputs.get("agent_path")
+            depth = int(inputs.get("depth") or 0)
+            raw_turn_number = inputs.get("_turn_number")
+            turn_number = (
+                raw_turn_number
+                if isinstance(raw_turn_number, int)
+                and not isinstance(raw_turn_number, bool)
+                and raw_turn_number > 0
+                else None
+            )
+            run = inputs.get("run", {})
+            run_kind = None
+            run_context = None
+            if run:
+                kind = run.get("kind", "normal")
+                run_kind = RunKind(kind)
+                context_data = run.get("context")
+                if context_data:
+                    run_context = normalize_run_context(context_data)
+            # Merge raw_query into RunContext.extra
+            # (without affecting run_kind for normal queries)
+            raw_query = inputs.get("raw_query", "")
+            if raw_query:
+                if run_context is None:
+                    run_context = RunContext(extra={"raw_query": raw_query})
+                else:
+                    run_context.extra["raw_query"] = raw_query
+        elif isinstance(inputs, str):
+            query = inputs
+            conversation_id = None
+            parent_session_id = None
+            invocation_id = None
+            parent_invocation_id = None
+            delegation_id = None
+            agent_path = None
+            depth = 0
+            turn_number = None
+            run_kind = None
+            run_context = None
+        elif isinstance(inputs, InteractiveInput):
+            query = inputs
+            conversation_id = None
+            parent_session_id = None
+            invocation_id = None
+            parent_invocation_id = None
+            delegation_id = None
+            agent_path = None
+            depth = 0
+            turn_number = None
+            run_kind = None
+            run_context = None
+        else:
+            raise build_error(
+                StatusCode.DEEPAGENT_INPUT_PARAM_ERROR,
+                error_msg="Input must be dict with 'query', str, or InteractiveInput.",
+            )
+
+        invoke_inputs = InvokeInputs(
+            query=query,
+            conversation_id=conversation_id,
+            run_kind=run_kind,
+            run_context=run_context,
+            parent_session_id=parent_session_id,
+            invocation_id=invocation_id,
+            parent_invocation_id=parent_invocation_id,
+            delegation_id=delegation_id,
+            agent_path=agent_path,
+            depth=depth,
+            turn_number=turn_number,
+        )
+        return invoke_inputs
+
+    @staticmethod
+    def _copy_run_context_with_raw_query(
+        run_context: RunContext,
+        raw_query: str,
+    ) -> RunContext:
+        """Return a per-round RunContext with refreshed raw_query."""
+        extra = dict(run_context.extra)
+        extra["raw_query"] = raw_query
+        return RunContext(
+            reason=run_context.reason,
+            session_id=run_context.session_id,
+            context_mode=run_context.context_mode,
+            extra=extra,
+        )
+
+    @classmethod
+    def _run_context_for_task_loop_round(
+        cls,
+        run_context: Optional[RunContext],
+        current_query: Any,
+        is_follow_up: bool,
+    ) -> Optional[RunContext]:
+        """Return the RunContext that should be passed to one task-loop round."""
+        if run_context is None:
+            return None
+        if not is_follow_up:
+            return run_context
+        if not isinstance(current_query, str):
+            return run_context
+        if not current_query.strip():
+            return run_context
+        return cls._copy_run_context_with_raw_query(
+            run_context,
+            current_query,
+        )
+
+    @staticmethod
+    def _to_effective_inputs(invoke_inputs: InvokeInputs) -> Dict[str, Any]:
+        """Convert typed invoke inputs to ReAct input dict."""
+        effective_inputs: Dict[str, Any] = {"query": invoke_inputs.query}
+        if invoke_inputs.conversation_id is not None:
+            effective_inputs["conversation_id"] = invoke_inputs.conversation_id
+        if invoke_inputs.parent_session_id is not None:
+            effective_inputs["parent_session_id"] = invoke_inputs.parent_session_id
+        if invoke_inputs.invocation_id is not None:
+            effective_inputs["invocation_id"] = invoke_inputs.invocation_id
+        if invoke_inputs.parent_invocation_id is not None:
+            effective_inputs["parent_invocation_id"] = invoke_inputs.parent_invocation_id
+        if invoke_inputs.delegation_id is not None:
+            effective_inputs["delegation_id"] = invoke_inputs.delegation_id
+        if invoke_inputs.agent_path is not None:
+            effective_inputs["agent_path"] = list(invoke_inputs.agent_path)
+        if invoke_inputs.depth:
+            effective_inputs["depth"] = invoke_inputs.depth
+        if invoke_inputs.turn_number is not None:
+            effective_inputs["_turn_number"] = invoke_inputs.turn_number
+        if invoke_inputs.run_kind is not None:
+            effective_inputs["run_kind"] = invoke_inputs.run_kind
+        if invoke_inputs.run_context is not None:
+            effective_inputs["run_context"] = invoke_inputs.run_context
+        return effective_inputs
+
+    @staticmethod
+    def _is_resume_input(invoke_inputs: InvokeInputs) -> bool:
+        """Return True if the query is an InteractiveInput (interrupt resume)."""
+        return isinstance(invoke_inputs.query, InteractiveInput)
+
+    @staticmethod
+    def _result_from_stream_chunk(chunk: Any, output_parts: List[str]) -> Optional[Dict[str, Any]]:
+        """Build an invoke-style result from emitted stream chunks."""
+        chunk_type = getattr(chunk, "type", None)
+        payload = getattr(chunk, "payload", None)
+        if isinstance(chunk, dict):
+            chunk_type = chunk.get("type", chunk_type)
+            payload = chunk.get("payload", payload)
+
+        if not isinstance(payload, dict):
+            return None
+
+        result: Optional[Dict[str, Any]] = None
+        if chunk_type == "llm_output":
+            content = payload.get("content")
+            if isinstance(content, str):
+                output_parts.append(content)
+        elif chunk_type == "answer":
+            result = dict(payload)
+            result.setdefault("result_type", "answer")
+            if "output" not in result:
+                content = result.get("content")
+                if isinstance(content, str):
+                    output_parts.append(content)
+                    result["output"] = content
+                else:
+                    result = None
+        return result
+
+    @staticmethod
+    def _finalized_answer_chunk(chunk: Any, result: dict[str, Any]) -> Any:
+        """Keep transport metadata while replacing the pre-rail result."""
+        if isinstance(chunk, dict):
+            return {**chunk, "payload": result}
+        if isinstance(chunk, OutputSchema):
+            return chunk.model_copy(update={"payload": result})
+        return OutputSchema(type="answer", index=0, payload=result)
+
+    async def _prepare_single_round_session(
+        self, inputs: InvokeInputs, session: Session | None,
+    ) -> Session | None:
+        if session is not None or not inputs.conversation_id:
+            return session
+        if self._deep_config is not None and self._deep_config.enable_task_loop:
+            if not self._is_resume_input(inputs):
+                return None  # Task-loop sessions remain caller-owned.
+        envs = {}
+        if inputs.parent_session_id:
+            envs[KV_CACHE_AFFINITY_PARENT_SESSION_ID_ENV] = inputs.parent_session_id
+        session = create_agent_session(
+            session_id=inputs.conversation_id,
+            card=self.card,
+            envs=envs,
+        )
+        # Outer rails and the inner ReAct must see the same restored state.
+        await session.pre_run(inputs=self._to_effective_inputs(inputs))
+        return session
+
+    def add_rail(self, rail: AgentRail) -> "DeepAgent":
+        """Synchronously queue a rail for registration.
+
+        When a TaskCompletionRail is added it replaces any
+        previously queued one (default or user-provided).
+        """
+        if isinstance(rail, TaskCompletionRail):
+            # Remove any existing TaskCompletionRail (auto-default
+            # or a previously queued user rail).
+            self._pending_rails = [
+                r for r in self._pending_rails
+                if not isinstance(r, TaskCompletionRail)
+            ]
+        self._pending_rails.append(rail)
+        return self
+
+    def configured_rails(self) -> List[AgentRail]:
+        """Return all queued + registered rails (pending first, then registered).
+
+        Public accessor for hosts that need to copy a template agent's full rail
+        set without touching DeepAgent's internal rail lists directly.
+        """
+        return [*self._pending_rails, *self._registered_rails]
+
+    def find_rails_by_type(self, rail_types: tuple[type, ...]) -> List[AgentRail]:
+        """Return queued + registered rails matching any of the given types.
+
+        Public counterpart to ``strip_rails_by_type`` for callers that need to
+        locate a rail instance without touching DeepAgent's internal rail lists
+        directly.
+        """
+        if not rail_types:
+            return []
+        return [rail for rail in (*self._pending_rails, *self._registered_rails) if isinstance(rail, rail_types)]
+
+    def find_rail_by_name(self, name: str) -> Optional[AgentRail]:
+        """Return a pending or registered rail by its materialized class name."""
+        return next(
+            (
+                rail
+                for rail in (*self._pending_rails, *self._registered_rails)
+                if type(rail).__name__ == name
+            ),
+            None,
+        )
+
+    def find_pending_rails_by_type(self, rail_type: type) -> List[AgentRail]:
+        """Return pending rails matching the given type."""
+        return [rail for rail in self._pending_rails if isinstance(rail, rail_type)]
+
+    def is_pending_rail(self, rail: AgentRail) -> bool:
+        """Return True when rail is queued for lazy registration."""
+        return rail in self._pending_rails
+
+    def is_registered_rail(self, rail: AgentRail) -> bool:
+        """Return True when rail is registered in the active runtime."""
+        return rail in self._registered_rails
+
+    def remove_pending_rail(self, rail: AgentRail) -> "DeepAgent":
+        """Remove a specific rail from the pending queue by object identity."""
+        self._pending_rails = [queued for queued in self._pending_rails if queued is not rail]
+        return self
+
+    def strip_rails_by_type(self, rail_types: tuple[type, ...]) -> int:
+        """Remove queued rails by type and mark registered ones as stale.
+
+        This provides a public API for callers that need to replace built-in rails
+        without touching DeepAgent's internal rail lists directly.
+        """
+        if not rail_types:
+            return 0
+
+        removed = 0
+        before = len(self._pending_rails)
+        self._pending_rails = [r for r in self._pending_rails if not isinstance(r, rail_types)]
+        removed += before - len(self._pending_rails)
+
+        for rail in list(self._registered_rails):
+            if isinstance(rail, rail_types):
+                self._stale_rails.append(rail)
+                removed += 1
+
+        return removed
+
+    def _bind_live_goal_manager(self, rail: TaskCompletionRail) -> None:
+        """Copy ``DeepAgent.goal_manager`` onto a rail created after ``start()``.
+
+        ``start()`` is the only place that constructs ``GoalManager``. Hot
+        reconfigure queues a fresh ``TaskCompletionRail`` with
+        ``_goal_manager is None``, so the next ``init()`` would skip goal
+        tools and protocol injection unless this binding runs first.
+        """
+        manager = self.goal_manager
+        if manager is None:
+            return
+        rail.set_goal_manager(manager)
+
+    async def register_rail(self, rail: AgentRail) -> "DeepAgent":
+        """Register a rail with selective routing."""
+        if isinstance(rail, TaskCompletionRail):
+            self._task_completion_rail = rail
+            self._bind_live_goal_manager(rail)
+        if isinstance(rail, DeepAgentRail):
+            rail.set_sys_operation(self.deep_config.sys_operation)
+            rail.set_workspace(self.deep_config.workspace)
+        self._sync_prompt_builder_references()
+        init_rail(rail, self)
+        await self._register_rail_selective(rail)
+        self._sync_prompt_builder_references()
+        return self
+
+    async def unregister_rail(self, rail: AgentRail) -> "DeepAgent":
+        """Unregister a rail from pending/outer/inner."""
+        if self._deep_config is not None and self._deep_config.moa is not None:
+            from openjiuwen.harness.moa.integration import MoAIntegration
+
+            await MoAIntegration.retire_companions(self, rail)
+
+        # Remove queued instances first so lazy-init does not re-register stale rails.
+        self._pending_rails = [queued for queued in self._pending_rails if queued is not rail]
+        self._registered_rails = [r for r in self._registered_rails if r is not rail]
+
+        if isinstance(rail, TaskCompletionRail) and self._task_completion_rail is rail:
+            self._task_completion_rail = None
+
+        # Remove from outer DeepAgent.
+        await self._agent_callback_manager.unregister_rail(rail, self)
+
+        # Remove bridged callbacks from inner agent.
+        if self._react_agent is not None:
+            await self._react_agent.agent_callback_manager.unregister_rail(
+                rail, self._react_agent
+            )
+        rail.uninit(self)
+        return self
+
+    def _new_extension_context(self, context: BuildContext | None) -> BuildContext:
+        if context is not None:
+            ctx = context.derive()
+            ctx.extras = dict(ctx.extras)
+            return ctx
+        return BuildContext(
+            language=self.deep_config.language or "cn",
+            workspace=self.deep_config.workspace,
+            member_card_id=self.card.id,
+        )
+
+    async def _apply_extension_parts(
+        self,
+        parts: ExtensionParts,
+        *,
+        source_uri: str | None,
+    ) -> LoadRecord:
+        from openjiuwen.harness.extension_binder import apply_extension_hot
+
+        record = LoadRecord(source_uri=source_uri, refs=await apply_extension_hot(self, parts))
+        self._load_records[record.load_id] = record.model_copy(deep=True)
+        return record
+
+    async def load_plugin(
+        self,
+        path: str,
+        *,
+        context: BuildContext | None = None,
+    ) -> LoadRecord:
+        """Hot-load a file-backed Plugin package.
+
+        Accepts either a ``package_type=plugin`` ``manifest.json`` or a legacy
+        ``harness_config.yaml`` / ``expert_harness.yaml`` / ``harness.yaml``
+        package (see ``find_plugin_manifest`` for the lookup order); both map
+        onto ``PluginSpec``.
+        """
+        try:
+            manifest_path = find_plugin_manifest(path)
+            spec = load_plugin_package(manifest_path)
+            ctx = self._new_extension_context(context)
+            ctx.extras["source_root"] = str(manifest_path.parent)
+            parts = resolve_plugin_parts(spec, ctx)
+            return await self._apply_extension_parts(parts, source_uri=str(manifest_path))
+        except Exception as exc:
+            raise build_error(
+                StatusCode.DEEPAGENT_LOAD_PLUGIN_ERROR,
+                error_msg=str(exc),
+                cause=exc,
+            ) from exc
+
+    async def load_plugin_spec(
+        self,
+        spec: PluginSpec,
+        *,
+        context: BuildContext | None = None,
+    ) -> LoadRecord:
+        """Hot-load an in-memory ``PluginSpec`` via resolve Parts + apply_hot.
+
+        Unlike :meth:`load_plugin`, there is no package root: every path-bearing
+        field on ``spec`` must already be an absolute path, or resolve rejects it.
+        """
+        try:
+            ctx = self._new_extension_context(context)
+            parts = resolve_plugin_parts(spec, ctx)
+            return await self._apply_extension_parts(parts, source_uri=None)
+        except Exception as exc:
+            raise build_error(
+                StatusCode.DEEPAGENT_LOAD_PLUGIN_ERROR,
+                error_msg=str(exc),
+                cause=exc,
+            ) from exc
+
+    async def load_agent_template(
+        self,
+        path: str,
+        *,
+        context: BuildContext | None = None,
+    ) -> LoadRecord:
+        """Hot-load a file-backed AgentTemplate package (root ``manifest.json``).
+
+        Keeps this agent's ``agent_card`` / model unchanged, overlays the root
+        template's persona/capabilities, and materializes its direct
+        ``subagents`` as runtime ``SubAgentConfig``.
+        """
+        try:
+            manifest_path = find_agent_template_manifest(path)
+            spec = load_agent_template_package(manifest_path)
+            ctx = self._new_extension_context(context)
+            ctx.extras["source_root"] = str(manifest_path.parent)
+            ctx.extras["_parent_model"] = self.deep_config.model
+            parts = resolve_agent_template_parts(spec, ctx)
+            record = await self._apply_extension_parts(parts, source_uri=str(manifest_path))
+            self._active_agent_template = (record.load_id, spec.agent_card.name)
+            return record
+        except Exception as exc:
+            raise build_error(
+                StatusCode.DEEPAGENT_LOAD_AGENT_TEMPLATE_ERROR,
+                error_msg=str(exc),
+                cause=exc,
+            ) from exc
+
+    async def load_agent_template_spec(
+        self,
+        spec: AgentTemplateSpec,
+        *,
+        context: BuildContext | None = None,
+    ) -> LoadRecord:
+        """Hot-load an in-memory ``AgentTemplateSpec``.
+
+        Unlike :meth:`load_agent_template`, no package manifest is read here:
+        every path-bearing field on ``spec`` must already be absolute.  This is
+        the in-memory counterpart to :meth:`load_plugin_spec` and is suitable
+        for a serialized spec carried across a team-member build boundary.
+        """
+        try:
+            ctx = self._new_extension_context(context)
+            ctx.extras["_parent_model"] = self.deep_config.model
+            parts = resolve_agent_template_parts(spec, ctx)
+            record = await self._apply_extension_parts(parts, source_uri=None)
+            self._active_agent_template = (record.load_id, spec.agent_card.name)
+            return record
+        except Exception as exc:
+            raise build_error(
+                StatusCode.DEEPAGENT_LOAD_AGENT_TEMPLATE_ERROR,
+                error_msg=str(exc),
+                cause=exc,
+            ) from exc
+
+    async def load_plugin_ability(
+        self,
+        *,
+        tools: Tool | ToolCard | list[Tool | ToolCard] | None = None,
+        rails: AgentRail | list[AgentRail] | None = None,
+        skills: ResolvedSkill | list[ResolvedSkill] | None = None,
+    ) -> LoadRecord:
+        """Hot-load pre-built tools / rails / skills onto this agent.
+        """
+        try:
+            def _as_ability_list(value):
+                if value is None:
+                    return []
+                if isinstance(value, list):
+                    return [item for item in value if item is not None]
+                return [value]
+
+            parts = ExtensionParts(
+                tools=_as_ability_list(tools),
+                rails=_as_ability_list(rails),
+                skills=_as_ability_list(skills),
+            )
+            return await self._apply_extension_parts(parts, source_uri=None)
+        except Exception as exc:
+            raise build_error(
+                StatusCode.DEEPAGENT_LOAD_PLUGIN_ERROR,
+                error_msg=str(exc),
+                cause=exc,
+            ) from exc
+
+    async def unload_extension(self, record: LoadRecord) -> list[str]:
+        """Unload resources produced by a successful Plugin / AgentTemplate load.
+
+        Resolves ``record.load_id`` against this agent's ``_load_records`` ledger.
+        Unknown / already-unloaded ids are a no-op. Only the ledger-owned refs
+        are applied; the caller's ``record.refs`` are ignored.
+        """
+        try:
+            from openjiuwen.harness.extension_binder import unapply_extension_hot
+
+            owned = self._load_records.get(record.load_id)
+            if owned is None:
+                return []
+            labels = await unapply_extension_hot(self, owned.refs)
+            self._load_records.pop(record.load_id, None)
+            if (
+                self._active_agent_template is not None
+                and self._active_agent_template[0] == record.load_id
+            ):
+                self._active_agent_template = None
+            return labels
+        except Exception as exc:
+            raise build_error(
+                StatusCode.DEEPAGENT_UNLOAD_EXTENSION_ERROR,
+                error_msg=str(exc),
+                cause=exc,
+            ) from exc
+
+    async def load_harness_config(self, config_path: str) -> list[str]:
+        """Deprecated hot-load entry. Use :meth:`load_plugin` instead.
+
+        Args:
+            config_path: Path to a harness_config.yaml manifest or its parent
+                directory. Resolved the same way as ``load_plugin``.
+
+        Returns:
+            List of human-readable resource labels (same shape the old
+            implementation returned).
+        """
+        warnings.warn(
+            "DeepAgent.load_harness_config is deprecated; "
+            "use load_plugin instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        record = await self.load_plugin(config_path)
+        return self._load_record_labels(record)
+
+    async def unload_harness_config(self, config_path: str) -> list[str]:
+        """Deprecated unload entry. Use :meth:`unload_extension` instead.
+
+        Locates the ``LoadRecord`` previously produced by ``load_harness_config``
+        via ``_load_records`` (keyed by the resolved manifest path),
+        then delegates to ``unload_extension``. Returns an empty list when
+        no matching record is found, mirroring the old "no-op on missing" behavior.
+
+        Args:
+            config_path: Path originally passed to ``load_harness_config``.
+        """
+        warnings.warn(
+            "DeepAgent.unload_harness_config is deprecated; "
+            "use unload_extension instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        try:
+            resolved = str(find_plugin_manifest(config_path))
+        except FileNotFoundError:
+            return []
+        target_record: LoadRecord | None = None
+        for record in self._load_records.values():
+            if record.source_uri == resolved:
+                target_record = record
+                break
+        if target_record is None:
+            return []
+        return await self.unload_extension(target_record)
+
+    @staticmethod
+    def _load_record_labels(record: LoadRecord) -> list[str]:
+        return [f"{ref.kind.value}:{ref.identity}" for ref in record.refs]
+
+    def _runtime_extension_session_id(self) -> str:
+        """Return a stable namespace key for runtime extension imports."""
+        return (
+            self._bound_session_id
+            or self.card.id
+            or self.card.name
+            or "deep_agent"
+        )
+
+    def enqueue_harness_config(
+        self, config_path: str,
+    ) -> None:
+        """Schedule a harness_config.yaml for loading on next stream() call."""
+        self._pending_harness_configs.append(config_path)
+
+    async def _drain_pending_harness_configs(
+        self,
+    ) -> None:
+        """Load any enqueued harness configs before processing a query."""
+        while self._pending_harness_configs:
+            path = self._pending_harness_configs.pop(0)
+            try:
+                record = await self.load_plugin(path)
+                logger.info(
+                    "Auto-loaded harness config %s: %s",
+                    path,
+                    self._load_record_labels(record),
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to load harness config: %s",
+                    path,
+                )
+
+    async def _register_rail_selective(self, rail: AgentRail) -> None:
+        """Route rail callbacks to the correct agent and record the rail as registered."""
+        callbacks = rail.get_callbacks()
+
+        for event, callback in callbacks.items():
+            if event in _BRIDGE_EVENTS:
+                if self._react_agent is not None:
+                    await self._react_agent.register_callback(event, callback, rail.callback_priority(event))
+                continue
+
+            if event in _OUTER_ONLY_EVENTS or event in _DEEP_EVENTS:
+                await self.register_callback(event, callback, rail.callback_priority(event))
+                continue
+
+            logger.warning(
+                f"Unknown rail event {event}, registering on outer DeepAgent"
+            )
+            await self.register_callback(event, callback, rail.callback_priority(event))
+
+        self._registered_rails.append(rail)
+
+    async def _run_single_round_invoke(
+        self,
+        ctx: AgentCallbackContext,
+        session: Optional[Session],
+        *,
+        streaming: bool = False,
+        host_iteration_limit: int | None = None,
+    ) -> Dict[str, Any]:
+        """Invoke inner ReActAgent exactly once.
+
+        Args:
+            ctx: Callback context carrying the normalized invocation inputs.
+            session: Session shared with the long-lived interaction.
+            streaming: Whether model chunks should be written to the session stream.
+
+        Returns:
+            The completed ReAct invocation result.
+        """
+        modified = ctx.inputs
+        if not isinstance(modified, InvokeInputs):
+            raise build_error(
+                StatusCode.DEEPAGENT_CONTEXT_PARAM_ERROR,
+                error_msg="ctx.inputs must be InvokeInputs for single-round invoke.",
+            )
+
+        if self._react_agent is None:
+            raise build_error(
+                StatusCode.DEEPAGENT_RUNTIME_ERROR,
+                error_msg="DeepAgent not configured. Call configure() first.",
+            )
+
+        effective_inputs = self._to_effective_inputs(modified)
+        steering_queue = ctx.steering_queue
+        if steering_queue is None:
+            steering_queue = asyncio.Queue()
+            ctx.bind_steering_queue(steering_queue)
+        effective_inputs["_steering_queue"] = steering_queue
+        if host_iteration_limit is not None:
+            effective_inputs["_host_max_iterations"] = host_iteration_limit
+        if streaming:
+            return await self._react_agent.invoke(
+                effective_inputs,
+                session,
+                _streaming=True,
+            )
+        return await self._react_agent.invoke(effective_inputs, session)
+
+    def _build_task_loop_evaluators(self) -> List[StopConditionEvaluator]:
+        """Build stop evaluators for the outer task loop."""
+        evaluators = (
+            self._task_completion_rail.build_evaluators()
+            if self._task_completion_rail is not None
+            else []
+        )
+        guard_cfg = (
+            self._deep_config.task_loop_no_progress_guard
+            if self._deep_config is not None
+            else None
+        )
+        if isinstance(guard_cfg, dict):
+            guard_enabled = bool(guard_cfg.get("enabled", False))
+            max_consecutive_empty_answers = guard_cfg.get(
+                "max_consecutive_empty_answers",
+                3,
+            )
+            min_answer_chars = guard_cfg.get("min_answer_chars", 80)
+        else:
+            guard_enabled = bool(getattr(guard_cfg, "enabled", False))
+            max_consecutive_empty_answers = getattr(
+                guard_cfg,
+                "max_consecutive_empty_answers",
+                3,
+            )
+            min_answer_chars = getattr(
+                guard_cfg,
+                "min_answer_chars",
+                80,
+            )
+        if guard_enabled:
+            evaluators.append(
+                NoProgressAnswerEvaluator(
+                    max_consecutive_empty_answers=max_consecutive_empty_answers,
+                    min_answer_chars=min_answer_chars,
+                )
+            )
+        return evaluators
+
+    async def _setup_task_loop(
+        self,
+        session: Session,
+    ) -> Tuple[LoopCoordinator, TaskLoopController]:
+        """Create or reuse Controller infrastructure for a task loop.
+
+        Sets instance attributes and returns the key objects
+        needed by the loop body.
+
+        Args:
+            session: Current session.
+
+        Returns:
+            (coordinator, controller)
+        """
+        session_id = session.get_session_id()
+
+        # Reuse existing controller if session_id matches
+        if (
+            self._loop_controller is not None
+            and self._bound_session_id == session_id
+        ):
+            coordinator = self._loop_coordinator
+            if coordinator is None:
+                evaluators = self._build_task_loop_evaluators()
+                coordinator = LoopCoordinator(evaluators=evaluators)
+                self._loop_coordinator = coordinator
+            coordinator.reset()
+            return coordinator, self._loop_controller
+
+        # New controller (first time or session switch)
+        if self._loop_controller is not None:
+            await self._force_cleanup_controller()
+
+        evaluators = self._build_task_loop_evaluators()
+        coordinator = LoopCoordinator(evaluators=evaluators)
+        coordinator.reset()
+
+        queues = LoopQueues()
+
+        config = ControllerConfig(suppress_completion_signal=True)
+        context_engine = ContextEngine()
+
+        controller = TaskLoopController()
+        controller.init(
+            card=self.card,
+            config=config,
+            ability_manager=self.ability_manager,
+            context_engine=context_engine,
+        )
+
+        from openjiuwen.harness.task_loop.session_spawn_executor import (
+            SESSION_SPAWN_TASK_TYPE,
+            build_session_spawn_executor,
+        )
+        # Register DEEP_TASK_TYPE and SESSION_SPAWN_TASK_TYPE executors
+        controller.add_task_executor(
+            DEEP_TASK_TYPE, build_deep_executor(self),
+        ).add_task_executor(
+            SESSION_SPAWN_TASK_TYPE, build_session_spawn_executor(self)
+        )
+
+        handler = TaskLoopEventHandler(self)
+        handler.interaction_queues = queues
+        controller.set_event_handler(handler)
+
+        # Inject SessionToolkit to Handler
+        toolkit = self._session_toolkit
+        if toolkit is not None and hasattr(handler, "set_session_toolkit"):
+            handler.set_session_toolkit(toolkit)
+
+        self._loop_coordinator = coordinator
+        self._loop_controller = controller
+        self._loop_session = session
+
+        return coordinator, controller
+
+    # ----------------------------------------------------------------
+    # State management
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    def _read_runtime_state(
+        session: Session,
+    ) -> Optional[DeepAgentState]:
+        """Read the cached runtime state from session."""
+        state = getattr(session, _SESSION_RUNTIME_ATTR, None)
+        if state is None:
+            return None
+        if not isinstance(state, DeepAgentState):
+            raise build_error(
+                StatusCode.DEEPAGENT_CONTEXT_PARAM_ERROR,
+                error_msg=(
+                    "Invalid deepagent runtime state "
+                    "type on session."
+                ),
+            )
+        return state
+
+    @staticmethod
+    def _write_runtime_state(
+        session: Session,
+        state: DeepAgentState,
+    ) -> None:
+        """Write runtime state to session cache."""
+        setattr(session, _SESSION_RUNTIME_ATTR, state)
+
+    @staticmethod
+    def _clear_runtime_state(session: Session) -> None:
+        """Clear runtime state from session cache."""
+        if hasattr(session, _SESSION_RUNTIME_ATTR):
+            delattr(session, _SESSION_RUNTIME_ATTR)
+
+    def load_state(self, session: Session) -> DeepAgentState:
+        """Load deepagent runtime state from session.
+
+        Returns the cached runtime object when available;
+        otherwise loads from persisted session state and
+        primes the cache.
+
+        Args:
+            session: Current session.
+
+        Returns:
+            Current DeepAgentState (never None).
+        """
+        state = self._read_runtime_state(session)
+        if state is not None:
+            return state
+        data = session.get_state(_SESSION_STATE_KEY)
+        loaded = (
+            DeepAgentState.from_session_dict(data)
+            if isinstance(data, dict)
+            else DeepAgentState()
+        )
+        self._write_runtime_state(session, loaded)
+        return loaded
+
+    def save_state(
+        self,
+        session: Session,
+        state: Optional[DeepAgentState] = None,
+    ) -> None:
+        """Persist deepagent state to session.
+
+        When ``state`` is provided it becomes the new
+        runtime snapshot; otherwise the currently cached
+        state is persisted.
+
+        Args:
+            session: Current session.
+            state: State to save; if None the cached
+                state is used.
+        """
+        target = (
+            state
+            if state is not None
+            else self._read_runtime_state(session)
+        )
+        if target is None:
+            return
+        self._write_runtime_state(session, target)
+        session.update_state(
+            {_SESSION_STATE_KEY: target.to_session_dict()}
+        )
+
+    def clear_state(
+        self,
+        session: Session,
+        clear_persisted: bool = False,
+    ) -> None:
+        """Clear deepagent runtime cache from session.
+
+        Args:
+            session: Current session.
+            clear_persisted: When True, also clears the
+                persisted session snapshot.
+        """
+        self._clear_runtime_state(session)
+        if clear_persisted:
+            session.update_state({_SESSION_STATE_KEY: None})
+
+    def switch_mode(self, session: Session, mode: str) -> None:
+        """Switch agent mode, updating session-scoped PlanModeState.
+
+        Args:
+            session: Current session.
+            mode: Target mode string — ``"plan"`` or ``"auto"``.
+        """
+        state = self.load_state(session)
+        if state.plan_mode.mode == mode:
+            state.plan_mode.pre_plan_mode = state.plan_mode.mode
+            logger.info("[DeepAgent] mode in state is the same, no need to switch, mode: {}".format(mode))
+            return
+        state.plan_mode.pre_plan_mode = state.plan_mode.mode
+        state.plan_mode.mode = mode
+        self.save_state(session, state)
+
+    def restore_mode_after_plan_exit(self, session: Session) -> None:
+        """Restore the mode that was active before entering plan mode.
+
+        Does **not** clear ``plan_slug`` so that the execution phase can
+        still reference the plan file.
+
+        Args:
+            session: Current session.
+        """
+        state = self.load_state(session)
+        state.plan_mode.mode = state.plan_mode.pre_plan_mode or "normal"
+        state.plan_mode.pre_plan_mode = None
+        self.save_state(session, state)
+
+    def get_plan_file_path(self, session: Session) -> Path | None:
+        """Derive the plan file path from the slug stored in session state.
+
+        Args:
+            session: Current session.
+
+        Returns:
+            Resolved ``Path`` to the plan Markdown file, or ``None`` if
+            no slug has been set or the workspace is unavailable.
+        """
+        from openjiuwen.harness.tools import resolve_plan_file_path
+
+        state = self.load_state(session)
+        slug = state.plan_mode.plan_slug
+        if not slug or not self._deep_config or not self._deep_config.workspace:
+            return None
+        return resolve_plan_file_path(
+            self._deep_config.workspace.root_path, slug
+        )
+
+    def _has_remaining_tasks(self, session: Session) -> bool:
+        """Check whether the task plan still has pending tasks."""
+        st = self.load_state(session)
+        if st.task_plan is None:
+            return False
+        return st.task_plan.get_next_task() is not None
+
+    def _has_pending_session_spawn(self) -> bool:
+        """Check if there are pending SESSION_SPAWN tasks.
+
+        Returns:
+            True if there are SUBMITTED/WORKING SESSION_SPAWN tasks.
+        """
+        if self._session_toolkit is None:
+            return False
+
+        pending_tasks = self._session_toolkit.list_all()
+        return any(r.status == "running" for r in pending_tasks)
+
+    async def _force_cleanup_controller(self) -> None:
+        """Force cleanup of existing controller (on session switch)."""
+        if self._loop_controller is None:
+            return
+
+        self._log_loop("forcing controller cleanup due to session switch")
+
+        if self._loop_session is not None:
+            try:
+                await self._loop_controller.unbind_session(self._loop_session)
+            except Exception as e:
+                logger.warning(f"unbind_session failed during force cleanup: {e}")
+
+        try:
+            await self._loop_controller.stop()
+        except Exception as e:
+            logger.warning(f"controller.stop() failed during force cleanup: {e}")
+
+        self._loop_coordinator = None
+        self._loop_controller = None
+        self._loop_session = None
+        self._bound_session_id = None
+
+    @staticmethod
+    def _log_loop(msg: str, detail: str = "") -> None:
+        """Log an outer-loop event respecting sensitivity."""
+        if UserConfig.is_sensitive():
+            logger.info(f"[OuterLoop] {msg}")
+        else:
+            logger.info(f"[OuterLoop] {msg}{detail}")
+
+    async def schedule_auto_invoke_on_spawn_done(
+        self,
+        query: str,
+        delay: float = 0.5,
+    ) -> None:
+        """Schedule delayed auto-invoke after SESSION_SPAWN completes (no active invoke).
+
+        Called by TaskLoopEventHandler. Waits ``delay`` to merge concurrent completions,
+        then invokes with a summary prompt if still idle and ``_loop_session`` is set.
+
+        Args:
+            query: The query to invoke with.
+            delay: Delay in seconds to merge multiple concurrent spawn completions.
+        """
+        await asyncio.sleep(delay)
+        self._auto_invoke_scheduled = False
+
+        if self._invoke_active:
+            return
+
+        if self._loop_session is None:
+            logger.warning("[AutoInvoke] session was cleaned up during delay, skipping")
+            return
+
+        try:
+            await self.invoke(
+                {"query": query},
+                session=self._loop_session,
+            )
+        except Exception as e:
+            logger.error(f"[AutoInvoke] auto-invoke failed: {e}", exc_info=True)
+
+    async def _run_task_loop(
+        self, ctx: AgentCallbackContext, session: Session,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Async generator for the outer task loop. Shared by invoke and stream.
+
+        Args:
+            ctx: Callback context with InvokeInputs.
+            session: Current session.
+
+        Yields:
+            Result dict from each iteration.
+        """
+        modified = ctx.inputs
+        if not isinstance(modified, InvokeInputs):
+            raise build_error(
+                StatusCode.DEEPAGENT_CONTEXT_PARAM_ERROR,
+                error_msg="ctx.inputs must be InvokeInputs for task-loop.",
+            )
+
+        coordinator, controller = await self._setup_task_loop(session)
+        timeout = self._deep_config.completion_timeout if self._deep_config else 600.0
+
+        # Only bind if session_id changed
+        session_id = session.get_session_id()
+        if self._bound_session_id != session_id:
+            await controller.bind_session(session)
+            self._bound_session_id = session_id
+
+        try:
+            current_query = modified.query
+            outer_round = 0
+            max_outer_rounds = 50
+
+            while coordinator.should_continue():
+                outer_round += 1
+                if outer_round > max_outer_rounds:
+                    self._log_loop(
+                        f"round={outer_round} exceeded max_outer_rounds={max_outer_rounds}, forcing stop"
+                    )
+                    yield {
+                        "output": (
+                            "Task loop stopped after exceeding the maximum number of "
+                            f"outer rounds ({max_outer_rounds}). This usually indicates "
+                            "the model is not making observable progress."
+                        ),
+                        "result_type": "error",
+                        "stop_reason": "MaxOuterRounds",
+                    }
+                    break
+                # Drain new follow-ups, merge into state buffer
+                new_follow_ups = controller.drain_follow_up()
+                _state = self.load_state(session)
+                if new_follow_ups:
+                    _state.pending_follow_ups.extend(
+                        new_follow_ups
+                    )
+                # Pop first buffered follow-up as query
+                is_follow_up = bool(
+                    _state.pending_follow_ups
+                )
+                if _state.pending_follow_ups:
+                    current_query = (
+                        _state.pending_follow_ups.pop(0)
+                    )
+                    self.save_state(session, _state)
+                round_run_context = self._run_context_for_task_loop_round(
+                    modified.run_context,
+                    current_query,
+                    is_follow_up,
+                )
+
+                query_preview = str(current_query)[:120]
+                self._log_loop(
+                    f"round={outer_round} started",
+                    f", query={query_preview}",
+                )
+
+                from openjiuwen.harness.moa.state import active_moa_input_origin
+
+                origin_token = active_moa_input_origin.set("internal") if outer_round > 1 else None
+                try:
+                    await controller.submit_round(
+                        session, current_query,
+                        is_follow_up=is_follow_up,
+                        run_kind=modified.run_kind,
+                        run_context=round_run_context,
+                        turn_number=modified.turn_number,
+                    )
+                finally:
+                    if origin_token is not None:
+                        active_moa_input_origin.reset(origin_token)
+                result = await controller.wait_round_completion(timeout=timeout)
+
+                result_type = result.get("result_type", "N/A")
+                output_preview = str(result.get("output", ""))[:200]
+                self._log_loop(
+                    f"round={outer_round} completed, result_type={result_type}",
+                    f", output={output_preview}",
+                )
+
+                yield result
+
+                coordinator.increment_iteration()
+                coordinator.set_last_result(result)
+                _state = self.load_state(session)
+                _state.stop_condition_state = coordinator.get_state()
+                self.save_state(session, _state)
+
+                if result.get("result_type") == "interrupt":
+                    self._log_loop(
+                        f"round={outer_round} interrupted"
+                    )
+                    break
+                if coordinator.is_aborted:
+                    self._log_loop(f"round={outer_round} aborted")
+                    break
+                if (
+                    controller.has_follow_up()
+                    or _state.pending_follow_ups
+                ):
+                    continue
+                if not self._has_remaining_tasks(session):
+                    self._log_loop("no remaining tasks, loop finished")
+                    break
+
+                current_query = modified.query
+
+            stop_reason = coordinator.stop_reason
+            if stop_reason:
+                self._log_loop(
+                    f"loop stopped by: {stop_reason}"
+                )
+                if stop_reason == "NoProgressAnswerEvaluator":
+                    yield {
+                        "output": (
+                            "Task loop stopped after repeated empty or "
+                            "near-empty no-tool answers. This indicates "
+                            "the model is not making observable progress."
+                        ),
+                        "result_type": "error",
+                        "stop_reason": stop_reason,
+                    }
+                # Note: MaxOuterRounds yields its own error result inside the loop,
+                # so no additional yield is needed here.
+        except asyncio.CancelledError:
+            try:
+                with anyio.fail_after(1.5, shield=True):
+                    await self._cancel_session_deep_tasks(session_id)
+            except TimeoutError:
+                logger.warning(
+                    "Cancel session deep tasks timed out; continuing cleanup"
+                )
+            raise
+        finally:
+            # Clear stop_condition_state so the next invoke starts fresh.
+            _state = self.load_state(session)
+            _state.stop_condition_state = None
+            self.save_state(session, _state)
+            # Keep controller alive when SESSION_SPAWN tasks are pending.
+            if self._has_pending_session_spawn():
+                self._log_loop("pending SESSION_SPAWN tasks, controller kept alive")
+            else:
+                await controller.unbind_session(session)
+                await controller.stop()
+                self._loop_coordinator = None
+                self._loop_controller = None
+                self._loop_session = None
+                self._bound_session_id = None
+                self._log_loop("all tasks completed, controller cleaned up")
+
+    async def _run_task_loop_invoke(
+        self,
+        ctx: AgentCallbackContext,
+        session: Optional[Session],
+    ) -> Dict[str, Any]:
+        """Run the outer task loop, return last result.
+
+        Args:
+            ctx: Callback context with InvokeInputs.
+            session: Current session.
+
+        Returns:
+            Result dict from the last iteration.
+        """
+        if session is None:
+            raise build_error(
+                StatusCode.DEEPAGENT_RUNTIME_ERROR,
+                error_msg=(
+                    "session is required for "
+                    "task-loop mode."
+                ),
+            )
+
+        last_result: Dict[str, Any] = {}
+        try:
+            async for result in self._run_task_loop(
+                ctx, session
+            ):
+                last_result = result
+        except Exception as e:
+            logger.error(f"Task loop invoke error: {e}", exc_info=True)
+            raise
+        return last_result
+
+    async def _run_task_loop_stream(
+        self,
+        ctx: AgentCallbackContext,
+        session: Optional[Session],
+        stream_modes: Optional[List[StreamMode]],
+    ) -> AsyncIterator[Any]:
+        """Stream the outer task loop with per-token chunks.
+
+        Uses the same coroutine pattern as ReActAgent.stream():
+        background task runs _run_task_loop (which triggers
+        invoke with _streaming=True), foreground reads from
+        session.stream_iterator().
+
+        Session lifecycle (pre_run/post_run) is managed by the
+        caller (Runner or direct caller), not by this method.
+        Only the stream emitter is closed here to send END_FRAME
+        and unblock stream_iterator().
+
+        Args:
+            ctx: Callback context with InvokeInputs.
+            session: Current session.
+            stream_modes: Stream mode filters.
+
+        Yields:
+            OutputSchema chunks (llm_reasoning / llm_output / answer).
+        """
+        _ = stream_modes
+        if session is None:
+            raise build_error(
+                StatusCode.DEEPAGENT_RUNTIME_ERROR,
+                error_msg=(
+                    "session is required for "
+                    "task-loop mode."
+                ),
+            )
+
+        async def _stream_process() -> None:
+            try:
+                async for result in self._run_task_loop(ctx, session):
+                    await self._write_round_result_to_stream(result, session)
+            except Exception as e:
+                logger.error(f"Task loop stream error: {e}", exc_info=True)
+                error_result = {"output": str(e), "result_type": "error"}
+                await self._write_round_result_to_stream(error_result, session)
+            finally:
+                # Only close the stream emitter to send END_FRAME,
+                # so stream_iterator() can terminate.
+                # Full session cleanup (post_run) is left to the caller.
+                await session.close_stream()
+
+        task = asyncio.create_task(_stream_process())
+        self._stream_process_task = task
+        try:
+            async for chunk in session.stream_iterator():
+                yield chunk
+
+            # Normal completion: wait for background task
+            await task
+        except asyncio.CancelledError:
+            # Cancel background task explicitly to speed up cleanup.
+            # Without this, await task could wait for a long-running
+            # operation (e.g., wait_round_completion with 600s timeout).
+            await self._cancel_session_deep_tasks(session.get_session_id())
+            await self._release_session_subagent_controls(
+                session,
+                reason="stream_cancelled",
+            )
+            await self._cancel_stream_process_task()
+            raise
+        finally:
+            # Stall aclose / GeneratorExit does not raise CancelledError, so
+            # CancelledError-only teardown left _stream_process, parallel tool
+            # gathers, and SubagentControl caches pending.
+            if not task.done():
+                try:
+                    await self._cancel_session_deep_tasks(
+                        session.get_session_id()
+                    )
+                except Exception:
+                    logger.debug(
+                        "deep task cancel during stream close failed",
+                        exc_info=True,
+                    )
+                try:
+                    await self._release_session_subagent_controls(
+                        session,
+                        reason="stream_cancelled",
+                    )
+                except Exception:
+                    logger.debug(
+                        "subagent control release during stream close failed",
+                        exc_info=True,
+                    )
+                try:
+                    await self._cancel_stream_process_task()
+                except Exception:
+                    logger.debug(
+                        "stream process cancel during stream close failed",
+                        exc_info=True,
+                    )
+            if self._stream_process_task is task:
+                self._stream_process_task = None
+
+    async def _write_round_result_to_stream(
+        self,
+        result: Dict[str, Any],
+        session: Session,
+    ) -> None:
+        """Write a task-loop round result to the session stream.
+
+        Delegates to the inner ReActAgent which already handles
+        normal answers, HITL interrupts, and workflow interrupts
+        consistently.
+
+        Args:
+            result: Result dict from the inner ReActAgent.
+            session: Current session to write into.
+        """
+        if self._react_agent is not None:
+            await self._react_agent.write_invoke_result_to_stream(
+                result, session
+            )
+
+    async def _run_single_round_stream(
+        self,
+        ctx: AgentCallbackContext,
+        session: Optional[Session],
+        stream_modes: Optional[List[StreamMode]],
+        *, host_iteration_limit: int | None = None,
+    ) -> AsyncIterator[Any]:
+        """Stream from inner ReActAgent exactly once."""
+        modified = ctx.inputs
+        if not isinstance(modified, InvokeInputs):
+            raise build_error(
+                StatusCode.DEEPAGENT_CONTEXT_PARAM_ERROR,
+                error_msg="ctx.inputs must be InvokeInputs for single-round stream.",
+            )
+
+        if self._react_agent is None:
+            raise build_error(
+                StatusCode.DEEPAGENT_RUNTIME_ERROR,
+                error_msg="DeepAgent not configured. Call configure() first.",
+            )
+
+        effective_inputs = self._to_effective_inputs(modified)
+        steering_queue = ctx.steering_queue
+        if steering_queue is None:
+            steering_queue = asyncio.Queue()
+            ctx.bind_steering_queue(steering_queue)
+        effective_inputs["_steering_queue"] = steering_queue
+        if host_iteration_limit is not None:
+            effective_inputs["_host_max_iterations"] = host_iteration_limit
+        async with aclosing(self._react_agent.stream(
+            effective_inputs, session, stream_modes,
+        )) as chunks:
+            async for chunk in chunks:
+                yield chunk
+
+    async def _sync_expert_role_attachment(
+        self,
+        invoke_inputs: InvokeInputs,
+        session: Session | None,
+    ) -> None:
+        """Materialize the current AgentTemplate role onto this round's session.
+        """
+        try:
+            session_id = (
+                session.get_session_id()
+                if session is not None
+                else invoke_inputs.conversation_id
+            )
+            if not session_id:
+                return
+
+            manager = self.prompt_attachment_manager
+            language = resolve_language(
+                self._deep_config.language if self._deep_config is not None else None
+            )
+            if self._active_agent_template is not None:
+                role_name = self._active_agent_template[1]
+                await manager.add_section(
+                    session_id=session_id,
+                    section=_EXPERT_ROLE_SECTION,
+                    content=_expert_role_load_content(role_name, language),
+                    kind=PromptAttachmentKind.RUNTIME,
+                    source=_EXPERT_ROLE_SOURCE,
+                    metadata={"role_name": role_name},
+                )
+                return
+
+            attachments = await manager.collect_for_session(session_id)
+            current = next(
+                (item for item in attachments if item.section == _EXPERT_ROLE_SECTION),
+                None,
+            )
+            if current is None:
+                return
+            role_name = current.metadata.get("role_name")
+            if not role_name:
+                return
+            await manager.add_section(
+                session_id=session_id,
+                section=_EXPERT_ROLE_SECTION,
+                content=_expert_role_unload_content(role_name, language),
+                kind=PromptAttachmentKind.RUNTIME,
+                source=_EXPERT_ROLE_SOURCE,
+                metadata={"role_name": role_name},
+            )
+        except Exception as exc:  # noqa: BLE001 - role notices must not block the model
+            logger.warning(
+                "[DeepAgent] failed to sync expert_role attachment: %s",
+                exc,
+                exc_info=True,
+            )
+
+    @contextmanager
+    def _invocation_log_context(self, session: Session | None):
+        """Capture this invocation without switching process-global log paths."""
+        directory = self._deep_config.invocation_log_dir if self._deep_config is not None else None
+        with ExitStack() as stack:
+            scope = None
+            if directory:
+                session_id = session.get_session_id() if session is not None else ""
+                try:
+                    scope = stack.enter_context(invocation_log_scope(
+                        directory, agent_id=self.card.id,
+                        session_id=session_id, role=self.card.name,
+                    ))
+                except Exception as exc:
+                    logger.warning("Invocation log capture unavailable: %s", type(exc).__name__)
+            yield scope
+
+    async def invoke(
+        self,
+        inputs: Any,
+        session: Optional[Session] = None,
+    ) -> Dict[str, Any]:
+        """Execute DeepAgent in single-round or task-loop mode."""
+        await self._ensure_initialized()
+
+        if self._react_agent is None:
+            raise build_error(
+                StatusCode.DEEPAGENT_RUNTIME_ERROR,
+                error_msg="DeepAgent not configured. Call configure() first.",
+            )
+
+        invoke_inputs = self._normalize_inputs(inputs)
+        owns_session = session is None
+        session = await self._prepare_single_round_session(invoke_inputs, session)
+        host_iteration_limit = self._deep_config.max_iterations_hard_limit if self._deep_config else None
+        task_loop_enabled = bool(
+            self._deep_config
+            and self._deep_config.enable_task_loop
+            and host_iteration_limit is None
+        )
+        with self._invocation_log_context(session):
+            ctx = AgentCallbackContext(agent=self, inputs=invoke_inputs, session=session)
+            if self._deep_config is not None and not self._deep_config.enable_task_loop:
+                ctx.bind_steering_queue(asyncio.Queue())
+
+            proposal_owner = self._proposal_owner()
+            proposal_binding = proposal_owner.begin_work(
+                session.get_session_id(), interaction_response=self._is_resume_input(invoke_inputs),
+            ) if proposal_owner is not None and session is not None else None
+            proposal_tokens = (
+                proposal_owner.activate(proposal_binding.identity)
+                if proposal_binding is not None else None
+            )
+            proposal_succeeded = False
+
+            self._invoke_active = True
+            try:
+                result: Dict[str, Any]
+                async with ctx.lifecycle(
+                    AgentCallbackEvent.BEFORE_INVOKE,
+                    AgentCallbackEvent.AFTER_INVOKE,
+                ):
+                    await self._sync_expert_role_attachment(invoke_inputs, session)
+                    if (
+                        task_loop_enabled
+                        and not self._is_resume_input(invoke_inputs)
+                    ):
+                        result = await self._run_task_loop_invoke(ctx, session)
+                    else:
+                        result = await self._run_single_round_invoke(
+                            ctx, session, host_iteration_limit=host_iteration_limit,
+                        )
+                    invoke_inputs.result = result
+
+                if session is not None:
+                    self.save_state(session)
+                    self.clear_state(session)
+                proposal_succeeded = True
+                return invoke_inputs.result
+            finally:
+                if proposal_binding is not None:
+                    proposal_owner.finish_work(
+                        proposal_binding.identity, result=invoke_inputs.result, succeeded=proposal_succeeded,
+                    )
+                    proposal_owner.reset(proposal_tokens)
+                self._invoke_active = False
+                if owns_session and session is not None:
+                    await session.post_run()
+
+    async def stream(
+        self,
+        inputs: Any,
+        session: Optional[Session] = None,
+        stream_modes: Optional[List[StreamMode]] = None,
+    ) -> AsyncIterator[Any]:
+        """Stream in this task so rails finish only after delivered chunks."""
+        async with aclosing(self._stream_with_context(inputs, session, stream_modes)) as chunks:
+            async for chunk in chunks:
+                yield chunk
+
+    async def _stream_with_context(
+        self,
+        inputs: Any,
+        session: Optional[Session] = None,
+        stream_modes: Optional[List[StreamMode]] = None,
+    ) -> AsyncIterator[Any]:
+        """Stream execute DeepAgent in single-round or task-loop mode."""
+        await self._ensure_initialized()
+        await self._drain_pending_harness_configs()
+
+        if self._react_agent is None:
+            raise build_error(
+                StatusCode.DEEPAGENT_RUNTIME_ERROR,
+                error_msg="DeepAgent not configured. Call configure() first.",
+            )
+
+        invoke_inputs = self._normalize_inputs(inputs)
+        owns_session = session is None
+        session = await self._prepare_single_round_session(invoke_inputs, session)
+        host_iteration_limit = self._deep_config.max_iterations_hard_limit if self._deep_config else None
+        task_loop_enabled = bool(
+            self._deep_config
+            and self._deep_config.enable_task_loop
+            and host_iteration_limit is None
+        )
+        with self._invocation_log_context(session):
+            ctx = AgentCallbackContext(agent=self, inputs=invoke_inputs, session=session)
+            if self._deep_config is not None and not self._deep_config.enable_task_loop:
+                ctx.bind_steering_queue(asyncio.Queue())
+
+            proposal_owner = self._proposal_owner()
+            proposal_binding = proposal_owner.begin_work(
+                session.get_session_id(), interaction_response=self._is_resume_input(invoke_inputs),
+            ) if proposal_owner is not None and session is not None else None
+            proposal_tokens = (
+                proposal_owner.activate(proposal_binding.identity)
+                if proposal_binding is not None else None
+            )
+            proposal_succeeded = False
+
+            self._invoke_active = True
+            try:
+                stream_result: Optional[Dict[str, Any]] = None
+                stream_output_parts: List[str] = []
+                terminal_chunk = None
+                interrupted = False
+                async with ctx.lifecycle(
+                    AgentCallbackEvent.BEFORE_INVOKE,
+                    AgentCallbackEvent.AFTER_INVOKE,
+                ):
+                    await self._sync_expert_role_attachment(invoke_inputs, session)
+                    if (
+                        task_loop_enabled
+                        and not self._is_resume_input(invoke_inputs)
+                    ):
+                        chunks = self._run_task_loop_stream(ctx, session, stream_modes)
+                    else:
+                        chunks = self._run_single_round_stream(
+                            ctx, session, stream_modes, host_iteration_limit=host_iteration_limit,
+                        )
+                    async with aclosing(chunks):
+                        async for chunk in chunks:
+                            chunk_result = self._result_from_stream_chunk(chunk, stream_output_parts)
+                            if chunk_result is not None:
+                                stream_result = chunk_result
+                                terminal_chunk = chunk
+                            else:
+                                chunk_type = (
+                                    chunk.get("type") if isinstance(chunk, dict)
+                                    else getattr(chunk, "type", None)
+                                )
+                                interrupted = interrupted or chunk_type == INTERACTION
+                                if chunk_type == INTERACTION:
+                                    if proposal_binding is not None:
+                                        proposal_owner.suspend_work(proposal_binding.identity)
+                                    stream_result = None
+                                    terminal_chunk = None
+                                yield chunk
+
+                    if stream_result is None and stream_output_parts and not interrupted:
+                        stream_result = {
+                            "output": "".join(stream_output_parts),
+                            "result_type": "answer",
+                        }
+                    if stream_result is not None:
+                        invoke_inputs.result = stream_result
+
+                if session is not None:
+                    self.save_state(session)
+                    self.clear_state(session)
+                    if owns_session:
+                        await session.post_run()
+                proposal_succeeded = True
+                if invoke_inputs.result is not None:
+                    yield self._finalized_answer_chunk(terminal_chunk, invoke_inputs.result)
+            finally:
+                if proposal_binding is not None:
+                    proposal_result = invoke_inputs.result
+                    if proposal_succeeded and proposal_result is None and interrupted:
+                        proposal_result = {"result_type": "interrupt"}
+                    proposal_owner.finish_work(
+                        proposal_binding.identity, result=proposal_result, succeeded=proposal_succeeded,
+                    )
+                    proposal_owner.reset(proposal_tokens)
+                self._invoke_active = False
+                if owns_session and session is not None:
+                    await session.post_run()
+
+    async def follow_up(
+        self,
+        msg: str,
+        task_id: Optional[str] = None,
+        session: Optional[Session] = None,
+    ) -> None:
+        """Publish a FollowUpEvent to the FOLLOW_UP topic.
+
+        The event is handled concurrently with INPUT
+        and does not block the current iteration.
+        The handler pushes the message into
+        LoopQueues.follow_up, which the outer
+        loop drains after each iteration.
+
+        Args:
+            msg: Follow-up message text.
+            task_id: Optional task to associate.
+            session: Current session.
+        """
+        controller = self._loop_controller
+        if controller is None:
+            return
+        sess = session or self._loop_session
+        if sess is None:
+            return
+        event = FollowUpEvent.from_text(msg)
+        if task_id:
+            event.metadata = {"task_id": task_id}
+        await controller.event_queue.publish_event_async(
+            self.card.id, sess, event
+        )
+
+    async def steer(
+        self,
+        msg: str,
+        session: Optional[Session] = None,
+    ) -> None:
+        """Publish a TaskInteractionEvent to TASK_INTERACTION topic.
+
+        The event is handled concurrently with INPUT.
+        The handler pushes the message into
+        LoopQueues.steering, which the executor
+        drains before the next inner invoke.
+
+        Args:
+            msg: Steering instruction text.
+            session: Current session.
+        """
+        controller = self._loop_controller
+        if controller is None:
+            return
+        sess = session or self._loop_session
+        if sess is None:
+            return
+        from openjiuwen.core.controller.schema.dataframe import (
+            TextDataFrame,
+        )
+        event = TaskInteractionEvent(
+            interaction=[TextDataFrame(text=msg)]
+        )
+        await controller.event_queue.publish_event_async(
+            self.card.id, sess, event
+        )
+
+    async def _cancel_stream_process_task(self) -> None:
+        """Cancel the in-flight task-loop stream background task, if any.
+
+        Must not ``await`` the current task. Doing so (or cancelling a
+        gather that includes the waiter) creates an asyncio
+        ``Task.cancel`` parent cycle and raises ``RecursionError`` —
+        observed when headless stream-stall timeouts cancel a DeepAgent
+        mid parallel tool batch.
+        """
+        task = self._stream_process_task
+        if task is None or task.done():
+            return
+        # Same guard as ``_cancel_active_round`` for ``_interaction_round_task``.
+        if task is asyncio.current_task():
+            task.cancel()
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except RecursionError:
+            logger.warning(
+                "RecursionError while awaiting cancelled stream process task; "
+                "leaving task to be collected by the event loop"
+            )
+        except Exception:
+            logger.debug(
+                "stream process task raised during cancel",
+                exc_info=True,
+            )
+
+    async def _release_session_subagent_controls(
+        self,
+        session: Optional[Session],
+        *,
+        reason: str,
+    ) -> None:
+        """Cancel persistent runtime subagents owned by a parent session."""
+        if session is None:
+            return
+        session_id = session.get_session_id()
+        try:
+            await release_subagent_control(self, session_id, reason=reason)
+        except Exception as e:
+            logger.warning(
+                "Failed to release subagent controls for session %s: %s",
+                session_id,
+                e,
+                exc_info=True,
+            )
+
+    async def _cancel_session_deep_tasks(self, session_id: str) -> None:
+        """Cancel active DeepAgent round tasks for a session.
+
+        Session-spawn tasks intentionally keep running after the foreground
+        stream disconnects, so this only targets the current DeepAgent round.
+        """
+        controller = self._loop_controller
+        if controller is None:
+            return
+        scheduler = controller.task_scheduler
+        if scheduler is None or scheduler.task_manager is None:
+            return
+
+        try:
+            tasks = await scheduler.task_manager.get_task(
+                task_filter=TaskFilter(session_id=session_id)
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to list session tasks during stream cancel: %s",
+                e,
+                exc_info=True,
+            )
+            return
+
+        cancellable = {
+            TaskStatus.SUBMITTED,
+            TaskStatus.WORKING,
+        }
+        for task in tasks:
+            if task.task_type != DEEP_TASK_TYPE or task.status not in cancellable:
+                continue
+            try:
+                await scheduler.cancel_task(task.task_id)
+            except Exception as e:
+                logger.warning(
+                    "Failed to cancel deep task %s during stream cancel: %s",
+                    task.task_id,
+                    e,
+                    exc_info=True,
+                )
+
+    async def abort(
+        self,
+        session: Optional[Session] = None,
+    ) -> None:
+        """Request immediate abort of the task loop.
+
+        Sets the abort flag on the coordinator and
+        calls on_abort() on the event handler so the
+        outer loop can exit promptly. Also cancels the
+        background ``_stream_process`` task when streaming,
+        so consumer disconnect / interrupt stops promptly
+        instead of leaving a zombie ReAct loop running.
+
+        Args:
+            session: Parent session whose runtime subagents should be cancelled.
+                Falls back to the bound loop session when omitted.
+        """
+        proposal_session = session or self._loop_session
+        if self._moa_scope_owner is not None:
+            if proposal_session is None:
+                self._moa_scope_owner.close_all("aborted")
+            else:
+                self._moa_scope_owner.close_session(proposal_session.get_session_id(), "aborted")
+        coordinator = self._loop_coordinator
+        controller = self._loop_controller
+        if coordinator is not None and controller is not None:
+            coordinator.request_abort()
+            handler = cast(
+                TaskLoopEventHandler,
+                controller.event_handler,
+            )
+            await handler.on_abort()
+        await self._cancel_stream_process_task()
+        await self._release_session_subagent_controls(
+            session or self._loop_session,
+            reason="aborted",
+        )
+
+    # ----------------------------------------------------------------
+    # long-lived session
+    # ----------------------------------------------------------------
+    async def prepare_interaction_task_loop(
+        self,
+        session: Session,
+    ) -> Tuple[LoopCoordinator, TaskLoopController]:
+        """Prepare and bind the task-loop kernel for the long-lived interaction loop."""
+        coordinator, controller = await self._setup_task_loop(session)
+        session_id = session.get_session_id()
+        if self._bound_session_id != session_id:
+            await controller.bind_session(session)
+            self._bound_session_id = session_id
+        self._loop_session = session
+        return coordinator, controller
+
+    async def run_one_round(
+        self,
+        work: RoundWorkItem,
+        task_id: str,
+        session: Session,
+    ) -> RoundOutcome:
+        """Execute one interaction work item and optionally propose follow-up work."""
+        # Passive work bypasses invoke()/stream(), so materialize pending rails
+        # before its first BEFORE_INVOKE callback, too.
+        await self._ensure_initialized()
+        proposal_owner = self._proposal_owner()
+        proposal_binding = proposal_owner.begin_work(
+            session.get_session_id(), work=work,
+            interaction_response=isinstance(work.query, InteractiveInput),
+        ) if proposal_owner is not None else None
+        proposal_tokens = proposal_owner.activate(proposal_binding.identity) if proposal_binding is not None else None
+        proposal_succeeded = False
+        proposal_result = None
+        next_work = None
+        self._invoke_active = True
+        try:
+            coordinator, controller = await self.prepare_interaction_task_loop(session)
+            if work.reset_loop:
+                coordinator.reset()
+                state = self.load_state(session)
+                state.stop_condition_state = None
+                self.save_state(session, state)
+
+            inputs = copy.deepcopy(work.inputs)
+            if work.kind == "goal":
+                inputs["run"] = {
+                    "kind": "goal",
+                    "context": copy.deepcopy(work.context),
+                }
+            invoke_inputs = self._normalize_inputs(inputs)
+            is_resume_input = self._is_resume_input(invoke_inputs)
+            ctx = AgentCallbackContext(
+                agent=self, inputs=invoke_inputs, session=session
+            )
+            async with ctx.lifecycle(
+                AgentCallbackEvent.BEFORE_INVOKE,
+                AgentCallbackEvent.AFTER_INVOKE,
+            ):
+                await self._sync_expert_role_attachment(invoke_inputs, session)
+                if is_resume_input:
+                    result = await self._run_single_round_invoke(
+                        ctx,
+                        session,
+                        streaming=True,
+                    )
+                else:
+                    await controller.submit_round(
+                        session,
+                        str(work.query),
+                        is_follow_up=work.is_follow_up,
+                        run_kind=invoke_inputs.run_kind,
+                        run_context=invoke_inputs.run_context,
+                        task_id=task_id,
+                        turn_number=invoke_inputs.turn_number,
+                    )
+                    timeout = (
+                        self._deep_config.completion_timeout
+                        if self._deep_config
+                        else 600.0
+                    )
+                    result = await controller.wait_round_completion(timeout=timeout)
+                await self._write_round_result_to_stream(result, session)
+                invoke_inputs.result = result
+                proposal_result = result
+                next_work = (
+                    None
+                    if is_resume_input
+                    else self._build_interaction_next_work(
+                        work=work,
+                        result=result,
+                        session=session,
+                        coordinator=coordinator,
+                        controller=controller,
+                    )
+                )
+
+            self.save_state(session)
+            self.clear_state(session)
+            proposal_succeeded = True
+            return RoundOutcome(next_work=next_work)
+        except Exception:
+            logger.exception("[DeepAgent] interaction round execution failed")
+            return RoundOutcome(
+                error_code="round_execution_error",
+                error_message="interaction round execution failed",
+            )
+        finally:
+            if proposal_binding is not None:
+                proposal_owner.finish_work(
+                    proposal_binding.identity, result=proposal_result,
+                    succeeded=proposal_succeeded, continuing=next_work is not None,
+                )
+                proposal_owner.reset(proposal_tokens)
+            self._invoke_active = False
+
+    def _build_interaction_next_work(
+        self,
+        *,
+        work: RoundWorkItem,
+        result: Dict[str, Any],
+        session: Session,
+        coordinator: Any,
+        controller: Any,
+    ) -> Optional[RoundWorkItem]:
+        """Decide whether another user work item should follow this round."""
+        coordinator.increment_iteration()
+        coordinator.set_last_result(result)
+        state = self.load_state(session)
+        state.stop_condition_state = coordinator.get_state()
+        state.pending_follow_ups.extend(controller.drain_follow_up())
+        self.save_state(session, state)
+
+        if result.get("result_type") == "interrupt" or coordinator.is_aborted:
+            return None
+        if not coordinator.should_continue() or work.kind == "goal":
+            return None
+
+        state = self.load_state(session)
+        if state.pending_follow_ups:
+            query = state.pending_follow_ups.pop(0)
+            self.save_state(session, state)
+            inputs = copy.deepcopy(work.inputs)
+            inputs["query"] = query
+            next_work = RoundWorkItem.user(
+                request_id=work.request_id,
+                inputs=inputs,
+                is_follow_up=True,
+                reset_loop=False,
+            )
+            if self._moa_scope_owner is not None:
+                self._moa_scope_owner.inherit_work(work, next_work)
+            return next_work
+        if self._has_remaining_tasks(session):
+            next_work = RoundWorkItem.user(
+                request_id=work.request_id,
+                inputs=work.inputs,
+                reset_loop=False,
+            )
+            if self._moa_scope_owner is not None:
+                self._moa_scope_owner.inherit_work(work, next_work)
+            return next_work
+        return None
+
+    @property
+    def phase(self) -> InteractionPhase:
+        return self._interaction_phase
+
+    @property
+    def interaction_started(self) -> bool:
+        """Whether ``start()`` has bound this session's interaction loop."""
+        return self._interaction_started
+
+    @property
+    def active_round(self) -> Optional[ActiveInteractionRound]:
+        return self._active_interaction_round
+
+    @property
+    def event_manager(self) -> EventManager:
+        return self._event_manager
+
+    def has_output_stream(self) -> bool:
+        return self._interaction_output.has_consumer()
+
+    async def start(
+        self,
+        *,
+        session: Optional[Session] = None,
+    ) -> None:
+        """Bind the task-loop kernel and start the passive output forwarder.
+
+        Hosts should pass the product ``Session`` they own.  When ``session`` is
+        omitted, a fresh agent session is created with id ``\"default\"`` (useful
+        for unit tests and simple embeddings).
+
+        Lifecycle callbacks awaited while the start lock is held must not
+        re-enter ``start()`` or ``stop()`` on this agent.
+        """
+        async with self._interaction_start_lock:
+            if self._interaction_started:
+                self._ensure_interaction_running()
+            elif not self._try_transition_interaction_phase(InteractionPhase.IDLE):
+                raise RuntimeError("interaction_terminated")
+
+            if session is None:
+                session = create_agent_session(
+                    session_id="default",
+                    card=getattr(self, "card", None),
+                )
+                await session.pre_run(inputs={})
+
+            sid = session.get_session_id()
+
+            if self._interaction_started:
+                if self._bound_session_id == sid:
+                    return
+                raise RuntimeError(
+                    f"Interaction loop already bound to session {self._bound_session_id}; "
+                    f"cannot bind {sid}."
+                )
+
+            # The controller starts its long-lived TaskScheduler inside
+            # prepare_interaction_task_loop().  Create the mutable worktree
+            # holder first so the scheduler, supervisor, rounds, and tool
+            # tasks all inherit the same object through their copied Context.
+            from openjiuwen.extensions.observability.span_context import set_current_session_id
+            from openjiuwen.harness.tools.worktree.session import init_session_state
+
+            init_session_state()
+            # Bind the observability session the same way, for the same reason:
+            # every task this loop spawns then resolves its run root by this
+            # session instead of guessing among the runs live in the process.
+            set_current_session_id(sid)
+
+            self._interaction_session = session
+            await self.prepare_interaction_task_loop(session)
+            goal_language = self._goal_prompt_language()
+            if self._task_completion_rail is None:
+                await self.register_rail(
+                    TaskCompletionRail(goal_language=goal_language)
+                )
+
+            from openjiuwen.harness.goal.store import SessionGoalStore
+
+            self.goal_manager = GoalManager(
+                store=SessionGoalStore(session),
+                event_manager=self._event_manager,
+                control_lock=self._interaction_control_lock,
+                has_output_stream=self.has_output_stream,
+                cancel_active_round=self._cancel_active_round,
+                emit_event=self._emit_interaction_event,
+                notify_work=self._notify_work,
+                language=goal_language,
+            )
+            self._interaction_started = True
+            self._interaction_forwarder_task = asyncio.create_task(
+                self._forward_session_stream(), name=f"interaction_forwarder[{sid}]"
+            )
+
+            rail = self._task_completion_rail
+            if isinstance(rail, TaskCompletionRail):
+                self._bind_live_goal_manager(rail)
+                try:
+                    init_rail(rail, self)
+                except Exception:
+                    logger.exception("[DeepAgent] Failed to register goal tools")
+
+            self._ensure_supervisor_running()
+            logger.info("[DeepAgent] Started for session %s", sid)
+
+    async def stop(self) -> None:
+        """Serialize teardown with start and terminate this interaction runtime."""
+        async with self._interaction_start_lock:
+            await self._stop_interaction_locked()
+
+    async def _stop_interaction_locked(self) -> None:
+        """Teardown helper; awaited callbacks must not re-enter start or stop."""
+        self._fresh_input_context_factory = None
+        if self._moa_scope_owner is not None:
+            self._moa_scope_owner.close_all("interaction_stopped")
+        self._try_transition_interaction_phase(InteractionPhase.TERMINATED)
+        if not self._interaction_started:
+            return
+        self._event_manager.discard_all_work()
+        await self._interaction_output.shutdown()
+        await self._cancel_active_round(reason="stop")
+
+        for task in (self._interaction_supervisor_task, self._interaction_forwarder_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+        self._interaction_supervisor_task = None
+        self._interaction_forwarder_task = None
+
+        emit_tasks = list(self._interaction_emit_tasks)
+        self._interaction_emit_tasks.clear()
+        for task in emit_tasks:
+            if not task.done():
+                task.cancel()
+        for task in emit_tasks:
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+
+        if self._interaction_session is not None:
+            with suppress(Exception):
+                await self._interaction_session.close_stream()
+        controller = self.loop_controller
+        if controller is not None and self._interaction_session is not None:
+            with suppress(Exception):
+                await controller.unbind_session(self._interaction_session)
+            with suppress(Exception):
+                await controller.stop()
+
+        self._interaction_started = False
+        self._event_manager.discard_all_work()
+        self._try_transition_interaction_phase(InteractionPhase.TERMINATED)
+        self._active_interaction_round = None
+        self._interaction_round_task = None
+
+    async def attach_output(self) -> Optional[InteractionOutputStream]:
+        """Claim the sole output reader for this interaction.
+
+        Returns ``None`` when another consumer already holds the lease.
+
+        If an ACTIVE goal exists, missing goal work is ensured even when this
+        call does not obtain the lease, so an already-attached reader continues
+        to receive goal progress (session switch / concurrent attach_goal).
+        """
+        self._ensure_interaction_running()
+
+        async with self._interaction_send_lock:
+            self._ensure_interaction_running()
+            async with self._interaction_control_lock:
+                self._ensure_interaction_running()
+                stream = await self._attach_output_locked()
+                self._ensure_interaction_running()
+                if self.goal_manager is not None:
+                    record = self._load_goal_record_locked()
+                    if record is not None and record.status is GoalStatus.ACTIVE:
+                        self.goal_manager.ensure_active_goal_work_locked()
+                        self._notify_work()
+                return stream
+
+    async def send_input(self, request: SendInputRequest) -> None:
+        """Dispatch user text or interrupt-resume input.
+
+        Hosts that need to read output must call ``attach_output`` first (or
+        already hold a stream).  Steer / follow-up requests typically skip
+        attach and let the existing consumer receive output.  Dispatch modes
+        do not apply to ``InteractiveInput`` recovery requests.
+        """
+        self._ensure_interaction_running()
+
+        async with self._interaction_send_lock:
+            self._ensure_interaction_running()
+            await self._send_user(request)
+
+    def _ensure_interaction_running(self) -> None:
+        if not self._is_interaction_running():
+            raise RuntimeError("interaction_terminated")
+
+    def _is_interaction_running(self) -> bool:
+        return self._interaction_started and self._interaction_phase is not InteractionPhase.TERMINATED
+
+    def _try_transition_interaction_phase(self, target: InteractionPhase) -> bool:
+        if not isinstance(target, InteractionPhase):
+            raise TypeError("interaction phase target must be InteractionPhase")
+        if (
+            self._interaction_phase is InteractionPhase.TERMINATED
+            and target is not InteractionPhase.TERMINATED
+        ):
+            return False
+        self._interaction_phase = target
+        return True
+
+    async def _send_user(self, request: SendInputRequest) -> None:
+        inputs = request.inputs
+        if not isinstance(inputs, dict):
+            raise ValueError(
+                "send_input requires inputs['query'] to be a non-empty string "
+                "or InteractiveInput"
+            )
+        query = inputs.get("query")
+        is_resume_input = isinstance(query, InteractiveInput)
+        if not is_resume_input and (
+            not isinstance(query, str) or not query.strip()
+        ):
+            raise ValueError(
+                "send_input requires inputs['query'] to be a non-empty string "
+                "or InteractiveInput"
+            )
+
+        async with self._interaction_control_lock:
+            self._ensure_interaction_running()
+            if is_resume_input:
+                self._event_manager.push_user(
+                    RoundWorkItem.user(
+                        request_id=request.request_id,
+                        inputs=inputs,
+                        reset_loop=False,
+                    )
+                )
+                self._notify_work()
+                return
+
+            loop = self.loop_controller
+            try:
+                mode = (
+                    InputDispatchMode.FOLLOW_UP
+                    if request.mode is None
+                    else InputDispatchMode(request.mode)
+                )
+            except ValueError as exc:
+                raise ValueError(f"unsupported input dispatch mode: {request.mode}") from exc
+
+            if mode is InputDispatchMode.STEER and self._active_interaction_round is not None:
+                if loop is None:
+                    raise RuntimeError("active interaction round cannot accept steer without loop_controller")
+                loop.enqueue_steer(str(inputs["query"]))
+                self._notify_work()
+                return
+
+            keep_open = self._should_keep_interaction_open_locked()
+            if keep_open:
+                self._event_manager.push_user(
+                    RoundWorkItem.user(
+                        request_id=request.request_id,
+                        inputs=inputs,
+                        is_follow_up=True,
+                        reset_loop=False,
+                    )
+                )
+                self._notify_work()
+                return
+
+            # Fresh user turn.  Output lease ownership stays with the host via
+            # ``attach_output``; send_input never steals or creates a stream.
+            context_factory = self._fresh_input_context_factory
+            if context_factory is None:
+                self._event_manager.push_user(
+                    RoundWorkItem.user(request_id=request.request_id, inputs=inputs)
+                )
+                self._notify_work()
+            else:
+                await self._enqueue_fresh_input_in_context(
+                    context_factory,
+                    request_id=request.request_id,
+                    inputs=inputs,
+                )
+
+    async def _enqueue_fresh_input_in_context(
+        self,
+        context_factory: FreshInputContextFactory,
+        *,
+        request_id: Optional[str],
+        inputs: Dict[str, Any],
+    ) -> None:
+        """Enter host readiness without allowing exit to hide dispatch failure."""
+        context = context_factory()
+        await context.__aenter__()
+        try:
+            self._ensure_interaction_running()
+            self._event_manager.push_user(
+                RoundWorkItem.user(request_id=request_id, inputs=inputs)
+            )
+            self._notify_work()
+        except BaseException as primary_error:
+            primary_traceback = primary_error.__traceback__
+            try:
+                await context.__aexit__(
+                    type(primary_error),
+                    primary_error,
+                    primary_traceback,
+                )
+            except BaseException as exit_error:
+                # Dispatch failure is authoritative, including when context
+                # cleanup is cancelled. Preserve cleanup only as the cause.
+                logger.exception(
+                    "[DeepAgent] fresh input context exit failed after dispatch error"
+                )
+                raise primary_error.with_traceback(primary_traceback) from exit_error
+            raise
+        await context.__aexit__(None, None, None)
+
+    async def _attach_output_locked(self) -> Optional[InteractionOutputStream]:
+        lease = await self._interaction_output.attach()
+        return InteractionOutputStream(self, lease) if lease is not None else None
+
+    async def next_output(self, lease: OutputLease) -> Optional[Any]:
+        return await self._interaction_output.next_item(lease)
+
+    async def detach_output(self, token: str, *, abort_active_round: bool) -> None:
+        async with self._interaction_control_lock:
+            detached = await self._interaction_output.detach(token)
+            if not detached:
+                return
+            self._retire_detached_proposals("output_detached", abort_active_round=abort_active_round)
+            self._event_manager.discard_all_work()
+            if abort_active_round:
+                await self._cancel_active_round(reason="output_detached")
+
+    async def _detach_current_output_locked(self, *, abort_active_round: bool) -> None:
+        lease = self._interaction_output.current_lease()
+        if lease is None:
+            return
+        if await self._interaction_output.detach(lease.token):
+            self._retire_detached_proposals("output_replaced", abort_active_round=abort_active_round)
+            self._event_manager.discard_all_work()
+            if abort_active_round:
+                await self._cancel_active_round(reason="output_replaced")
+
+    def _retire_detached_proposals(self, reason: str, *, abort_active_round: bool) -> None:
+        owner = self._moa_scope_owner
+        session = self._interaction_session
+        if owner is None or session is None:
+            return
+        if abort_active_round:
+            owner.close_session(session.get_session_id(), reason)
+        else:
+            active = self._active_interaction_round
+            owner.discard_queued(
+                session.get_session_id(), reason,
+                active_work=active.work if active is not None else None,
+            )
+
+    def _emit_interaction_event(self, event: InteractionEvent) -> None:
+        # The callback is synchronous because rails can invoke it from several
+        # lifecycle hooks.  Capture the lease now so a delayed task cannot put
+        # an old event into a replacement request's output stream.
+        # Fire-and-forget is required (cannot await here); track the task so
+        # stop() can cancel outstanding emits instead of leaking them.
+        token = self._interaction_output.current_token()
+        if token is not None:
+            task = asyncio.create_task(
+                self._interaction_output.emit(event.to_output_schema(), expected_token=token)
+            )
+            self._interaction_emit_tasks.add(task)
+            task.add_done_callback(self._interaction_emit_tasks.discard)
+
+    async def cancel_round(
+        self,
+        *,
+        reason: str,
+    ) -> bool:
+        """Cancel the current active round without stopping the interaction loop.
+
+        Works for both user and goal rounds. Does not modify GoalRecord: an
+        ACTIVE goal stays ACTIVE until ``goal_manager.pause/clear`` (or
+        evaluation reaches a terminal status). Hosts that need to stop the
+        in-flight attempt while keeping the persistent goal should call this
+        (or close the output stream with ``abort_active_round=True``).
+        """
+        active = self._active_interaction_round
+        if active is None:
+            return False
+        await self._cancel_active_round(reason=reason)
+        return True
+
+    async def _cancel_active_round(
+        self,
+        *,
+        reason: str,
+        expected_run_kind: Optional[str] = None,
+        expected_goal_id: Optional[str] = None,
+        expected_revision: Optional[int] = None,
+        wait_timeout: float = 1.5,
+    ) -> None:
+        """Cancel the in-flight interaction round.
+
+        Order mirrors NativeHarness hard-cancel intent, with a bounded wait so
+        goal overwrite/clear are not blocked for minutes on an unresponsive
+        streaming LLM ``await``:
+
+        1. ``abort()`` first — arm coordinator abort / cancel stream_process.
+        2. Cancel ``_interaction_round_task`` so the supervisor is not stuck in
+           ``wait_round_completion``.
+        3. ``cancel_task`` with a short timeout (shielded); if the exec task is
+           still draining LLM I/O, continue without waiting and let cancel
+           finish in the background.
+        """
+        active = self._active_interaction_round
+        if active is None:
+            return
+        if expected_run_kind is not None and active.run_kind != expected_run_kind:
+            return
+        if expected_goal_id is not None and active.goal_id != expected_goal_id:
+            return
+        if expected_revision is not None and active.revision != expected_revision:
+            return
+
+        logger.info("[DeepAgent] cancelling %s round: %s", active.run_kind, reason)
+        if self._moa_scope_owner is not None:
+            self._moa_scope_owner.close_work(active.work, reason)
+        task_id = active.task_id
+        controller = self.loop_controller
+        scheduler = getattr(controller, "task_scheduler", None) if controller else None
+
+        # 1) Signal abort before waiting on scheduler cancel.
+        with suppress(Exception):
+            await self.abort(self._interaction_session)
+
+        # 2) Unblock supervisor / wait_round_completion promptly.
+        round_task = self._interaction_round_task
+        if (
+            round_task is not None
+            and round_task is not asyncio.current_task()
+            and not round_task.done()
+        ):
+            round_task.cancel()
+
+        # 3) Bound the wait for the scheduler exec task (often stuck in LLM I/O).
+        if task_id and scheduler is not None:
+            cancel_wait = asyncio.create_task(
+                scheduler.cancel_task(task_id),
+                name=f"deepagent-cancel-task-{task_id[:12]}",
+            )
+            try:
+                with anyio.fail_after(wait_timeout, shield=True):
+                    await cancel_wait
+            except TimeoutError:
+                logger.warning(
+                    "[DeepAgent] cancel_task timed out after %.1fs "
+                    "(reason=%s task_id=%s); continuing without waiting for LLM",
+                    wait_timeout,
+                    reason,
+                    task_id,
+                )
+            except Exception:
+                logger.debug(
+                    "[DeepAgent] cancel_task raised during round cancel "
+                    "(reason=%s task_id=%s)",
+                    reason,
+                    task_id,
+                    exc_info=True,
+                )
+                if not cancel_wait.done():
+                    cancel_wait.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await cancel_wait
+
+    def _notify_work(self) -> None:
+        self._interaction_wakeup.set()
+        self._ensure_supervisor_running()
+
+    def _ensure_supervisor_running(self) -> None:
+        if self._interaction_supervisor_task is None or self._interaction_supervisor_task.done():
+            self._interaction_supervisor_task = asyncio.create_task(self._supervisor_loop())
+
+    async def _supervisor_loop(self) -> None:
+        try:
+            while self._is_interaction_running():
+                if not self._interaction_output.has_consumer():
+                    if not self._try_transition_interaction_phase(InteractionPhase.IDLE):
+                        return
+                    self._interaction_wakeup.clear()
+                    await self._interaction_wakeup.wait()
+                    continue
+
+                work = self._event_manager.next_work()
+                if work is None:
+                    if not self._is_interaction_running():
+                        return
+                    await self._promote_loop_follow_ups()
+                    work = self._event_manager.next_work()
+                if work is None:
+                    await self._close_idle_output_if_finished()
+                    if not self._is_interaction_running():
+                        return
+                    if not self._try_transition_interaction_phase(InteractionPhase.IDLE):
+                        return
+                    self._interaction_wakeup.clear()
+                    if self._event_manager.has_pending_work():
+                        continue
+                    await self._interaction_wakeup.wait()
+                    continue
+
+                self._interaction_round_task = asyncio.create_task(self._execute_round(work))
+                await asyncio.wait({self._interaction_round_task})
+                if self._interaction_round_forwarded is not None:
+                    with suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(self._interaction_round_forwarded.wait(), timeout=2.0)
+                self._interaction_round_task = None
+                self._interaction_round_forwarded = None
+        except asyncio.CancelledError:
+            logger.debug("[DeepAgent] supervisor cancelled")
+        except Exception:
+            logger.exception("[DeepAgent] supervisor failed")
+            self._try_transition_interaction_phase(InteractionPhase.IDLE)
+
+    async def _promote_loop_follow_ups(self) -> None:
+        controller = self.loop_controller
+        if controller is None or not controller.has_follow_up():
+            return
+        for query in controller.drain_follow_up():
+            work = RoundWorkItem.user(
+                request_id=None,
+                inputs={"query": query},
+                is_follow_up=True,
+                reset_loop=False,
+            )
+            if self._moa_scope_owner is not None:
+                self._moa_scope_owner.mark_automatic(work)
+            self._event_manager.push_user(work)
+
+    async def _close_idle_output_if_finished(self) -> None:
+        """End an ordinary response stream after its final queued round."""
+        async with self._interaction_control_lock:
+            if not self._is_interaction_running():
+                return
+            if self._should_keep_interaction_open_locked():
+                return
+            await self._interaction_output.finish_current()
+
+    def _should_keep_interaction_open_locked(self) -> bool:
+        """Return whether the current output stream still owns live work.
+
+        The caller must hold ``_interaction_control_lock``.  A goal stream spans
+        multiple attempts, so an ACTIVE goal keeps the interaction open.
+
+        Side effect (intentional): when the GoalRecord is ACTIVE, this method
+        also calls ``ensure_active_goal_work_locked()`` so the next attempt is
+        queued before the host can observe an idle completion.  Callers must
+        treat a True result as both "keep open" and "goal work ensured".
+        """
+        if self._event_manager.has_pending_work() or self._active_interaction_round is not None:
+            return True
+        record = self._load_goal_record_locked()
+        if record is not None and record.status is GoalStatus.ACTIVE:
+            if self.goal_manager is not None:
+                self.goal_manager.ensure_active_goal_work_locked()
+            return True
+        return False
+
+    async def _forward_session_stream(self) -> None:
+        session = self._interaction_session
+        if session is None:
+            return
+        try:
+            async for chunk in session.stream_iterator():
+                if chunk is _ROUND_BOUNDARY:
+                    if self._interaction_round_forwarded is not None:
+                        self._interaction_round_forwarded.set()
+                    continue
+                await self._interaction_output.emit(chunk)
+        except Exception:
+            logger.exception("[DeepAgent] output forwarder failed")
+            self._emit_interaction_event(
+                InteractionEvent.execution_error(
+                    code="forwarder_crashed", message="output forwarder crashed"
+                )
+            )
+
+    async def _emit_round_boundary(self, session: "Session") -> bool:
+        """Emit an internal round-boundary marker into the session stream.
+
+        Uses ``session._inner`` because the public Session API has no way to
+        inject a non-payload control frame into ``stream_iterator()`` ordering.
+        ``_ROUND_BOUNDARY`` is filtered by ``_forward_session_stream`` and must
+        not go through ``write_stream`` / ``write_custom_stream``.
+        """
+        try:
+            manager = getattr(session, "_inner").stream_writer_manager()
+            await manager.stream_emitter().emit(_ROUND_BOUNDARY)
+            return True
+        except Exception:
+            logger.debug("[DeepAgent] unable to emit ordered round boundary", exc_info=True)
+            return False
+
+    async def _execute_round(self, work: RoundWorkItem) -> None:
+        if not self._is_interaction_running():
+            return
+        if not self._try_transition_interaction_phase(InteractionPhase.RUNNING):
+            return
+        session = self._interaction_session
+        task_id = uuid.uuid4().hex
+        forwarded = asyncio.Event()
+        self._interaction_round_forwarded = forwarded
+        self._active_interaction_round = ActiveInteractionRound(work=work, task_id=task_id)
+        self._event_manager.mark_started(work)
+        continuation_enqueued = False
+        round_succeeded = False
+        try:
+            if session is None or not self._interaction_output.has_consumer():
+                return
+            if work.kind == "goal":
+                if self.goal_manager is None:
+                    return
+                started = await self.goal_manager.begin_attempt(
+                    goal_id=str(work.context["goal_id"]),
+                    revision=int(work.context["revision"]),
+                )
+                if started is None:
+                    return
+
+            outcome: RoundOutcome = await self.run_one_round(
+                work, task_id, session
+            )
+            if not self._is_interaction_running():
+                return
+            if outcome.next_work is not None:
+                self._event_manager.push_user(outcome.next_work)
+                continuation_enqueued = True
+                self._notify_work()
+            round_succeeded = outcome.error_code is None
+            if outcome.error_code is not None:
+                self._emit_interaction_event(
+                    InteractionEvent.execution_error(
+                        code=outcome.error_code,
+                        message=outcome.error_message or "",
+                    )
+                )
+        except asyncio.CancelledError:
+            logger.info("[DeepAgent] round cancelled")
+        except Exception:
+            logger.exception("[DeepAgent] round execution failed")
+            self._emit_interaction_event(
+                InteractionEvent.execution_error(
+                    code="round_execution_error",
+                    message="round execution failed",
+                )
+            )
+        finally:
+            owner = self._moa_scope_owner
+            if owner is not None:
+                suspended = session is not None and owner.is_suspended(work, session.get_session_id())
+                if not round_succeeded or (not continuation_enqueued and not suspended):
+                    owner.close_work(work, "work_not_continued")
+            self._event_manager.mark_finished(work)
+            if session is not None:
+                emitted = await self._emit_round_boundary(session)
+                if not emitted:
+                    forwarded.set()
+            self._active_interaction_round = None
+            self._try_transition_interaction_phase(InteractionPhase.IDLE)
+
+    def _load_goal_record_locked(self) -> Optional[GoalRecord]:
+        if self.goal_manager is None:
+            return None
+        return self.goal_manager.get_store().load()
+
+
+
+__all__ = [
+    "DeepAgent",
+    "DeepAgentConfig",
+]

@@ -1,0 +1,276 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
+import uuid
+from enum import Enum
+from typing import Optional, Union, Any, Self, Literal
+
+from pydantic import BaseModel, Field, model_validator
+
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import build_error
+
+
+class ProviderType(str, Enum):
+    """ModelClientProvider type"""
+    OpenAI = "OpenAI"
+    OpenAIAccount = "OpenAIAccount"
+    OpenRouter = "OpenRouter"
+    Anthropic = "Anthropic"
+    SiliconFlow = "SiliconFlow"
+    DashScope = "DashScope"
+    DeepSeek = "DeepSeek"
+    Moonshot = "Moonshot"
+    MiniMax = "MiniMax"
+    ModelArts = "ModelArts"
+    VolcEngine = "VolcEngine"
+    Qianfan = "Qianfan"
+    Zhipu = "Zhipu"
+    MiMo = "MiMo"
+    InferenceAffinity = "InferenceAffinity"
+    AscendAffinity = "AscendAffinity"
+    IntelliRouter = "intelli_router"
+
+
+class LLMApiMode(str, Enum):
+    ChatCompletions = "chat_completions"
+    Responses = "responses"
+    AnthropicMessages = "anthropic_messages"
+
+
+class LLMAuthMode(str, Enum):
+    ApiKey = "api_key"
+    NoneAuth = "none"
+    CustomHeaders = "custom_headers"
+    OpenAIAccountOAuth = "openai_account_oauth"
+
+
+class KVCacheExtensionConfig(BaseModel):
+    mode: Literal["none", "affinity"] = "none"
+    affinity_field: str = "agent_hint"
+
+
+class LLMExtensionsConfig(BaseModel):
+    prompt_cache: dict[str, Any] = Field(default_factory=dict)
+    kv_cache: KVCacheExtensionConfig = Field(default_factory=KVCacheExtensionConfig)
+    response_fields: dict[str, Any] = Field(default_factory=dict)
+    request_extra_body: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReasoningConfig(BaseModel):
+    """Provider-neutral reasoning/thinking request intent."""
+
+    mode: Literal["auto", "enabled", "disabled"] = Field(default="auto")
+    effort: Optional[str] = Field(default=None)
+    budget_tokens: Optional[int] = Field(default=None, ge=0)
+    model_config = {"extra": "forbid"}
+
+
+class IntelliRouterDeploymentConfig(BaseModel):
+    """One deployment candidate used by the IntelliRouter model client."""
+
+    route_id: str = Field(description="Stable route ID inside the model group")
+    model_id: Optional[str] = Field(default=None, description="Business model ID resolved by JiuwenSwarm")
+    model_name: str = Field(description="Provider-facing model name")
+    provider: str = Field(description="Provider adapter name used by intelli_router")
+    api_key: str = Field(default="", description="Resolved API key")
+    api_base: str = Field(default="", description="Provider API base URL")
+    endpoint_profile: Optional[str] = Field(default=None, description="Provider endpoint dialect")
+    custom_headers: Optional[dict[str, str]] = Field(default=None, description="Route-level custom headers")
+    verify_ssl: Optional[bool] = Field(default=None, description="Route-level TLS verification override")
+    fallback_tag: Optional[str] = Field(default=None, description="Official model name used by tag-filtered routing")
+    model_description: Optional[str] = Field(default=None, description="User-provided model capability description")
+    request_defaults: dict[str, Any] = Field(default_factory=dict)
+    tpm: Optional[int] = Field(default=None, description="Tokens-per-minute capacity hint")
+    rpm: Optional[int] = Field(default=None, description="Requests-per-minute capacity hint")
+    timeout: Optional[float] = Field(default=None, description="Route-level timeout")
+
+    model_config = {"extra": "forbid"}
+
+
+class IntelliRouterConfig(BaseModel):
+    """Structured config for the IntelliRouter model client."""
+
+    model_group_id: Optional[str] = Field(default=None, description="Business model group ID")
+    deployments: list[IntelliRouterDeploymentConfig] = Field(default_factory=list)
+    strategy: str = Field(default="ordered-failover", description="Routing strategy name")
+    strategy_kwargs: dict[str, Any] = Field(default_factory=dict)
+    num_retries: Optional[int] = Field(default=None, description="Fallback retry budget")
+    timeout: float = Field(default=30.0, description="Router request timeout")
+    enable_health_check: bool = Field(default=False, description="Enable router health checks")
+    health_check_interval: float = Field(default=300.0, description="Health check interval in seconds")
+    enable_observability: bool = Field(default=False, description="Enable router observability hooks")
+    web_dashboard_port: int = Field(default=0, description="Metrics web dashboard port")
+    router_scope: Optional[str] = Field(
+        default=None,
+        description="Router cache scope; clients with different scopes never share router state (e.g. cooldowns)",
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+_TOP_LEVEL_API_KEY_PROVIDERS = {
+    ProviderType.OpenAI.value,
+    ProviderType.OpenRouter.value,
+    ProviderType.Anthropic.value,
+    ProviderType.SiliconFlow.value,
+    ProviderType.DashScope.value,
+    ProviderType.DeepSeek.value,
+    ProviderType.Moonshot.value,
+    ProviderType.MiniMax.value,
+    ProviderType.ModelArts.value,
+    ProviderType.VolcEngine.value,
+    ProviderType.Qianfan.value,
+    ProviderType.Zhipu.value,
+    ProviderType.MiMo.value,
+    ProviderType.InferenceAffinity.value,
+}
+_TOP_LEVEL_API_BASE_PROVIDERS = _TOP_LEVEL_API_KEY_PROVIDERS | {ProviderType.OpenAIAccount.value}
+_DEFAULT_API_BASE_BY_ENDPOINT_PROFILE = {
+    "ollama": "http://localhost:11434/v1",
+    "lmstudio": "http://localhost:1234/v1",
+}
+
+
+class ModelClientConfig(BaseModel):
+    """ModelClient config"""
+    client_id: str = Field(default_factory=lambda: str(uuid.uuid4()),
+        description="The ModelClient client ID is a unique identifier used for registration in the Runner")
+    client_provider: Union[ProviderType, str] = Field(
+        ...,
+        description="Service provider identification, Enumeration value: OpenAI, OpenRouter, "
+                    "OpenAIAccount, SiliconFlow, DashScope, AscendAffinity or ICBC"
+    )
+    api_key: str = Field(default="", description="API key")
+    api_base: str = Field(default="", description="API base URL")
+    timeout: float = Field(
+        default=360.0,
+        gt=0,
+        description="HTTP request timeout in seconds (must be greater than 0). Kept >= "
+                    "stream_first_chunk_timeout so the transport layer never times out before "
+                    "the application-level stream timeout."
+    )
+    stream_first_chunk_timeout: Optional[float] = Field(
+        default=300.0,
+        gt=0,
+        description="Maximum seconds to wait for the first streaming chunk that carries model output "
+                    "(content, reasoning, or a tool call fragment); framing-only chunks such as a "
+                    "role-only delta do not satisfy it. None disables it"
+    )
+    stream_idle_timeout: Optional[float] = Field(
+        default=60.0,
+        gt=0,
+        description="Maximum seconds to wait between streaming chunks that carry model output; "
+                    "framing-only chunks such as heartbeat deltas do not reset it. None disables it"
+    )
+
+    max_retries: int = Field(
+        default=0,
+        description="Retained for compatibility. OpenAI and Anthropic SDK clients are "
+                    "created with max_retries=0, so this value is not passed to the SDK. "
+                    "Whole-call retries for transient provider failures are handled by "
+                    "ModelAnomalyDetectionRail."
+    )
+    use_shared_llm_http_client: bool = Field(
+        default=True,
+        description="Reuse a process-wide, long-lived HTTP client (with its own keep-alive connection pool) "
+                    "instead of building/closing a client per request. Emergency kill-switch: set to False "
+                    "to fall back to per-request clients."
+    )
+    verify_ssl: bool = Field(default=True, description="Whether to verify SSL certificates")
+    ssl_cert: Optional[str] = Field(default=None, description="Path to SSL certificate file")
+    custom_headers: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Developer-provided headers merged per LLM call"
+    )
+    api_mode: Optional[LLMApiMode] = Field(default=None, description="LLM API mode")
+    auth_mode: LLMAuthMode = Field(default=LLMAuthMode.ApiKey, description="LLM authentication mode")
+    endpoint_profile: Optional[str] = Field(default=None, description="OpenAI-compatible endpoint profile name")
+    extensions: LLMExtensionsConfig = Field(default_factory=LLMExtensionsConfig)
+    legacy_client_provider: Optional[str] = Field(default=None, description="Original provider before normalization")
+    intelli_router: Optional[IntelliRouterConfig] = Field(
+        default=None,
+        description="Structured IntelliRouter configuration, used when client_provider is intelli_router",
+    )
+    model_config = {
+        "extra": "allow",
+    }
+
+    @model_validator(mode='after')
+    def validate_client_provider(self) -> Self:
+        """Validate and normalize client_provider."""
+        if isinstance(self.client_provider, ProviderType):
+            self._validate_top_level_provider_config(self.client_provider.value)
+            return self
+        provider = self.client_provider.value if isinstance(self.client_provider, ProviderType) \
+            else str(self.client_provider)
+        provider = provider.strip()
+        # Normalize enum names and values, including aliases such as
+        # "IntelliRouter" -> "intelli_router".
+        provider_map = {
+            alias.lower(): builtin.value
+            for builtin in ProviderType
+            for alias in (builtin.name, builtin.value)
+        }
+        normalized_provider = provider_map.get(provider.lower())
+        if normalized_provider:
+            self.client_provider = normalized_provider
+            self._validate_top_level_provider_config(normalized_provider)
+            return self
+
+        from openjiuwen.core.common.clients import get_client_registry
+        supported_types = [name[4:] for name in get_client_registry().list_clients() if name.startswith("llm_")]
+        for builtin in ProviderType:
+            supported_types.append(builtin.value)
+        supported_types = list(set(supported_types))
+        if provider in supported_types:
+            self.client_provider = provider
+            self._validate_top_level_provider_config(provider)
+            return self
+        else:
+            raise build_error(
+                StatusCode.MODEL_PROVIDER_INVALID,
+                error_msg=f"unavailable model provider: {provider},"
+                          f"and available providers are: {supported_types}"
+            )
+
+    def _validate_top_level_provider_config(self, provider: str) -> None:
+        if not str(self.api_base or "").strip() and self.endpoint_profile:
+            default_api_base = _DEFAULT_API_BASE_BY_ENDPOINT_PROFILE.get(
+                str(self.endpoint_profile).strip().lower()
+            )
+            if default_api_base:
+                self.api_base = default_api_base
+        if self.auth_mode != LLMAuthMode.ApiKey.value and self.auth_mode != LLMAuthMode.ApiKey:
+            requires_api_key = False
+        else:
+            requires_api_key = provider in _TOP_LEVEL_API_KEY_PROVIDERS
+        if requires_api_key and not str(self.api_key or "").strip():
+            raise build_error(
+                StatusCode.MODEL_SERVICE_CONFIG_ERROR,
+                error_msg=f"api_key is required for provider {provider}."
+            )
+        if provider in _TOP_LEVEL_API_BASE_PROVIDERS and not str(self.api_base or "").strip():
+            raise build_error(
+                StatusCode.MODEL_SERVICE_CONFIG_ERROR,
+                error_msg=f"api_base is required for provider {provider}."
+            )
+
+
+class ModelRequestConfig(BaseModel):
+    """Model config"""
+    model_name: str = Field(default="", alias="model", description="Model name, e.g. gpt-4")
+    temperature: Optional[float] = Field(
+        default=None, description="Temperature parameter, controlling the randomness of outputs"
+    )
+    top_p: Optional[float] = Field(default=None, description="Top-p sampling parameter")
+    max_tokens: Optional[int] = Field(default=None, description="Maximum number of tokens to generate")
+    stop: Union[Optional[str], None] = Field(default=None, description="Stop sequence")
+    context_window: Optional[int] = Field(
+        default=None,
+        description="Maximum context window supported by the model, in tokens; internal context metadata",
+    )
+    reasoning: Optional[Union[ReasoningConfig, dict[str, Any]]] = Field(
+        default=None,
+        description="Provider-neutral reasoning/thinking request intent. Legacy raw reasoning dicts remain accepted.",
+    )
+    model_config = {"extra": "allow", "populate_by_name": True}

@@ -1,0 +1,628 @@
+#!/usr/bin/env python
+# coding: utf-8
+# pylint: disable=protected-access
+
+from __future__ import annotations
+
+import asyncio
+import shutil
+import subprocess
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from openjiuwen.core.foundation.tool import McpServerConfig
+from openjiuwen.harness.tools.browser_move.playwright_runtime.config import BrowserRunGuardrails
+from openjiuwen.harness.tools.browser_move.playwright_runtime.probes import (
+    build_browser_state_metadata_js,
+    build_card_probe_js,
+    build_interactive_probe_js,
+)
+from openjiuwen.harness.tools.browser_move.playwright_runtime.site_profiles import (
+    builtin_site_profiles,
+)
+from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
+    BrowserAgentRuntime,
+)
+from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime_tools import (
+    BrowserProbeCardsTool,
+)
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _make_runtime() -> BrowserAgentRuntime:
+    mcp_cfg = McpServerConfig(
+        server_id="test-playwright-runtime",
+        server_name="test-playwright-runtime",
+        server_path="stdio://playwright",
+        client_type="stdio",
+        params={"cwd": str(Path.cwd())},
+    )
+
+    return BrowserAgentRuntime(
+        provider="openai",
+        api_key="test-key",
+        api_base="https://example.invalid/v1",
+        model_name="test-model",
+        mcp_cfg=mcp_cfg,
+        guardrails=BrowserRunGuardrails(
+            max_steps=3,
+            max_failures=1,
+            timeout_s=30,
+            retry_once=False,
+        ),
+    )
+
+
+def test_build_card_probe_js_contains_card_extraction_terms() -> None:
+    js = build_card_probe_js(max_cards=10, viewport_only=True)
+
+    assert "max_cards" in js
+    assert "viewport_only" in js
+    assert "recurring_signatures" in js
+    assert "price" in js
+    assert "rating" in js
+    assert "author" in js
+    assert "likes" in js
+    assert "favorites" in js
+    assert "comments" in js
+    assert "shop" in js
+    assert "duration" in js
+    assert "high_temperature" in js
+    assert "low_temperature" in js
+    assert "sort_state" in js
+    assert "source" in js
+    assert "summary" in js
+    assert "primary_link" in js
+    assert "href: primaryLink.href" in js
+    assert "recommended_action" in js
+    assert "buttons" in js
+    assert "clickable" in js
+    assert "match_count" in js
+    assert "visible" in js
+    assert "enabled" in js
+    assert "generation_id" in js
+
+
+@pytest.mark.parametrize("error", [
+    "### Error\nReferenceError: missingHelper is not defined",
+    {"isError": True, "content": [{"type": "text", "text": "ReferenceError: missingHelper is not defined"}]},
+    {"result": "### Error\nReferenceError: visible is not defined"},
+    {"data": {"result": "### Error\nReferenceError: visible is not defined"}},
+])
+def test_probe_reports_executor_error_without_repeating_identical_script(error) -> None:
+    runtime = _make_runtime()
+    runtime._code_executor = AsyncMock(return_value=error)
+    parsed, _, retries = _run(runtime._execute_probe_json(
+        "async (page) => missingHelper(page)", artifact_kind="card_probe"
+    ))
+    assert parsed["ok"] is False
+    assert "ReferenceError" in parsed["error"]
+    assert retries == 0
+    runtime._code_executor.assert_awaited_once()
+
+
+def test_empty_card_result_is_not_a_script_error_or_retried() -> None:
+    runtime = _make_runtime()
+    runtime._code_executor = AsyncMock(return_value={"ok": True, "cards": []})
+    result, _, retries = _run(runtime._execute_probe_json(
+        "async (page) => ({ok: true, cards: []})", artifact_kind="card_probe",
+    ))
+    assert result == {"ok": True, "cards": []}
+    assert retries == 0
+    runtime._code_executor.assert_awaited_once()
+
+
+@pytest.mark.parametrize("probe,registry", [
+    ("probe_cards", "register_cards"), ("probe_interactives", "register_interactives"),
+])
+def test_failed_probe_keeps_existing_page_targets(probe, registry) -> None:
+    runtime = _make_runtime()
+    runtime.ensure_runtime_ready = AsyncMock()
+    runtime._code_executor = AsyncMock(return_value="### Error\nReferenceError: unavailable helper")
+    page = runtime.ensure_page_state()
+    page.observe(url="https://example.test/current", title="Current page")
+    previous = page.export()
+    with patch.object(page, registry, wraps=getattr(page, registry)) as register:
+        result = _run(getattr(runtime, probe)())
+    assert result["ok"] is False
+    assert "ReferenceError" in result["error"]
+    assert page.export() == previous
+    register.assert_not_called()
+    runtime._code_executor.assert_awaited_once()
+
+
+def test_generated_probe_scripts_parse_as_javascript(tmp_path: Path) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed; skipping generated JavaScript parse test")
+
+    scripts = (
+        build_browser_state_metadata_js(),
+        build_interactive_probe_js(),
+        build_card_probe_js(),
+    )
+    for index, script in enumerate(scripts):
+        runner = tmp_path / f"parse_probe_{index}.js"
+        runner.write_text(
+            f"const probe = ({script});\nif (typeof probe !== 'function') process.exit(2);\n",
+            encoding="utf-8",
+        )
+        subprocess.run([node, str(runner)], check=True, capture_output=True, text=True)
+
+
+def test_build_card_probe_js_embeds_generation_and_validates_clickability() -> None:
+    js = build_card_probe_js(generation_id="g11")
+
+    assert '"generation_id": "g11"' in js
+    assert "selectorMeta.match_count === 1" in js
+    assert "cardSelectorMeta.match_count === 1" in js
+    assert "selector_hint_validated: cardSelectorValidated" in js
+    assert "primary_link_selector_hint_validated: primaryLinkSelectorValidated" in js
+    assert "selector_hint: clickable ? selectorHint : ''" in js
+    assert "cardClickable ? 'use_validated_selector'" in js
+    assert "selectorDescriptor" in js
+    assert "selector_metadata" in js
+    assert "title: selectorDescriptor(title.selector_hint)" in js
+    assert "price: selectorDescriptor(price.selector_hint)" in js
+    assert "generation_id: generationId" in js
+    assert "region: semantics.region" in js
+    assert "kind: semantics.kind" in js
+    assert "is_ad: semantics.is_ad" in js
+    assert "result_index: isMainResult ? resultIndex : null" in js
+
+
+def test_build_card_probe_js_prefers_taobao_product_ancestor_links() -> None:
+    js = build_card_probe_js(
+        generation_id="g12",
+        site_profiles=builtin_site_profiles(),
+    )
+
+    assert "root.closest('a[href]')" in js
+    assert '"id": "taobao_marketplace"' in js
+    assert "isProfilePreferredPrimaryHref" in js
+    assert "isProfileExcludedPrimaryHref" in js
+    assert "siteDetailLink" in js
+
+
+def test_build_card_probe_js_prefers_and_deduplicates_ctrip_hotel_detail_links() -> None:
+    js = build_card_probe_js(
+        generation_id="g13",
+        site_profiles=builtin_site_profiles(),
+    )
+
+    assert '"id": "ctrip_hotels"' in js
+    assert '"query_id_params": ["hotelId", "hotelid"]' in js
+    assert "siteDetailLink" in js
+    assert "profileDetailLinks.has(detailLink.key)" in js
+
+
+def test_build_card_probe_js_clamps_max_cards() -> None:
+    js = build_card_probe_js(max_cards=999, viewport_only=True)
+
+    assert '"max_cards": 50' in js
+
+
+def test_browser_probe_cards_tool_invokes_runtime_api() -> None:
+    runtime = _make_runtime()
+    runtime.probe_cards = AsyncMock(
+        return_value={
+            "ok": True,
+            "cards": [
+                {
+                    "id": "card_1",
+                    "title": "A Light in the Attic",
+                    "price": "£51.77",
+                    "selector_hint": "article.product_pod",
+                }
+            ],
+            "error": None,
+        }
+    )
+
+    tool = BrowserProbeCardsTool(runtime, language="en")
+
+    result = _run(
+        tool.invoke(
+            {
+                "max_cards": 200,
+                "viewport_only": "false",
+                "include_buttons": "true",
+                "query": "attic",
+            }
+        )
+    )
+
+    runtime.probe_cards.assert_called_once_with(
+        max_cards=20,
+        viewport_only=False,
+        include_buttons=True,
+        query="attic",
+    )
+    assert result.success is True
+    assert result.data["cards"][0]["title"] == "A Light in the Attic"
+
+
+def test_browser_probe_cards_tool_reports_runtime_error() -> None:
+    runtime = _make_runtime()
+    runtime.probe_cards = AsyncMock(
+        return_value={
+            "ok": False,
+            "error": "browser_code_executor_not_ready",
+            "cards": [],
+        }
+    )
+
+    tool = BrowserProbeCardsTool(runtime, language="en")
+
+    result = _run(tool.invoke({}))
+
+    assert result.success is False
+    assert result.error == "browser_code_executor_not_ready"
+    assert result.data["cards"] == []
+
+
+def test_runtime_probe_cards_uses_code_executor_and_parses_json() -> None:
+    runtime = _make_runtime()
+    runtime.ensure_runtime_ready = AsyncMock()
+    runtime._code_executor = AsyncMock(
+        return_value={
+            "content": [
+                {
+                    "type": "text",
+                    "text": '{"ok": true, "url": "https://books.toscrape.com/", "cards": [{"id": "card_1", "title": "Book", "price": "£10.00"}]}',
+                }
+            ]
+        }
+    )
+
+    result = _run(
+        runtime.probe_cards(
+            max_cards=10,
+            viewport_only=True,
+            include_buttons=True,
+            query="book",
+        )
+    )
+
+    runtime.ensure_runtime_ready.assert_called_once()
+    runtime._code_executor.assert_called_once()
+    assert result["ok"] is True
+    assert result["url"] == "https://books.toscrape.com/"
+    assert result["cards"][0]["title"] == "Book"
+    assert result["cards"][0]["field_status"]["title"] == "present"
+    assert result["cards"][0]["field_status"]["rating"] == "missing"
+    assert result["cards"][0]["field_provenance"]["title"]["generation_id"] == "g0"
+    assert "id" not in result["cards"][0]
+    assert "selector_hint" not in result["cards"][0]
+    assert result["audit"]["raw_size_bytes"] > 0
+
+
+def test_runtime_probe_cards_handles_missing_code_executor() -> None:
+    runtime = _make_runtime()
+    runtime.ensure_runtime_ready = AsyncMock()
+    runtime._code_executor = None
+
+    result = _run(runtime.probe_cards())
+
+    assert result["ok"] is False
+    assert result["error"] == "browser_code_executor_not_ready"
+    assert result["cards"] == []
+
+
+def test_build_card_probe_js_keeps_normalization_simple() -> None:
+    js = build_card_probe_js(max_cards=10, viewport_only=True)
+
+    assert "const normalize = (value, limit = 180)" in js
+    assert "String(value || '')" in js
+    assert "repairCommonEncoding" not in js
+    assert "repairCommandEncoding" not in js
+    assert "normalizePriceValue" in js
+
+
+def test_build_card_probe_js_extracts_star_rating_classes() -> None:
+    js = build_card_probe_js(max_cards=10, viewport_only=True)
+
+    assert "ratingClassValue" in js
+    assert "Five stars" in js
+    assert "Three stars" in js
+    assert "One star" in js
+
+
+def test_build_card_probe_js_builds_deeper_selector_hints() -> None:
+    js = build_card_probe_js(max_cards=10, viewport_only=True)
+
+    assert "depth < 8" in js
+    assert "ol" in js
+    assert "ul" in js
+    assert "nth-of-type" in js
+
+
+def test_build_card_probe_js_prefers_better_nested_card_candidate() -> None:
+    js = build_card_probe_js(max_cards=10, viewport_only=True)
+
+    assert "conflictsWithExisting" in js
+    assert "itemBetter" in js
+    assert "selected.splice" in js
+
+
+def test_build_card_probe_js_does_not_return_repeated_simple_selector_early() -> None:
+    js = build_card_probe_js(max_cards=10, viewport_only=True)
+
+    assert "validateSelectorHint(el, simple)" in js
+    assert "sameSimple.length === 1" not in js
+
+
+def test_build_card_probe_js_validates_selector_hints_before_returning_them() -> None:
+    js = build_card_probe_js(max_cards=10, viewport_only=True)
+
+    assert "matches.length === 1 && matches[0] === el" in js
+    assert "selector_hint_validated" in js
+    assert "primary_link_selector_hint_validated" in js
+    assert "'navigate_primary_link'" in js
+
+
+def test_build_card_probe_js_button_extraction_ignores_viewport_for_card_children() -> None:
+    js = build_card_probe_js(max_cards=10, viewport_only=True)
+
+    assert "rect.width < 2 || rect.height < 2" in js
+    assert "style.visibility === 'hidden'" in js
+    assert "Number(style.opacity) === 0" in js
+
+
+def test_build_card_probe_js_accepts_site_profiles_and_selector_cache_records() -> None:
+    js = build_card_probe_js(
+        max_cards=10,
+        viewport_only=True,
+        site_profiles=[
+            {
+                "id": "test_shop",
+                "domains": ["example.com"],
+                "route_patterns": ["^/search"],
+                "card_container_selectors": [".product-card"],
+                "title_selectors": [".product-title"],
+                "price_selectors": [".product-price"],
+                "button_selectors": [".add-to-cart"],
+            }
+        ],
+        selector_cache_records=[
+            {
+                "domain": "example.com",
+                "route_signature": "/search",
+                "kind": "card_probe",
+                "selectors": {
+                    "card_container_selectors": [".cached-card"],
+                    "title_selectors": [".cached-title"],
+                },
+            }
+        ],
+    )
+
+    assert "site_profiles" in js
+    assert "selector_cache_records" in js
+    assert ".product-card" in js
+    assert ".cached-card" in js
+    assert "profile_ids" in js
+    assert "cache_records_used" in js
+
+
+def test_runtime_probe_cards_unwraps_result_field_and_records_cache(tmp_path, monkeypatch) -> None:
+    from openjiuwen.harness.tools.browser_move.playwright_runtime.site_profiles import (
+        BrowserSelectorCache,
+    )
+    import openjiuwen.harness.tools.browser_move.playwright_runtime.runtime as runtime_module
+
+    runtime = _make_runtime()
+    runtime.ensure_runtime_ready = AsyncMock()
+    runtime._code_executor = AsyncMock(
+        return_value={
+            "result": (
+                "### Result\n"
+                '{"ok": true, '
+                '"url": "https://books.toscrape.com/", '
+                '"profile_ids": ["books_to_scrape"], '
+                '"cache_records_used": 0, '
+                '"cards": ['
+                '{"id": "card_1", '
+                '"title": "A Light in the Attic", '
+                '"price": "51.77", '
+                '"rating": "Three stars", '
+                '"availability": "In stock", '
+                '"has_image": true, '
+                '"primary_link": "https://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html", '
+                '"text_preview": "A Light in the Attic Three stars 51.77 In stock Add to basket", '
+                '"selector_hint": "ol:nth-of-type(1) > li:nth-of-type(1) > article.product_pod:nth-of-type(1)", '
+                '"title_selector_hint": "article.product_pod:nth-of-type(1) > h3:nth-of-type(1) > a:nth-of-type(1)", '
+                '"price_selector_hint": "article.product_pod:nth-of-type(1) > div.product_price:nth-of-type(2) > p.price_color:nth-of-type(1)", '
+                '"rating_selector_hint": "article.product_pod:nth-of-type(1) > p.star-rating:nth-of-type(1)", '
+                '"primary_link_selector_hint": "article.product_pod:nth-of-type(1) > h3:nth-of-type(1) > a:nth-of-type(1)", '
+                '"buttons": [{"selector_hint": "article.product_pod:nth-of-type(1) > div.product_price:nth-of-type(2) > form:nth-of-type(1) > button.btn.btn-primary:nth-of-type(1)"}]'
+                "},"
+                '{"id": "card_2", '
+                '"title": "Tipping the Velvet", '
+                '"price": "53.74", '
+                '"rating": "One star", '
+                '"availability": "In stock", '
+                '"has_image": true, '
+                '"primary_link": "https://books.toscrape.com/catalogue/tipping-the-velvet_999/index.html", '
+                '"text_preview": "Tipping the Velvet One star 53.74 In stock Add to basket", '
+                '"selector_hint": "ol:nth-of-type(1) > li:nth-of-type(2) > article.product_pod:nth-of-type(1)", '
+                '"title_selector_hint": "article.product_pod:nth-of-type(1) > h3:nth-of-type(1) > a:nth-of-type(1)", '
+                '"price_selector_hint": "article.product_pod:nth-of-type(1) > div.product_price:nth-of-type(2) > p.price_color:nth-of-type(1)", '
+                '"rating_selector_hint": "article.product_pod:nth-of-type(1) > p.star-rating:nth-of-type(1)", '
+                '"primary_link_selector_hint": "article.product_pod:nth-of-type(1) > h3:nth-of-type(1) > a:nth-of-type(1)", '
+                '"buttons": [{"selector_hint": "article.product_pod:nth-of-type(1) > div.product_price:nth-of-type(2) > form:nth-of-type(1) > button.btn.btn-primary:nth-of-type(1)"}]'
+                "}]}"
+            )
+        }
+    )
+
+    cache = BrowserSelectorCache(tmp_path / "selector_cache.json")
+    monkeypatch.setattr(runtime_module, "get_selector_cache", lambda: cache)
+
+    result = _run(runtime.probe_cards())
+
+    assert result["ok"] is True
+    assert result["cards"][0]["title"] == "A Light in the Attic"
+
+    exported = cache.export_for_probe()
+    assert len(exported) == 1
+    assert exported[0]["domain"] == "books.toscrape.com"
+    assert exported[0]["success_count"] == 1
+    assert exported[0]["quality_score"] > 0
+
+
+def test_runtime_unwrap_mcp_result_field() -> None:
+    runtime = _make_runtime()
+
+    raw = {"result": '### Result\n{"ok": true, "cards": []}'}
+
+    assert runtime.unwrap_mcp_text_result(raw) == '### Result\n{"ok": true, "cards": []}'
+
+
+def test_build_card_probe_js_has_cache_first_diagnostics() -> None:
+    js = build_card_probe_js(
+        max_cards=10,
+        viewport_only=True,
+        selector_cache_records=[
+            {
+                "domain": "example.com",
+                "route_signature": "/search",
+                "kind": "card_probe",
+                "selectors": {
+                    "card_container_selectors": [".cached-card"],
+                    "title_selectors": [".cached-title"],
+                },
+                "quality_score": 0.9,
+            }
+        ],
+    )
+
+    assert "cacheSelectors" in js
+    assert "siteProfileSelectors" in js
+    assert "cachedCandidates" in js
+    assert "hasEnoughGoodCards(cachedCandidates)" in js
+    assert "selectorSource = 'cache'" in js
+    assert "cache_accepted" in js
+    assert "cache_rejection_reason" in js
+    assert "cache_candidate_count" in js
+    assert "cache_good_candidate_count" in js
+    assert "selector_source" in js
+    assert "cached_container_selectors" in js
+    assert "record.kind || 'card_probe'" in js
+
+
+def test_build_card_probe_js_filters_page_chrome_candidates() -> None:
+    js = build_card_probe_js(max_cards=10, viewport_only=True)
+
+    assert "looksLikePageChrome" in js
+    assert "fresh & fast" in js.lower()
+    assert "breadcrumb" in js
+    assert "navbar" in js
+
+
+def test_build_card_probe_js_uses_selectable_not_raw_scored() -> None:
+    js = build_card_probe_js(max_cards=10, viewport_only=True)
+
+    assert "const selectable = scored.filter" in js
+    assert "for (const item of selectable)" in js
+
+
+def test_build_card_probe_js_includes_table_and_list_row_selectors() -> None:
+    js = build_card_probe_js(max_cards=10, viewport_only=True)
+
+    assert "tbody > tr" in js
+    assert '[role="article"]' in js
+    assert '[role="row"]' in js
+    assert '[class*="article" i]' in js
+    assert '[class*="post" i]' in js
+    assert '[class*="result" i]' in js
+    assert '[class*="search-result" i]' in js
+    assert '[class*="list" i]' in js
+    assert '[class*="row" i]' in js
+
+
+def test_build_card_probe_js_extracts_article_metadata_fields() -> None:
+    js = build_card_probe_js(max_cards=10, viewport_only=True)
+
+    assert "extractAuthor" in js
+    assert "extractSource" in js
+    assert "extractSummary" in js
+    assert "author_selector_hint" in js
+    assert "source_selector_hint" in js
+    assert "summary_selector_hint" in js
+    assert '[class*="author" i]' in js
+    assert '[class*="summary" i]' in js
+    assert '[class*="snippet" i]' in js
+
+
+def test_runtime_probe_cards_records_rejected_cache_attempt(tmp_path, monkeypatch) -> None:
+    import json
+    from openjiuwen.harness.tools.browser_move.playwright_runtime.site_profiles import (
+        BrowserSelectorCache,
+    )
+    import openjiuwen.harness.tools.browser_move.playwright_runtime.runtime as runtime_module
+
+    cache_path = tmp_path / "selector_cache.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "records": [
+                    {
+                        "domain": "example.com",
+                        "route_signature": "/search",
+                        "kind": "card_probe",
+                        "selectors": {"card_container_selectors": [".old-card"]},
+                        "success_count": 2,
+                        "failure_count": 0,
+                        "quality_score": 0.8,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cache = BrowserSelectorCache(cache_path)
+    monkeypatch.setattr(runtime_module, "get_selector_cache", lambda: cache)
+
+    runtime = _make_runtime()
+    runtime.ensure_runtime_ready = AsyncMock()
+    runtime._code_executor = AsyncMock(
+        return_value={
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        '{"ok": true, '
+                        '"url": "https://example.com/search?q=mouse", '
+                        '"cache_records_used": 1, '
+                        '"cache_accepted": false, '
+                        '"cache_rejection_reason": "cache_validation_failed", '
+                        '"selector_source": "generic", '
+                        '"cards": []}'
+                    ),
+                }
+            ]
+        }
+    )
+
+    result = _run(runtime.probe_cards())
+
+    assert result["ok"] is True
+    exported = cache.export_for_probe()
+    assert exported[0]["failure_count"] == 1
+    assert exported[0]["last_failure_reason"] == "cache_validation_failed"
+
+
+def test_browser_probe_cards_prioritizes_article_links_over_author_links() -> None:
+    js = build_card_probe_js(max_cards=5, viewport_only=False)
+
+    assert "isAuthorProfileElement" in js
+    assert "isArticleLinkElement" in js
+    assert "a.block-title.so-item-report[href]" in js
+    assert "buttonArticleLink" in js

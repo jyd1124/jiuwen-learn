@@ -1,0 +1,318 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Resume journal — content-addressed by *structural call path*.
+
+Each ``agent()`` call is keyed by where it sits in the orchestration tree
+(``("call", k)`` / ``("par", k, i)`` / ``("pipe", k, i, s)`` / ``("wf", k,
+name)``), which is a deterministic, latency-independent function of the script
+— unlike a global entry counter, which reorders under ``pipeline`` streaming.
+The key answers "did this call's *position* change?"; a SHA-256 of ``prompt +
+opts + schema`` answers "did its *content* change?".
+
+Replay is purely content-addressed: a call is a cache **hit** iff its key is in
+the prior journal *and* its signature matches. No global "live latch" — the
+cascade is automatic, because a downstream prompt that embeds an upstream
+result changes its own signature once the upstream re-runs. This is both
+simpler and deterministic under concurrency.
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+from pathlib import Path
+from typing import Sequence
+
+import aiofiles
+
+
+def key_str(key: tuple) -> str:
+    """Serialise a structural path tuple to a stable string."""
+    return json.dumps(key, ensure_ascii=False)
+
+
+def _program_order(ks: str) -> list[int]:
+    """Sort coordinates that order journal records in script execution order.
+
+    Each path segment is ``[kind, ordinal, *sub_indices]`` (``("call", n)`` /
+    ``("par", k, branch)`` / ``("pipe", k, item, stage)`` / ``("wf", k, name)``).
+    The per-scope ``ordinal`` is assigned sequentially in program order, and the
+    sub-indices order children within a ``parallel`` / ``pipeline`` block — so the
+    flattened tuple of integer coordinates (kind label dropped, ``name`` skipped)
+    sorts records exactly the way the script ran, depth-first. This is
+    deterministic (ordinals do not depend on wall-clock or completion timing), so
+    the journal stays byte-stable across runs while reading top-to-bottom in
+    execution order.
+    """
+    coords: list[int] = []
+    try:
+        segs = json.loads(ks)
+    except (json.JSONDecodeError, TypeError):
+        return coords  # unparseable key → stable-ish at front; should not happen
+    for seg in segs:
+        for item in seg[1:]:  # drop kind (seg[0]); keep ordinal + integer sub-indices
+            if isinstance(item, int):
+                coords.append(item)
+    return coords
+
+
+def call_signature(
+    prompt: str,
+    opts: dict,
+    json_schema: dict | None,
+    history: Sequence[dict] | None = None,
+) -> str:
+    """SHA-256 over the call's *content* (prompt + identity opts + schema [+ history]).
+
+    ``history`` participates **only when non-empty**: a stateless ``agent()``
+    call (whose history is always empty) yields a byte-identical signature to
+    before this parameter existed, so worker resume is unaffected. A stateful
+    session turn folds its prior turns in, so a changed upstream turn cascades a
+    re-run of every turn that depends on it.
+
+    ``isolation`` participates **only when set**: omitting it yields the exact
+    legacy byte sequence (existing caches stay valid), while flipping a call
+    to ``isolation='worktree'`` re-keys it. Without this, editing a script to
+    add isolation to an already-cached call would resume-hit the old record
+    and silently skip the worktree the caller now asked for.
+
+    ``agent_template`` likewise participates only when set: the same prompt run by two experts is two calls.
+    """
+    identity = {k: opts.get(k) for k in ("label", "phase", "model")}
+    if opts.get("isolation"):
+        identity["isolation"] = opts["isolation"]
+    if opts.get("agent_type"):
+        identity["agent_type"] = opts["agent_type"]
+    if opts.get("builtin_model"):
+        identity["builtin_model"] = opts["builtin_model"]
+    if opts.get("effort"):
+        identity["effort"] = opts["effort"]
+    if opts.get("agent_template"):
+        identity["agent_template"] = opts["agent_template"]
+    parts = [
+        prompt,
+        json.dumps(identity, sort_keys=True, ensure_ascii=False),
+        json.dumps(json_schema, sort_keys=True, ensure_ascii=False),
+    ]
+    if history:
+        parts.append(json.dumps(list(history), sort_keys=True, ensure_ascii=False))
+    blob = "\x00".join(parts)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+class Journal:
+    """Content-addressed call cache with a crash-durable write-ahead log (WAL).
+
+    Two on-disk artifacts per run (the caller threads a per-run journal path
+    and its per-run WAL sidecar):
+
+    - The **journal** is the canonical, program-ordered snapshot of one run.
+      :meth:`save` writes it **atomically** (temp file + ``os.replace``) and
+      never touches the WAL, so it is crash-safe and safe to call repeatedly
+      (e.g. a mid-run checkpoint).
+    - The **WAL** is an append-only log: every freshly computed record is
+      appended the instant it is produced, so a mid-run process crash (no
+      chance to commit) still leaves the completed work recoverable.
+      :meth:`load` replays the WAL over the journal (WAL wins — it is newer)
+      and tolerates a torn trailing line (a crash mid-append).
+
+    Invariant — **the WAL is never actively deleted**: it is a log, and like
+    any log it ages out (rolling retention), it is not truncated by finalize
+    or compaction. Cleanup is the whole-tree ``delete_team`` sweep; a future
+    rolling policy may retire old WAL files by age/size, never by run state.
+    """
+
+    def __init__(self, prior: dict[str, dict] | None = None, wal_path: str | None = None) -> None:
+        self.prior = prior or {}
+        # Records actually used this run (cache-hit -> reused prior; miss -> fresh).
+        self.used: dict[str, dict] = {}
+        # Append-only WAL path (per-run ``wal/{run_id}.wal`` in the swarmflow
+        # integration); None disables durability (e.g. the offline preview path
+        # that passes no journal_path). Never unlinked by the journal itself.
+        self._wal_path = wal_path
+        # Serialises WAL appends so concurrent parallel()/pipeline() completions
+        # never interleave on disk; held across the aiofiles write, so the event
+        # loop stays free while one append runs.
+        self._wal_lock = asyncio.Lock()
+
+    @property
+    def wal_path(self) -> str | None:
+        """WAL path this journal persists to; ``None`` means durability is off."""
+        return self._wal_path
+
+    @staticmethod
+    def _parse_records(text: str) -> "list[dict]":
+        """Parse JSONL into records, tolerating a torn trailing line.
+
+        A crash mid WAL-append can leave a partial final record; that line fails to
+        parse and is skipped — its call simply re-executes on the next run.
+        Accepts both call records (keyed by structural path) and run-level
+        records (``pause`` / ``seal``), which carry a synthetic key of the form
+        ``__run__:{type}:{run_id}`` so they round-trip through ``load``.
+        """
+        records: list[dict] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(rec, dict) and "key" in rec:
+                records.append(rec)
+        return records
+
+    @classmethod
+    async def load(
+        cls,
+        path: str | None,
+        wal_path: str | None = None,
+        legacy_path: str | None = None,
+    ) -> "Journal":
+        """Load prior records, replaying the run's WAL on top (WAL is newer).
+
+        Reads the canonical journal first, then overlays this run's WAL — so if
+        the journal is missing or incomplete (a pause, a crash before save),
+        the WAL's records still seed ``prior`` (last record wins across both
+        sources). ``legacy_path`` (the pre-per-run shared ``journal.jsonl``)
+        and its ``.wal`` sidecar are read FIRST and only seed ``prior`` —
+        new records still append to the per-run WAL only, so an upgraded
+        session never writes the frozen legacy file. Reads are async
+        (``aiofiles``) so they never stall the shared event loop. The WAL
+        itself is left untouched: it is an append-only log that is never
+        actively cleaned (see the class docstring).
+        """
+        legacy_sources: tuple[str, ...] = ()
+        if legacy_path:
+            legacy_sources = (legacy_path, f"{legacy_path}.wal")
+        prior: dict[str, dict] = {}
+        for src in (*legacy_sources, path, wal_path):
+            if not (src and Path(src).exists()):
+                continue
+            async with aiofiles.open(src, "r", encoding="utf-8") as f:
+                text = await f.read()
+            for rec in cls._parse_records(text):
+                prior[rec["key"]] = rec  # last record wins (WAL overlays journal)
+        return cls(prior, wal_path=wal_path)
+
+    def get_cached(self, ks: str, sig: str, run_id: str | None = None) -> dict | None:
+        """Return the cached record if both ``sig`` and ``run_id`` match.
+
+        ``run_id`` is an independent isolation key (NOT folded into the sig hash):
+        two runs of the same script with the same prompt produce the same ``sig``,
+        but a record written under ``run_id="A"`` must not be served to
+        ``run_id="B"``. A legacy record with no ``run_id`` field (``None``) never
+        matches a run that carries a non-``None`` ``run_id`` — it naturally misses
+        without error.
+
+        When ``run_id`` is ``None`` (the caller omits it), the old sig-only
+        behaviour holds for back-compat (e.g. callers not yet threaded through).
+        """
+        rec = self.prior.get(ks)
+        if rec is None or rec.get("sig") != sig:
+            return None
+        # run_id isolation: a non-None query run_id must equal the record's
+        # run_id. A record missing run_id (None) and a non-None query miss.
+        if run_id is not None and rec.get("run_id") != run_id:
+            return None
+        return rec
+
+    def find_run_record(self, run_id: str, record_type: str) -> dict | None:
+        """Find the latest record of ``record_type`` (``"pause"`` / ``"seal"``) for ``run_id``.
+
+        Used to recover budget state on resume (pause record) or detect a
+        terminal prior run (seal record → force a fresh run_id on relaunch).
+        Returns the last match in insertion order (WAL overlay semantics: a
+        later record of the same type supersedes an earlier one). ``None`` when
+        no such record exists (first run, or a different run_id).
+        """
+        found = None
+        for rec in self.prior.values():
+            if rec.get("run_id") == run_id and rec.get("type") == record_type:
+                found = rec  # last one wins (dict iteration = insertion order)
+        return found
+
+    async def use(self, ks: str, record: dict) -> None:
+        """Record a used result, durably appending FRESH ones to the WAL first.
+
+        A cache hit reuses the very prior object (already durable in the journal /
+        old WAL), so only a fresh record is appended — the ``is`` identity check is
+        the same one ``hits`` uses. The append is awaited so the WAL is durable
+        before the call proceeds.
+        """
+        if self.prior.get(ks) is not record:
+            await self._append_wal(record)
+        self.used[ks] = record
+
+    async def write_run_record(self, run_id: str, record_type: str, payload: dict) -> None:
+        """Write a run-level record (``pause`` / ``seal``) to the journal + WAL.
+
+        Unlike call records, these carry no structural call path — they are a
+        run-wide snapshot keyed by a synthetic path ``[["__run__", ord,
+        record_type, run_id]]``. A high ordinal (``sys.maxsize``) sorts them after every call
+        in program order, so they land at the tail of a saved journal exactly
+        where a terminal/mid-run snapshot belongs. ``payload`` is merged onto the
+        ``type`` / ``run_id`` envelope before persistence.
+        """
+        import sys
+        ks = key_str([["__run__", sys.maxsize, record_type, run_id]])
+        rec = {"key": ks, "type": record_type, "run_id": run_id, **payload}
+        await self._append_wal(rec)
+        self.used[ks] = rec
+        # Also surface in ``prior`` so same-run lookups (find_run_record) see it
+        # without a reload — matching how cache-hit call records live in both.
+        self.prior[ks] = rec
+
+    async def _append_wal(self, record: dict) -> None:
+        """Durably append one fresh record to the WAL (crash-safe checkpoint).
+
+        Async file I/O (``aiofiles``) keeps the write off the event loop; the lock
+        serialises concurrent appends so parallel()/pipeline() completions never
+        interleave on disk.
+        """
+        if not self._wal_path:
+            return
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        async with self._wal_lock:
+            async with aiofiles.open(self._wal_path, "a", encoding="utf-8") as f:
+                await f.write(line)
+                await f.flush()
+
+    async def save(self, path: str) -> None:
+        """Atomically write the program-ordered journal snapshot (does NOT touch the WAL).
+
+        Ordered by structural program order (not key string / completion time): the
+        file reads top-to-bottom in execution order yet stays byte-stable across
+        runs, since ordinals are deterministic regardless of concurrency timing.
+
+        Crash-safe: writes a temp file (async) then ``os.replace`` (atomic same-dir
+        rename — a fast metadata syscall), so a crash mid-write leaves either the
+        previous journal or the new one, never a torn file. Pure write with no
+        destructive side effect, so it is safe to call repeatedly (e.g. a mid-run
+        checkpoint).
+        """
+        lines = [json.dumps(self.used[k], ensure_ascii=False) for k in sorted(self.used, key=_program_order)]
+        body = ("\n".join(lines) + "\n") if lines else ""
+        tmp = f"{path}.tmp"
+        async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
+            await f.write(body)
+            await f.flush()
+        os.replace(tmp, path)
+
+    async def finalize(self, path: str) -> None:
+        """Terminal commit: snapshot the journal. The WAL is kept.
+
+        Call ONLY when the workflow has fully completed. The WAL is an
+        append-only log that is never actively deleted (see the class
+        docstring) — cleanup is the whole-tree ``delete_team`` sweep, or a
+        future log-rolling policy, never a per-run unlink.
+        """
+        await self.save(path)
+
+    # --- stats helpers (for tests / CLI) ---
+    @property
+    def hits(self) -> int:
+        return sum(1 for k, r in self.used.items() if self.prior.get(k) is r)

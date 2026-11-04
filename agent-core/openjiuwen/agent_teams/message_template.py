@@ -1,0 +1,560 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Two-phase rendering for framework-templated team messages (F_63).
+
+A scheduler handoff is *sent* as an intent and *rendered* at delivery:
+
+* **send time** — the scheduler writes a mailbox row whose ``content`` is
+  empty and whose ``meta`` column carries a template key plus its data
+  bindings (``refs`` to table rows, ``params`` for transient values).
+* **delivery time** — this module loads the markdown template in the
+  recipient's language, resolves every ``{{namespace.field}}`` against the
+  *current* task / member rows, and hands the harness one coherent document.
+
+Storing a reference instead of a snapshot buys three things: the task body
+lives in exactly one place (the task table), a later ``update_task`` is
+visible to messages already queued, and the message history stays readable
+instead of carrying N copies of a task brief.
+
+The placeholder contract:
+
+* one syntax, ``{{ns.field}}``, resolved in a single ``re.sub`` pass — the
+  substituted values are **never rescanned**, so LLM-authored task text
+  containing ``{{...}}`` cannot inject placeholders;
+* namespaces declare an explicit field whitelist (no ``getattr``
+  passthrough) so a new DB column never silently leaks into a prompt;
+* an unknown namespace / field / missing row renders as ``<missing:ns.field>``
+  rather than raising — lazy-safe, in the spirit of the error system's
+  message rendering.
+
+Templates are code assets under ``prompts/<lang>/<key>.md``, never stored in
+the DB: a reworded template takes effect immediately for messages already
+queued, and a half-rendered ``{{...}}`` string can never reach a reader.
+"""
+
+from __future__ import annotations
+
+import difflib
+import json
+import re
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
+
+from openjiuwen.agent_teams.prompts.loader import TemplateLoader, load_template
+from openjiuwen.agent_teams.schema.task import REVISION_DIFF_MIN_CHARS
+from openjiuwen.agent_teams.tools.database.graph import stale_against
+from openjiuwen.core.common.logging import team_logger
+
+# Async row lookups the expansion needs. Narrow callables rather than a DB
+# handle: the two delivery sites (in-process mailbox drain, external inbox)
+# reach their rows through different objects, and tests fake them in one line.
+TaskGetter = Callable[[str], Awaitable[Any]]
+MemberGetter = Callable[[str], Awaitable[Any]]
+# ``(upstream_rows, downstream_rows)`` of the referenced task: the tasks it
+# depends on and the tasks that depend on it. Optional — a delivery site
+# without it renders the briefs as "none" (F_118 / D7).
+TaskLinksGetter = Callable[[str], Awaitable[tuple[list[Any], list[Any]]]]
+# ``(task_id, revision) -> body | None``: the snapshot of a task body at one
+# revision (F_129 / D9). Optional — without it no diff is rendered.
+RevisionSnapshotGetter = Callable[[str, int], Awaitable[str | None]]
+# ``task_id -> subtask rows`` (F_129 / D5). Optional — without it the
+# subtask brief renders as "none".
+SubtasksGetter = Callable[[str], Awaitable[list[Any]]]
+
+_PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-z_]+)\.([a-z_]+)\s*\}\}")
+_BLANK_RUN_RE = re.compile(r"\n{3,}")
+
+_REF_TASK = "task"
+_REF_MEMBER = "member"
+_NS_PARAM = "param"
+
+
+def _task_reviewers(task: Any) -> str:
+    return ", ".join(task.reviewers())
+
+
+def _task_max_rounds(task: Any) -> str:
+    return "" if task.max_review_rounds is None else str(task.max_review_rounds)
+
+
+# Field whitelists. A namespace resolver maps a whitelisted field name to a
+# reader over the row — never a raw getattr, so adding a DB column does not
+# widen the prompt surface by accident.
+_TASK_FIELDS: dict[str, Callable[[Any], str]] = {
+    "task_id": lambda task: str(task.task_id),
+    "title": lambda task: task.title or "",
+    "content": lambda task: task.content or "",
+    "status": lambda task: str(task.status),
+    "assignee": lambda task: task.assignee or "",
+    "reviewer": _task_reviewers,
+    "review_round": lambda task: str(task.review_round),
+    "max_review_rounds": _task_max_rounds,
+    "revision": lambda task: str(getattr(task, "revision", 0) or 0),
+}
+
+# Computed task fields (F_118 / D7): one line per linked task, resolved at
+# delivery time like every other ``task.*`` value. The upstream line carries
+# the author's completion summary (F_119); the full detail stays one
+# ``view_task(action='note')`` call away.
+_TASK_LINK_FIELDS = ("upstream_brief", "downstream_brief")
+
+_NONE_PHRASE = {"cn": "无", "en": "none"}
+
+# Revision fields (F_129): what changed since the revision the assignee last
+# saw. Each renders a whole section, heading included, or "" when there is
+# nothing to say — a template drops the section by leaving the slot empty.
+_REVISION_FIELDS = ("change_notes", "revision_diff", "subtask_brief")
+
+_CHANGE_NOTES_HEADING = {"cn": "## 修改说明", "en": "## What changed"}
+_DIFF_HEADING = {
+    "cn": "## 与你上次看到的版本相比（仅作定位，以完整内容为准）",
+    "en": "## Compared with the version you last saw (a locator only — the full content is authoritative)",
+}
+_STALE_MARK = {"cn": "需复核", "en": "needs review"}
+# Context lines around each changed region of a revision diff (D9).
+_DIFF_CONTEXT_LINES = 2
+
+_UPSTREAM_NOTE_HINT = {
+    "cn": "需要某个上游任务的详细完成说明时，用 `view_task(action='note', task_id=...)` 查看。",
+    "en": "For an upstream task's full completion note, call `view_task(action='note', task_id=...)`.",
+}
+
+# Rendered length ceiling of a completion summary (F_119). The stored value is
+# never cut; only lightweight renderings (digests, briefs) are.
+SUMMARY_RENDER_LIMIT = 200
+
+
+def completion_summary(task: Any) -> str:
+    """Render a task's completion summary as one bounded line.
+
+    Falls back to the first non-empty line of the completion note when the
+    author gave no summary. Line breaks are folded into spaces and the result
+    is cut to ``SUMMARY_RENDER_LIMIT`` characters with a trailing ``…``.
+
+    Args:
+        task: A task row (or any object with ``summary`` / ``note``).
+
+    Returns:
+        The one-line summary, or ``""`` when the task has neither field.
+    """
+    text = (getattr(task, "summary", None) or "").strip()
+    if not text:
+        note = getattr(task, "note", None) or ""
+        text = next((line.strip() for line in note.splitlines() if line.strip()), "")
+    text = " ".join(text.split())
+    if len(text) > SUMMARY_RENDER_LIMIT:
+        return text[:SUMMARY_RENDER_LIMIT] + "…"
+    return text
+
+
+def completion_summary_truncated(task: Any) -> bool:
+    """Whether :func:`completion_summary` had to drop part of the task's text.
+
+    True when the rendered line is cut, or when it fell back to the note while
+    the note has more than its first line.
+    """
+    summary = " ".join((getattr(task, "summary", None) or "").split())
+    if summary:
+        return len(summary) > SUMMARY_RENDER_LIMIT
+    note_lines = [line for line in (getattr(task, "note", None) or "").splitlines() if line.strip()]
+    if not note_lines:
+        return False
+    return len(note_lines) > 1 or len(" ".join(note_lines[0].split())) > SUMMARY_RENDER_LIMIT
+
+
+def _task_line(task: Any, *, with_summary: bool) -> str:
+    parts = [f"{task.task_id} · {task.title or ''}"]
+    if task.assignee:
+        parts.append(f"· {task.assignee}")
+    summary = completion_summary(task) if with_summary else ""
+    if summary:
+        parts.append(f"· {summary}")
+    return " ".join(parts)
+
+
+def upstream_lines(upstream: list[Any]) -> list[str]:
+    """One bullet per upstream task: ``- task_id · title · assignee · <completion summary>``.
+
+    Args:
+        upstream: Upstream task rows (the task's direct dependencies).
+
+    Returns:
+        The bullet lines, empty when there is no upstream task.
+    """
+    return [f"- {_task_line(task, with_summary=True)}" for task in upstream]
+
+
+def upstream_brief(upstream: list[Any], language: str = "cn") -> str:
+    """Render one line per upstream task with its completion summary.
+
+    Only the summary is rendered; a closing line points to
+    ``view_task(action='note')`` for the full detail.
+
+    Args:
+        upstream: Upstream task rows (the task's direct dependencies).
+        language: Rendering language of the closing hint ('cn' or 'en').
+
+    Returns:
+        The bullet lines plus the hint, or ``""`` when there is no upstream task.
+    """
+    lines = upstream_lines(upstream)
+    if not lines:
+        return ""
+    lines.append(_UPSTREAM_NOTE_HINT.get(language, _UPSTREAM_NOTE_HINT["en"]))
+    return "\n".join(lines)
+
+
+def _task_briefs(upstream: list[Any], downstream: list[Any], language: str) -> dict[str, str]:
+    none = _NONE_PHRASE.get(language, _NONE_PHRASE["en"])
+    up = upstream_brief(upstream, language) or none
+    down = "\n".join(f"- {_task_line(task, with_summary=False)}" for task in downstream) or none
+    return {"upstream_brief": up, "downstream_brief": down}
+
+
+_MEMBER_FIELDS: dict[str, Callable[[Any], str]] = {
+    "member_name": lambda member: str(member.member_name),
+    "display_name": lambda member: member.display_name or "",
+    "desc": lambda member: member.desc or "",
+}
+
+
+class RefUnresolved(Exception):
+    """A row named by ``meta.refs`` could not be fetched.
+
+    Distinct from a placeholder the namespaces cannot answer: a missing
+    *field* is a template bug and renders inline as ``<missing:ns.field>``,
+    while a missing *row* (task cancelled and swept, member removed) means the
+    document has no subject at all — the delivery degrades to the fallback
+    line instead of shipping a brief full of holes.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class ExpandedMessage:
+    """The text to deliver for one message row.
+
+    Attributes:
+        body: The rendered document (templated messages) or the sender's
+            original content (ordinary messages).
+        is_template: Whether the row carried a framework template. Delivery
+            sites use it to drop the reply hint — a framework instruction is
+            answered with a tool call, not a reply.
+    """
+
+    body: str
+    is_template: bool
+    # ``(task_id, revision)`` when the document showed that task's content
+    # (F_129): the delivery site records it as seen by the assignee.
+    shown_revision: tuple[str, int] | None = None
+
+
+def parse_meta(raw: Any) -> dict | None:
+    """Parse the ``meta`` column into a template descriptor, or None.
+
+    Returns None for rows without meta, for malformed JSON, and for meta
+    without a ``template`` key — all of which mean "an ordinary message,
+    render ``content`` verbatim".
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        meta = json.loads(raw)
+    except (ValueError, TypeError):
+        team_logger.warning("[message_template] malformed meta, treating as a plain message")
+        return None
+    if not isinstance(meta, dict) or not meta.get("template"):
+        return None
+    return meta
+
+
+def build_meta(template: str, *, refs: dict[str, str] | None = None, params: dict[str, str] | None = None) -> dict:
+    """Assemble a delivery payload for one templated message.
+
+    Args:
+        template: Template key, i.e. the ``prompts/<lang>/<key>.md`` basename.
+        refs: Row bindings resolved *at delivery* — ``{"task": task_id}`` and
+            ``{"member": member_name}``. Anything a table can answer belongs
+            here, so the reader sees current truth rather than a snapshot.
+        params: Transient scalars a table cannot answer (e.g. an aggregated
+            reviewer feedback block), frozen at send time.
+    """
+    meta: dict[str, Any] = {"template": template}
+    if refs:
+        meta["refs"] = refs
+    if params:
+        meta["params"] = {key: str(value) for key, value in params.items()}
+    return meta
+
+
+def fallback_line(meta: dict) -> str:
+    """Synthesize a one-line stand-in when expansion fails.
+
+    Deliberately not a stored copy: the template key and the task id in meta
+    are all a reader needs to recover (``view_task`` fills in the rest), so a
+    healthy delivery pays nothing for a fallback that almost never runs.
+    """
+    template = meta.get("template") or "?"
+    task_id = (meta.get("refs") or {}).get(_REF_TASK)
+    if task_id:
+        return f"[{template}] task_id={task_id} — details unavailable, call view_task for the task."
+    return f"[{template}] — details unavailable."
+
+
+async def expand_message(
+    msg: Any,
+    *,
+    task_getter: TaskGetter,
+    member_getter: MemberGetter,
+    language: str,
+    loader: TemplateLoader = load_template,
+    task_links_getter: TaskLinksGetter | None = None,
+    revision_snapshot_getter: RevisionSnapshotGetter | None = None,
+    subtasks_getter: SubtasksGetter | None = None,
+) -> ExpandedMessage:
+    """Render one message row into the text to deliver.
+
+    Ordinary messages pass through untouched. A templated message loads its
+    markdown in ``language``, resolves the placeholders against the rows named
+    by ``meta.refs``, and returns the document; any failure (template gone,
+    task row deleted, unreadable meta) degrades to ``fallback_line`` so a
+    delivery never dies on a rendering problem.
+
+    ``loader`` lets a team handler bind its per-team workspace cache at
+    construction — scheduler_* templates then read evolved workspace
+    values; the default stays framework read-only.
+    """
+    meta = parse_meta(getattr(msg, "meta", None))
+    if meta is None:
+        return ExpandedMessage(body=msg.content, is_template=False)
+    try:
+        template = loader(str(meta["template"]), language)
+        # The link briefs cost extra queries; only pay for them when this
+        # template actually renders one (today: the task-start handoffs).
+        links_wanted = any(f"task.{field}" in template.content for field in _TASK_LINK_FIELDS)
+        revision_wanted = {field for field in _REVISION_FIELDS if f"task.{field}" in template.content}
+        values, task = await _resolve_namespaces(
+            meta,
+            task_getter=task_getter,
+            member_getter=member_getter,
+            task_links_getter=task_links_getter if links_wanted else None,
+            language=language,
+        )
+        if task is not None and revision_wanted:
+            values[_REF_TASK].update(
+                await _revision_fields(
+                    task,
+                    revision_wanted,
+                    language=language,
+                    revision_snapshot_getter=revision_snapshot_getter,
+                    subtasks_getter=subtasks_getter,
+                )
+            )
+        body = _substitute(template.content, values)
+        if revision_wanted:
+            # An empty revision section leaves its blank lines behind; fold them.
+            body = _BLANK_RUN_RE.sub("\n\n", body).strip()
+        shown = None
+        if task is not None and "task.content" in template.content:
+            shown = (str(task.task_id), int(getattr(task, "revision", 0) or 0))
+        return ExpandedMessage(body=body, is_template=True, shown_revision=shown)
+    except Exception:
+        team_logger.warning(
+            "[message_template] expansion of template %s failed, delivering the fallback line",
+            meta.get("template"),
+            exc_info=True,
+        )
+        return ExpandedMessage(body=fallback_line(meta), is_template=True)
+
+
+async def _resolve_namespaces(
+    meta: dict,
+    *,
+    task_getter: TaskGetter,
+    member_getter: MemberGetter,
+    task_links_getter: TaskLinksGetter | None = None,
+    language: str = "cn",
+) -> tuple[dict[str, dict[str, str]], Any]:
+    """Fetch the referenced rows and project them onto the whitelists.
+
+    Returns the values and the referenced task row (``None`` without one).
+
+    Raises:
+        RefUnresolved: A referenced row is gone; the caller degrades to the
+            fallback line rather than render a document without its subject.
+    """
+    refs = meta.get("refs") or {}
+    params = meta.get("params") or {}
+    values: dict[str, dict[str, str]] = {_NS_PARAM: {key: str(value) for key, value in params.items()}}
+
+    task = None
+    task_id = refs.get(_REF_TASK)
+    if task_id:
+        task = await task_getter(str(task_id))
+        if task is None:
+            raise RefUnresolved(f"task {task_id} not found")
+        values[_REF_TASK] = {field: read(task) for field, read in _TASK_FIELDS.items()}
+        upstream, downstream = await task_links_getter(str(task_id)) if task_links_getter else ([], [])
+        values[_REF_TASK].update(_task_briefs(upstream, downstream, language))
+
+    member_name = refs.get(_REF_MEMBER)
+    if member_name:
+        member = await member_getter(str(member_name))
+        if member is None:
+            raise RefUnresolved(f"member {member_name} not found")
+        values[_REF_MEMBER] = {field: read(member) for field, read in _MEMBER_FIELDS.items()}
+
+    return values, task
+
+
+def unseen_change_notes(task: Any) -> list[dict]:
+    """Edit notes of the revisions the assignee has not seen yet, in order (F_129 / D8)."""
+    try:
+        notes = json.loads(getattr(task, "change_notes", None) or "[]")
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(notes, list):
+        return []
+    observed = int(getattr(task, "observed_revision", 0) or 0)
+    current = int(getattr(task, "revision", 0) or 0)
+    unseen = [note for note in notes if isinstance(note, dict) and observed < int(note.get("revision") or 0) <= current]
+    return sorted(unseen, key=lambda note: int(note.get("revision") or 0))
+
+
+def change_notes_lines(task: Any) -> list[str]:
+    """One bullet per unseen edit note: ``- r<N> (<by>): <note>``."""
+    lines = []
+    for note in unseen_change_notes(task):
+        by = f" ({note['by']})" if note.get("by") else ""
+        lines.append(f"- r{note.get('revision')}{by}: {note.get('note', '')}")
+    return lines
+
+
+def revision_diff(previous: str, current: str) -> str:
+    """Line diff between two task bodies (F_129 / D9), ``""`` when identical."""
+    lines = difflib.unified_diff(
+        previous.splitlines(),
+        current.splitlines(),
+        lineterm="",
+        n=_DIFF_CONTEXT_LINES,
+    )
+    return "\n".join(line for line in lines if not line.startswith(("---", "+++")))
+
+
+async def _revision_fields(
+    task: Any,
+    wanted: set[str],
+    *,
+    language: str,
+    revision_snapshot_getter: RevisionSnapshotGetter | None,
+    subtasks_getter: SubtasksGetter | None,
+) -> dict[str, str]:
+    """Render the requested F_129 sections; each is ``""`` when empty."""
+    out: dict[str, str] = {}
+    if "change_notes" in wanted:
+        lines = change_notes_lines(task)
+        heading = _CHANGE_NOTES_HEADING.get(language, _CHANGE_NOTES_HEADING["en"])
+        out["change_notes"] = "\n".join([heading, "", *lines]) if lines else ""
+    if "revision_diff" in wanted:
+        out["revision_diff"] = await _revision_diff_section(task, language, revision_snapshot_getter)
+    if "subtask_brief" in wanted:
+        rows = await subtasks_getter(str(task.task_id)) if subtasks_getter else []
+        out["subtask_brief"] = subtask_brief(rows, int(task.revision or 0), language)
+    return out
+
+
+async def _revision_diff_section(task: Any, language: str, getter: RevisionSnapshotGetter | None) -> str:
+    observed = int(getattr(task, "observed_revision", 0) or 0)
+    current = task.content or ""
+    if getter is None or observed >= int(task.revision or 0):
+        return ""
+    previous = await getter(str(task.task_id), observed)
+    if previous is None or max(len(previous), len(current)) < REVISION_DIFF_MIN_CHARS:
+        return ""
+    diff = revision_diff(previous, current)
+    if not diff:
+        return ""
+    heading = _DIFF_HEADING.get(language, _DIFF_HEADING["en"])
+    return f"{heading}\n\n```diff\n{diff}\n```"
+
+
+def subtask_brief(subtasks: list[Any], parent_revision: int, language: str = "cn") -> str:
+    """One bullet per subtask: ``- id · title · assignee · status`` plus a stale mark (F_129 / D5)."""
+    if not subtasks:
+        return _NONE_PHRASE.get(language, _NONE_PHRASE["en"])
+    mark = _STALE_MARK.get(language, _STALE_MARK["en"])
+    lines = []
+    for row in subtasks:
+        line = f"- {_task_line(row, with_summary=False)} · {row.status}"
+        stale = stale_against(row, parent_revision)
+        if stale:
+            line += f" · [{mark}: r{stale[1]} → r{stale[0]}]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+async def task_links(db: Any, task_id: str) -> tuple[list[Any], list[Any]]:
+    """Fetch ``(upstream_rows, downstream_rows)`` of ``task_id`` from a ``TeamDatabase``.
+
+    The one DB-shaped helper both delivery sites (in-process drain, external
+    inbox) bind as ``task_links_getter``, so the two never drift on which
+    rows a brief shows. Rows whose task was swept are simply absent.
+    """
+    deps = await db.task.get_task_dependencies(task_id)
+    upstream_ids = [dep.depends_on_task_id for dep in deps]
+    downstream_ids = await db.task.get_dependent_task_ids(task_id)
+    rows = {row.task_id: row for row in await db.task.get_tasks_by_ids(list({*upstream_ids, *downstream_ids}))}
+    upstream = [rows[tid] for tid in upstream_ids if tid in rows]
+    downstream = [rows[tid] for tid in downstream_ids if tid in rows]
+    return upstream, downstream
+
+
+def revision_getters(db: Any, team_name: str) -> tuple[RevisionSnapshotGetter, SubtasksGetter]:
+    """The F_129 getters both delivery sites bind, over a ``TeamDatabase``."""
+
+    async def _snapshot(task_id: str, revision: int) -> str | None:
+        return await db.task.get_revision_snapshot(team_name, task_id, revision)
+
+    async def _subtasks(task_id: str) -> list[Any]:
+        return await db.task.get_subtasks(team_name, task_id)
+
+    return _snapshot, _subtasks
+
+
+def _substitute(template: str, values: dict[str, dict[str, str]]) -> str:
+    """Replace every ``{{ns.field}}`` in one pass (values are never rescanned)."""
+
+    def _replace(match: re.Match[str]) -> str:
+        namespace, field = match.group(1), match.group(2)
+        resolved = values.get(namespace, {}).get(field)
+        if resolved is None:
+            return f"<missing:{namespace}.{field}>"
+        return resolved
+
+    return _PLACEHOLDER_RE.sub(_replace, template)
+
+
+__all__ = [
+    "ExpandedMessage",
+    "MemberGetter",
+    "RefUnresolved",
+    "RevisionSnapshotGetter",
+    "SubtasksGetter",
+    "SUMMARY_RENDER_LIMIT",
+    "TaskGetter",
+    "TaskLinksGetter",
+    "build_meta",
+    "completion_summary",
+    "completion_summary_truncated",
+    "expand_message",
+    "fallback_line",
+    "parse_meta",
+    "change_notes_lines",
+    "revision_diff",
+    "revision_getters",
+    "subtask_brief",
+    "task_links",
+    "unseen_change_notes",
+    "upstream_brief",
+    "upstream_lines",
+]

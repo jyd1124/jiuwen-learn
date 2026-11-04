@@ -1,0 +1,60 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""转发别名（auth 拆分过渡）：远端 auth 配置（登录模型集合）真源已迁 ``gateway.auth.remote_config``。
+
+server/agents 侧消费方经本路径取用（拍板 #10 方向：母仓反向依赖
+gateway 仓）；B3 拆仓时随 shim 收敛退役。
+"""
+
+from gateway.auth.remote_config import *  # noqa: F401,F403
+from gateway.auth.remote_config import (  # noqa: F401
+    Any,
+    CONFIG_URL_ENV,
+    DEFAULT_CONFIG_URL,
+    GatewaySettings,
+    LOGIN_SECTION_SUFFIX,
+    LoginSection,
+    Mapping,
+    ModelFilters,
+    REQUEST_TIMEOUT_S,
+    RemoteConfig,
+    _DISABLED_VALUES,
+    _RETRY_AFTER_FAILURE_S,
+    _RETRY_BACKOFF_MAX_S,
+    _RETRY_JITTER,
+    _VERSION_KEY,
+    _as_str_set,
+    _background_refreshing,
+    _backoff,
+    _cached,
+    _fetch,
+    _fetch_lock,
+    _fetch_once,
+    _last_failure_at,
+    _lock,
+    _login_sections,
+    _normalize_base_url,
+    _record_failure,
+    _refresh_in_background,
+    _reset_backoff,
+    _retry_after_s,
+    _retry_base_s,
+    _snapshot,
+    _unwrap_version,
+    annotations,
+    config_url,
+    dataclass,
+    field,
+    get_config,
+    logger,
+    logging,
+    os,
+    parse_config,
+    random,
+    re,
+    requests_request,
+    set_config_for_test,
+    threading,
+    time,
+    warm_up_in_background,
+)

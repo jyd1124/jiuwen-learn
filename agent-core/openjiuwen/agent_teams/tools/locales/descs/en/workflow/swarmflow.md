@@ -1,0 +1,339 @@
+Run a swarmflow orchestration script (a multi-agent workflow) that orchestrates a fleet of worker subagents **deterministically**. The script spawns and coordinates those workers — to be **comprehensive** (decompose and cover in parallel), to be **confident** (verify with independent perspectives before concluding), or to take on **scale one context can't hold** (migrations, audits, deep research). The script is where you encode that structure: **what fans out, what verifies, what synthesizes**. This tool **returns immediately** with a run_id (the workflow runs asynchronously in the background); that run_id is the handle for a later `resume_id`, and phase progress plus the final result are fed back into your context automatically.
+
+## When to call / when not to
+This tool's presence means `enable_swarmflow` is on. Judge top-down by priority — **stop at the first match**:
+
+1. **User names `swarmflow` → force this tool**: however trivial the task, do not fall back to a direct answer or `build_team`. Sole exception: the request plainly cannot be done as a workflow.
+2. **Orchestration-intent words → use it directly**: `workflow` / orchestration / fan-out / multi-agent / thorough audit — use this tool unless the request plainly cannot be done as a workflow.
+3. **Trivial one-step request → answer directly**: a single agent can answer in one step and there are no team / multi-member / decomposition semantics (a one-line factual question, a one-line code edit, a single lookup) — orchestration's value is decomposition / parallelism / verification, not wrapping trivia in a workflow.
+4. **Clear result / deliverable → `swarmflow`**: document / report / plan / code / review feedback / research conclusion, etc. — choose this tool by deliverable intent even with no keywords at all. "Simple / single-round / no teammate-to-teammate talk" is no reason to fall back to `build_team`; counting off / relay tasks (**fixed participant count + sequential execution + fixed end condition**) or "create an N-person team" carry multi-member semantics and also go to `swarmflow` — don't let the word "team" pull you back.
+5. **Emergent collaboration → `build_team`**: the goal is mainly assembling a team, role interaction, open-ended discussion / debate, companion-style or persistent / HITT collaboration — members must autonomously communicate / negotiate, no fixed information-flow topology, unclear task DAG. Only then use the `build_team` / `create_task` / `spawn_teammate` task-collaboration flow.
+6. **Unsure → default to `swarmflow`** (cheaper, more controllable).
+
+The underlying test is collaboration nature: structure that **can be thought through up front and written as deterministic control flow** (known topology; fan-out / pipeline / verify / synthesize codable; control flow decided by code, not live member negotiation; one-shot workers) is `swarmflow` territory. Typical: parallel decomposition, adversarial verification, large-scale ranking, research, audits, root-cause, exploration, triage.
+
+> **Hybrid is best**: before orchestrating, scout inline first (list the relevant files, find the data sources, scope the diff) to discover the work-list, then have the script pipeline over it. You don't need to know the shape before the *task* — only before the *orchestration step*.
+
+## Common workflow shapes (chainable across turns)
+- **Understand**: parallel readers over relevant subsystems → a structured map.
+- **Design**: a judge panel of N independent approaches → scored synthesis.
+- **Review**: findings by dimension → adversarial verify (see skeleton below).
+- **Research**: multi-modal sweep → deep read → a synthesized, cited conclusion.
+- **Migrate**: discover sites → transform each (with `isolation='worktree'` when needed) → verify.
+
+Larger work can be **split into several scripts run in sequence** (start the next after one finishes), or staged within one script via `phase()`. Read each stage's result before deciding the next — you stay in the loop, and each script is one well-scoped fan-out.
+
+## Behavior contract (must follow)
+- This tool **returns immediately** (with a run_id) — the workflow runs asynchronously in the background; **do not poll** or call it repeatedly.
+- Phase progress arrives **automatically** as notifications in your context; when the workflow **completes or fails, the final result is fed back to you automatically** — no need to query.
+- You are a **spectator**: the script orchestrates all the workers itself. On each progress notification, relay it to the user in brief natural language; staying quiet between notifications is the normal state.
+- **Do not** spawn members, `create_task`, or orchestrate yourself — the script owns all orchestration; and do not rewrite a worker's intermediate results.
+
+## Script sources (one of) and args
+- `script` (**available today**): inline script source, no disk write needed. **Prefer it for simple cases** — pass the source straight in to run, skipping the file and iterating fastest.
+- `script_path` (**available today**): path to a script file on disk. Best for scripts already on disk (`swarmskill-creator` output, or ones you iterate / resume repeatedly).
+- `name` (interface in place, execution coming): a saved / named workflow, resolved to a self-contained script.
+- `resume_id`: a prior run's run_id; on its own = resume, combined with `action` = runtime control (pause/resume/stop).
+- `args`: a **string** argument passed to the script's `run(args)` (e.g. a question, a target path). For structured input, `json.loads(args)` inside the script.
+
+> **Pick a source by complexity**: for a simple task whose orchestration is obvious at a glance, **prefer inline `script`** and run it directly, or hand-write a minimal script file and use `script_path` — no need to involve `swarmskill-creator`. Only for complex work (multi-phase / multi-role / needing executable retry·degrade·budget constraints / meant to become a reusable skill) use the `swarmskill-creator` skill to author a script through its full develop-and-validate flow — **it produces a script file on disk, which you then run with `swarmflow(script_path=...)`** (don't re-inline the whole source into `script`).
+>
+> **Temp script files always go under the team workspace**: whenever you take the "write a script file first, then pass `script_path`" route (as opposed to inline `script` — which the framework materializes to disk for you, no file-writing needed), the script file MUST be written with `write_file` inside the **team workspace** (e.g. `swarmflow/<workflow-name>.py`), **not** to `/tmp` or any path outside the workspace — the team workspace keeps it visible to members, reusable, and cleaned up with the team lifecycle; then pass that in-workspace script path to `script_path`.
+>
+> **When to install a `swarmskill-creator`-authored script**: if you are **augmenting / modifying a script inside an existing swarmskill**, follow creator's normal flow. If you are **writing a brand-new script from scratch**, after writing the script file **do not** immediately generate and install the skill — first call this tool to run the workflow to completion, and once swarmflow finishes and you have the actual result, **ask the user whether to install it as a skill**; install only after they confirm. Don't freeze an un-run, unverified orchestration into a skill.
+>
+> **To iterate**: edit the script file on disk and re-invoke with the same `script_path` — no need to resend the source. If `swarmskill-creator` is unavailable, tell the user honestly rather than forcing the call or hand-writing one.
+>
+> `name` (saved / named workflow) is still not supported; a call today is rejected with an **explicit error** (never a silent no-op). `resume_id` is now supported (optionally combined with `action` for runtime control).
+
+## Script structure (Python)
+A script is a Python module: a top-level `META` (pure literal) plus `async def run(args)`, importing the primitives from `swarmflow`.
+
+```python
+from swarmflow import agent, agent_session, human, parallel, pipeline, map_parallel, phase, log, workflow, budget, compact
+
+META = {
+    "name": "deep-research",
+    "description": "one line, shown in the permission dialog",
+    "whenToUse": "what it's for (optional, shown in the workflow list)",
+    "phases": [{"title": "Search", "detail": "parallel retrieval"}, {"title": "Verify", "detail": "cross-check"}],  # title may be a plain string
+    # Add this line ONLY when the user explicitly gives a budget figure (see Budget);
+    # when the user gave none you MUST omit it:
+    # "workflow_token_limit": 200000,
+}
+
+async def run(args):
+    phase("Search")
+    hits = await agent(f"search: {args}", schema=HITS)
+    return {"answer": ...}  # the structured result IS the return value, fed back automatically
+```
+
+- `META` must be a **pure literal** — no variables, function calls, f-strings, or string concatenation (extracted statically at load time).
+- Required `name` / `description`; optional `whenToUse` (shown in the workflow list), `phases`, `workflow_token_limit` (the run's own token ceiling, a plain integer; **write it only when the user explicitly gives a budget figure — when they gave none you MUST omit it**; see Budget).
+- `phases[].title` must match the `phase()` calls exactly; a phase with no matching call forms its own progress group.
+- **Return-value semantics**: a worker is told its final text **IS** the return value (not a human-facing message), so it returns **raw data**. The value `run(args)` returns (usually a dict) is the workflow's final result, fed back to the caller automatically.
+
+## Orchestration primitives (`from swarmflow import ...`)
+- `await agent(prompt, *, schema=None, label=None, phase=None, options=None)` — spawn a one-shot worker subagent. Orchestration/identity params (`label` / `phase` / `schema`) are explicit; tuning and forward-compat params ride in the `options` bag (mirroring `agent_session().send`).
+  - No `schema` returns text; a JSON Schema dict returns a validated dict, a pydantic model returns a model instance (validation is at the tool-call layer, the model retries on mismatch); failure (retries exhausted / spawn cap hit) returns `None` — filter with `compact()`.
+  - `label` overrides the label shown in progress.
+  - `phase` explicitly assigns this `agent()` to a progress group — **inside** a `pipeline`/`parallel` stage, always pass `phase` explicitly to avoid racing on the global `phase()` state; the same `phase` string groups into the same box.
+  - `options` is the tuning / forward-compat bag (a dict); keys are whitelisted against the engine + backend option sets and an unknown key fails fast. Currently supported keys:
+    - `model` overrides this worker's model. **Default to omitting it** — a worker inherits the team's teammate model (almost always correct); set it only when you're highly confident a worker needs a different tier. **Third-party nodes (with `agent_type`, below)**: a name that hits the team model pool and is compatible with the CLI's protocol → runs on the pool endpoint; a name that is incompatible / not in the pool → **fails before launch** (the error lists the compatible pool models, plus the built-in names and a pointer to `builtin_model` when this CLI declares them). **All three model options (`model` / `builtin_model` / `effort`) empty** → the CLI uses its own default model on its own login. **No fallback**: environment problems like auth failures surface as `AGENT_FAILED` with the root cause and a workaround — edit the script and re-run, never silently swap to another model.
+    - `builtin_model` (third-party nodes only): pick a built-in model the CLI runs on its **own login** (e.g. a subscription); mutually exclusive with `model` (`model` runs a pool endpoint, `builtin_model` the CLI's login). Only the names this CLI declares are accepted — which kinds declare built-in models and which models they offer is listed in the `<builtin_model_catalog>` injected at the end of this tool description (absent when none is declared).
+    - `effort` (third-party nodes only): the reasoning effort of the chosen `builtin_model`, one of that model's `efforts`; **requires `builtin_model`**; omit to take its `default_effort`.
+    - `timeout` the per-call timeout in seconds for this worker. Agent path: a timeout counts as one failed attempt and is retried automatically (2 more attempts by default); when all attempts fail the agent fails and the script continues (the failure message carries the seconds). Human path: the wait limit for a human reply; a timeout is treated as "no answer" and skips that turn (no retry). Omit for no limit.
+
+    - `isolation='worktree'`: run the worker in a fresh git worktree, **EXPENSIVE** (~200-500ms setup + disk per worker), use **ONLY** when workers mutate files in parallel and would otherwise conflict; the worktree is auto-removed if unchanged. **Cache-hit replay does not recreate the worktree** — a resume/relaunch hit reuses the journal result and skips worker execution, so files the worker created inside its worktree will not reappear; deliver worker output via the return value (text/schema), never assume worktree files survive a replay. **Same-run_id resume reuses the worktree**: an interrupted `isolation` worker resumed after a pause continues in the very worktree it left behind (including its unfinished changes); adding/removing `isolation` on an already-cached call re-runs that call.
+    - `agent_type`: hand this node to a **third-party CLI agent** (`'claude'` / `'codex'`); accepted by both `agent()` and `agent_session()`. The value must be a CLI backend the engine supports **and** be on this team's third-party agent allowlist, otherwise the node fails outright (the error lists both sets). With `schema` it uses "prompt constraint + JSON parse": a CLI that returns no valid JSON counts as not submitted (`None` after retries). Model options follow the `model` / `builtin_model` / `effort` rules above (pool endpoint or the CLI's own login — **no fallback**); third-party turns are billed against the budget at turn end (worst case one turn of overspend). `agent_session` memory is per run: resuming the same run recovers context, a fresh run starts empty.
+    - `agent_template`: delegate this node to **a member of the AgentGroup bound to the current session** (bare member name, e.g. `'clip'`; no group prefix). The worker runs with that member's persona, capability snapshot, and access gates, and no longer inherits the teammate's general tools; accepted by both `agent()` and `agent_session()`; the session locks the member on the first real turn — to switch, use `fork()`. A name not in the expert table, `'leader'` (the Team Leader is not a worker), a name with `/`, simultaneous use with `agent_type`, or a member with an external runtime → fails before launch and lists the available member names. Omitting this key leaves all existing behaviour unchanged (a generic worker).
+- `await verify(reviewers, *, threshold=0.85, label=None, phase=None, options=None)` — run one **multi-reviewer acceptance round** on a deliverable and return a structured `VerifyResult` (`{verdict: "pass"|"fail"|None, votes, feedback, passed}`). Each reviewer is a parallel structured `agent()`: `verdict`-kind votes pass/fail (one-vote veto), `score`-kind votes 0–1 (the average must reach `threshold`). A reviewer that did not vote → `verdict=None` (undecided); the script decides whether to retry or give up. **Single-shot, no auto-rework** — return `feedback` so the script can have the executor redo the deliverable and `verify()` again. **Recommended: build reviewers with the business helper `build_reviewers(deliverable, specs, ...)`** from a `type` (`verifier` / `inspector` / `challenger`) plus the deliverable (inline text or file paths) — fewer tokens, consistent prompts, automatic type→kind mapping; only construct `Reviewer{kind, prompt, label, options}` directly for a fully custom prompt (see "Verify (verify)").
+- `agent_session(label=, phase=, instructions=, options=)` + `await s.send(prompt, *, schema=, notify=False)` — a **stateful** multi-turn agent that remembers across turns; the second turn need not restate the first. `notify=True` pushes one-way, returns `None`. `options.model` takes effect **only on the session's first turn** (resolved and fixed when the avatar opens); passing a different `model` mid-session raises an error — `fork()` a new session to switch models.
+- `await s.fork(fork_mode=, keep_rounds=, label=, phase=, instructions=, options=)` — derive an **independent branch** from an `agent_session` (`fork_mode` is one of five): `full` inherits everything; `before`/`after` keep the turns before / from the N-th round on; `keep_before_compact_after`/`keep_after_compact_before` keep one side and summarise the other. `keep_rounds` is in **rounds** (each `send()` is one round): **required for every mode but `full`** (omitting it raises — no truncation without a split point); a value beyond the parent's actual round count degrades to full-context with a warning, not an error. The parent's context is frozen at the fork call — the two lines are fully independent afterwards; a child can keep `send`ing and can `fork` again (chained). `human_session` does not support `fork`.
+  - **Chained-fork rule**: **do not `fork` a forked child that has not sent a message yet** — it degrades to a mirror fallback (ToolMessage lost). Every session you `fork` must have `send`t at least once; to derive from a parent's earlier state, use that parent's `fork_mode` + `keep_rounds` (e.g. `before`/`after`) instead of forking an unsent child and re-forking it.
+  - **Third-party sessions (`agent_type`) fork more strictly**: only `full` / `before` are supported (CLI-native branching); `after` and both compact modes raise. For `before`, an out-of-range `keep_rounds` **raises instead of degrading to full**; the child's `agent_type` must equal the parent's.
+- `await human(prompt, *, schema=)` / `human_session()` + `.send()` — one-shot / stateful **human-in-the-loop**; waiting on a person holds no concurrency permit and costs no spawn budget, and is replayable from the journal.
+- `await parallel([thunk, ...])` — a fork-join **barrier**: runs concurrently, returns once all finish; a throwing branch resolves to `None` and the call **never raises** (filter with `compact` first). A thunk is a zero-arg callable like `lambda: agent(...)`.
+- `await pipeline(items, stage1, stage2, ...)` — a **no-barrier** stream: each item flows through all stages independently (A can be in stage 3 while B is still in stage 1); each stage callback receives `(prev, item, index)` — later stages can use `item`/`index` to label work without threading context through `prev`; a throwing stage drops only that item to `None` and skips its remaining stages.
+- `await map_parallel(items, fn)` (alias `pmap`) — closure-trap-free fan-out, `fn` is `async def fn(item)` or `fn(item, i)`, binding each item correctly.
+- `phase(title)` / `log(message)` — progress (open a phase / a narration line).
+- `await workflow(name_or_path, args)` — run another workflow inline as a sub-step and return its return value. The sub-workflow **shares** this run's concurrency cap, agent counter, abort signal, and token budget (its agents count toward `budget.spent()`). Nesting is **one level only** (a sub-workflow calling it again raises); unknown name / unreadable path / syntax error raise, catch with try/except.
+- `budget.total` / `budget.spent()` / `budget.remaining()` — token budget (see below).
+- `compact(xs)` / `flatten_filter(xs)` — pure list helpers: drop falsy (None/''/0/[]) / flatten one level and drop falsy.
+
+## What a worker can run
+Each worker spawned by `agent()` / a session (one-shot, or multi-turn within a session) is a team-member instance that **inherits the team's teammate spec capabilities**: model, tools, skills, workspace, sys_operation. But it has **no team-coordination tools** (cannot spawn members / create tasks / send messages) — it is a focused, disposable execution unit. So a script can let a worker call the tools configured in its spec (retrieval, code execution, etc.) to actually do work; pass a `schema` for a structured product.
+
+## pipeline or parallel (default pipeline)
+**Default to `pipeline`** (no barrier; wall-clock = the slowest single-item chain, not sum-of-slowest-per-stage). A barrier (`parallel`) is correct ONLY when a stage **needs all cross-item results from the previous one**:
+
+- dedup / merge the **full result set** before expensive downstream work;
+- **early-exit** when the count is zero ("0 findings → skip verification entirely");
+- the next stage's prompt **compares against** "all the other findings".
+
+These do NOT justify a barrier: "I need to flatten / map / filter first" (do it inside a pipeline stage), "the stages are conceptually separate" (that's what pipeline models — separate ≠ synchronized), "it's cleaner" (barrier latency is real: if the slowest of 5 finders takes 3× the fastest, a barrier wastes 2/3 of the fast finders' idle time).
+
+**Smell test**: if you wrote
+
+```python
+a = await parallel([...])
+b = transform(a)                      # flatten / map / filter — no cross-item dependency
+c = await parallel([... for x in b])
+```
+
+that middle `transform` needs no barrier — rewrite as a pipeline with the transform inside a stage: `pipeline(items, stageA, lambda r, *_: transform([r]), stageB)`. When in doubt: pipeline.
+
+## Determinism constraints (scripting rules)
+- `META` is a pure literal.
+- A script is plain Python, running in an async context — `await` directly. The standard library is available, **but** load-time lint **rejects** nondeterministic sources: `time.time()` / `time.monotonic()` / `random.*` / `*.now()` / `*.today()` (they would break resume). Pass timestamps via `args` and stamp afterwards; for randomness, vary the prompt / label by index.
+- **Closure trap**: `lambda: agent(...)` inside a comprehension makes every lambda capture the same (last) variable. Bind it — `lambda x=x: agent(...)` — or use `map_parallel`.
+- No filesystem, no out-of-band network — everything goes through the primitives.
+
+## Concurrency and limits
+- Concurrency cap = `min(16, CPU cores - 2)`; excess `agent()` calls queue and run as slots free. You can still pass many items to `parallel`/`pipeline`; only ~cap run at any moment.
+- Total agents over a workflow's lifetime are capped at **1000** (`agent()` returns `None` past it, no retry — a runaway backstop).
+- A single `parallel` / `pipeline` call takes at most **4096** items; exceeding it is an **explicit error**, not a silent truncation.
+- `workflow()` nesting is **one level only**.
+
+## Structured output (schema)
+- `schema=None` → text; `schema=<JSON Schema dict>` → dict; `schema=<pydantic model>` → model instance (attribute access + static narrowing).
+- Validation failure is retried by the model; on exhaustion it returns `None`. Filter `None` with `compact()` / `.filter` before use.
+
+## Budget (hard ceiling)
+- **Two budget layers, but `budget.*` reads only the run layer**: `budget.*` reports **this run's own ceiling** (`META["workflow_token_limit"]`; unbounded when omitted). The session-wide shared total (set by the deployment) is not visible to the script but still binds the run behind the scenes (hitting either layer ends the run). When the user's request states a token/budget figure ("budget 90K", "keep it under 200k tokens"), you MUST convert it to an integer and write it into `META["workflow_token_limit"]` — the engine bills per run, the UI shows it as the run budget badge, and an overrun feeds back to you to redesign the script.
+- **When the user gave NO budget figure, you MUST omit `workflow_token_limit` entirely** — do not estimate one yourself, do not derive one from the session total, and do not copy the example value. An invented ceiling makes the workflow die mid-run when it hits the cap, leaving the task unfinished.
+- `budget.total` (this run's token ceiling, i.e. `META["workflow_token_limit"]`; `None` when the user gave none), `budget.spent()` (tokens spent by this run, **taken from the usage the model itself reports**, input + output; only the agents of this run — not the main loop, not other workflows), `budget.remaining()` (`max(0, total - spent())`, `None` when unbounded).
+- **Hard ceiling**: once `spent()` reaches `total`, agents already running are stopped where they stand at their next model call, and a further `agent()` raises and ends the whole run (that error is not catchable with `except Exception`). Drive depth dynamically (`while budget.total and budget.remaining() > N`) or scale fan-out statically (`FLEET = budget.total // 100_000 if budget.total else 5`). With no `total` set, `remaining()` is `None` — a dynamic loop MUST guard on `budget.total`, else it runs to the 1000 cap.
+- `spent()` is **live**: concurrent agents are billed the moment each model call returns, so polling it sees the real global figure, not a stale one. The ceiling is a backstop — **wind down on `remaining()` yourself** to finish cleanly; hitting the ceiling fails the run. A single call is only billed once it returns, so `spent()` may overshoot `total` slightly.
+
+## Resume
+- `resume_id` = a prior run's **run_id** (the handle this tool returns). On resume it is **content-addressed**: unchanged `agent()` calls reuse cached results instantly; an upstream prompt change flips the downstream signature and re-runs it automatically (no manual marking). **Same script + same args → 100% cache hit.**
+- Maintained by the async-tool execution framework via a content-addressed journal (same model as the reference tool's runId).
+
+## Runtime control (pause / resume / stop)
+When a workflow is still running in the background and the user wants to control it, combine `resume_id` + `action` on this tool — `run_id` is the handle this tool returned on the earlier launch. Pick the action from the user's wording:
+- User says "hold on / pause the workflow" → `swarmflow(resume_id=<run_id>, action='pause')`: pauses execution, **preserving the completed prefix**, which `action='resume'` later continues from.
+- User says "carry on / resume" → `action='resume'`.
+- User says "never mind / stop" → `action='stop'`: **terminal** (cannot be resumed), but it only stops the workflow — it does **not** stop the session.
+- Example: `swarmflow(resume_id='wf_xxx', action='stop')`.
+
+## Verify (verify): multi-reviewer gating of a deliverable
+
+When you need quality gating on your own deliverable, use `verify()` instead of hand-writing "spawn N agents, collect votes, judge yourself" boilerplate, and collects per-vote `feedback` for a rework pass.
+
+**When to use `verify()` (not a bare `agent`):** any work that *judges a deliverable against acceptance criteria* — including **compiling, running, and checking each criterion** — is a reviewer's job (especially a `verifier`); use `verify()` rather than hand-writing one `agent(schema=...)` to collect an unstructured result. Every reviewer is an ordinary worker (inheriting the worker's tools — `bash` / `read_file` / `write_file`), so any reviewer can compile, run, and test — hand acceptance judging to a reviewer and `verify()` collects the votes and returns a structured `verdict` (semantics in the `verify` primitive above). **Build reviewers with `build_reviewers(deliverable, specs, ...)` (recommended)** — fewer tokens, prompts from the `swarmflow_reviewer_*` templates stay consistent, and type→kind is mapped for you; only construct `Reviewer` directly for a fully custom prompt. **A bare `agent` is for *producing* content (writing code, retrieval, summarising); judging whether a deliverable meets the bar goes through `verify()`.** See "Code skeletons" below for runnable examples.
+
+**Reviewer types and when to use each (composition guidance)**: `verify()` does not pick your reviewer composition for you — the script decides it by the deliverable's importance and openness. Baseline:
+
+| type | When to use | How many |
+|---|---|---|
+| `verifier` | Almost any deliverable worth gating; the basic quality guarantee; check each acceptance-criteria item | ≥1, the backbone; **verify / test-type deliverables need just 1** |
+| `inspector` | Key deliverables needing multi-dimensional scoring / consumed downstream, high norms & consistency requirements | by criticality; skip for light deliverables |
+| `challenger` | Deliverables with no deterministic criteria — open / design / planning / research, decisive or policy-level impact downstream | required for those; skip for verify / test-type deliverables |
+
+Composition baseline: **light gate** = 1 `verifier`; **key deliverable** = `verifier` + `inspector` (multiple inspectors can split dimensions); **open / high-risk design** = `verifier` + `challenger` (add `inspector` if needed). A script may call `verify()` repeatedly with different compositions for deliverables at different stages.
+
+**Per-reviewer model**: every reviewer role is an independent agent and can pin its model via the `"options"` key in its spec (overriding the team teammate model that reviewer inherits, and the `verify()`-level `options`):
+
+```python
+reviewers = build_reviewers(deliverable, [
+    {"type": "verifier",  "options": {"model": "flash-mini"}},
+    {"type": "inspector", "options": {"model": "pro"}},
+])
+r = await verify(reviewers, threshold=0.85)
+```
+
+**Two gates**: `verifier` is the **minimum bar** — it only asks "are the acceptance criteria met" (pass/fail). `inspector` is the **quality bar** — it scores each dimension and fails unless the average reaches 0.85, catching deliverables that are **functionally complete but mediocre** (e.g. code that compiles but is unmaintainable). For **key final / downstream-consumed deliverables**, `verifier` alone is not enough — add `inspector` to enforce quality; for one-off, light, disposable intermediate artifacts, `verifier` alone suffices.
+
+**Default composition**: **design documents / architecture / final deliverables** → `verifier` + `inspector` (functional floor + enforced quality — this is the default, don't use `verifier` alone); **implementation code** → `verifier` (compile/run acceptance) plus `inspector` if consumed downstream; **open-ended design / no deterministic bar** → add `challenger` on top. When unsure, default to `verifier` + `inspector`.
+
+## Orchestration pattern library (compose by scale)
+- **Verify**: run a multi-reviewer round on a deliverable — `verifier` checks "does it meet the bar" (one-vote veto), `inspector` scores "how good it is" (avg ≥ 0.85), `challenger` finds "unseen blind spots" (adversarial); compose by deliverable nature (see "Verify (verify)").
+- **Judge panel**: generate N independent attempts from different angles → score in parallel → synthesize from the winner, grafting the runners-up's best ideas.
+- **Loop-until-count**: accumulate to a target — `while len(bugs) < 10: ...`, pushing fresh findings each round.
+- **Loop-until-dry**: for unknown-size discovery, keep spawning finders until K consecutive rounds add nothing new (simple counters miss the tail).
+- **Multi-modal sweep**: parallel agents each searching a different way (by container / content / entity / time), each blind to the others.
+- **Completeness critic**: a final agent that asks "what's missing — a modality not run, a claim unverified, a source unread?"; what it finds becomes the next round.
+- **No silent caps**: if you bound coverage (top-N / sampling), `log()` what was dropped — a silent truncation reads as "covered everything".
+- Scale to the user's wording: "find a few bugs" → a few finders, single-vote verify; "thoroughly audit / be comprehensive" → a larger finder pool, 3–5 vote adversarial pass, a synthesis stage.
+
+These patterns are **not exhaustive** — compose novel harnesses when the task calls for it (tournament brackets, self-repair loops, staged escalation, and so on).
+
+## Code skeletons (real swarmflow API)
+
+**Adversarial verify (pipeline by default)** — review several dimensions in parallel ('bugs' / 'perf'); the moment a dimension's review completes, run a `verify()` one-vote-veto round over its findings ('bugs' verifies while 'perf' is still reviewing, no wasted wall-clock). **Build reviewers with `build_reviewers` (recommended)**: a single `challenger` is the adversarial form (any reviewer voting fail drops the finding); for a multi-perspective pass, put several `challenger` specs with different `instruction`s (see the "Multi-perspective review + loop-until-dry" example below):
+
+```python
+# from swarmflow import agent, parallel, compact, verify
+# from openjiuwen.agent_teams.workflow.review import build_reviewers
+
+async def run(args):
+    dims = [{"key": "bugs", "prompt": "find bugs"}, {"key": "perf", "prompt": "find perf issues"}]
+
+    async def review(_prev, d, _i):
+        return await agent(d["prompt"], label=f"review:{d['key']}", phase="Review", schema=FINDINGS)
+
+    async def adjudicate(rev, _d, _i):              # use verify() + build_reviewers to judge each finding (one-vote veto)
+        findings = rev["findings"] if rev else []
+        if not findings:
+            return []
+
+        async def judge(f):
+            r = await verify(build_reviewers(
+                f["title"],                          # the finding is the deliverable under review
+                [{"type": "challenger", "instruction": "Adversarially judge whether the finding is real and reproducible"}],
+            ))
+            return f if r.passed else None          # confirmed only if the adversarial review passes
+
+        return compact(await parallel([(lambda f=f: judge(f)) for f in findings]))
+
+    results = await pipeline(dims, review, adjudicate)
+    return {"confirmed": [f for rev in compact(results) for f in rev]}
+```
+
+> **When you need a barrier (parallel) over pipeline**: to dedup / merge the *full* set of findings before expensive verification, you genuinely need them all at once — that is when you use `parallel` to collect → dedup in plain code → then `verify()` each. Otherwise don't reach for a barrier just because it "looks cleaner" (see "pipeline or parallel").
+
+Loop-until-count — accumulate to a target:
+
+```python
+async def run(args):
+    bugs = []
+    while len(bugs) < 10:
+        r = await agent("Find bugs in this codebase.", schema=BUGS)
+        bugs.extend(r["bugs"] if r else [])
+        log(f"{len(bugs)}/10 found")
+    return {"bugs": bugs}
+```
+
+Loop-until-budget — scale depth to the budget (guard on `budget.total`):
+
+```python
+async def run(args):
+    bugs = []
+    while budget.total and budget.remaining() > 50_000:
+        r = await agent("Find bugs in this codebase.", schema=BUGS)
+        bugs.extend(r["bugs"] if r else [])
+        log(f"{len(bugs)} found, {budget.remaining() // 1000}k tokens left")
+    return {"bugs": bugs}
+```
+
+**Multi-perspective review + loop-until-dry (composing patterns)** — exhaustive review (find → dedup vs `seen` → diverse-lens review → loop-until-dry). Keep spawning finders until two consecutive rounds add nothing; judge each fresh finding concurrently via `verify()` + `build_reviewers` with a **multi-perspective** pass — three `challenger`s on `correctness`/`security`/`repro`, **one-vote veto** (any lens failing drops it; the single reviewer in the previous example is its degenerate form). **Dedup against `seen`, not `confirmed`**, or judge-rejected findings reappear every round and it never converges. Note `parallel` can nest `parallel`:
+
+```python
+from swarmflow import agent, parallel, compact, verify
+from openjiuwen.agent_teams.workflow.review import build_reviewers
+
+async def run(args):
+    seen, confirmed, dry = set(), [], 0
+    while dry < 2:                                  # stop after two empty rounds
+        found = compact(await parallel([(lambda p=p: agent(p, phase="Find", schema=BUGS)) for p in FINDERS]))
+        fresh = [b for r in found for b in (r["bugs"] if r else []) if b["id"] not in seen]
+        if not fresh:
+            dry += 1
+            continue
+        dry = 0
+        for b in fresh:
+            seen.add(b["id"])
+
+        async def judge(bug):                       # verify() + build_reviewers: one-vote veto across the 3 lenses
+            r = await verify(build_reviewers(
+                bug["desc"],                         # the finding is the deliverable under review
+                [
+                    {"type": "challenger", "instruction": "Judge via the correctness lens — is the finding real?"},
+                    {"type": "challenger", "instruction": "Judge via the security lens — is the finding real?"},
+                    {"type": "challenger", "instruction": "Judge via the repro lens — is the finding real?"},
+                ],
+            ))
+            return bug if r.passed else None        # confirmed only if all 3 lenses pass
+
+        confirmed.extend(compact(await parallel([(lambda b=b: judge(b)) for b in fresh])))
+    return {"confirmed": confirmed}
+```
+
+Write → compile / run acceptance (verifier builds on the spot) → package — when the deliverable is code, let a `verifier` compile and run and check the acceptance criteria, instead of writing a separate compile agent:
+
+```python
+from swarmflow import agent, verify
+from openjiuwen.agent_teams.workflow.review import build_reviewers
+
+async def run(args):
+    code = await agent("…write the code…", label="code")
+    r = await verify(build_reviewers(
+        [f"{PROJ}/src/main.cpp", f"{PROJ}/include/shape.h"],  # file paths; the verifier read_file's them
+        [{"type": "verifier", "instruction": "Compile and run: g++ must build it and the program output must match the acceptance criteria"}],
+        acceptance="…acceptance criteria…",
+        language="en",
+    ))
+    if not r.passed:
+        code = await agent(f"Fix the code per feedback:\n{r.feedback}\nOriginal code: {code}")
+        # verify() again (wrap in a loop until it passes or the round cap)
+    pkg = await agent("…package the zip…", label="package")
+    return {"code": code, "verify": r, "package": pkg}
+```
+
+Quality bar (inspector) — for **key final / downstream-consumed** deliverables, `verifier` (the minimum bar) alone is not enough; add `inspector` to score each dimension and pass only when the average reaches 0.85. Per-dimension scores are in `r.votes[i].score`, the reasons in `r.votes[i].feedback`:
+
+```python
+# from swarmflow import verify
+# from openjiuwen.agent_teams.workflow.review import build_reviewers
+
+async def run(args):
+    r = await verify(build_reviewers(
+        f"{PROJ}/src/main.cpp",                    # or a list of file paths
+        [{"type": "inspector", "instruction": (
+            "| Dimension | Weight | What to check |\n"
+            "| --- | --- | --- |\n"
+            "| Maintainability | 0.4 | Clear layering, consistent naming, no duplication |\n"
+            "| Extensibility | 0.3 | Adding types/logic without touching core |\n"
+            "| Robustness | 0.2 | Edge cases and error handling |\n"
+            "| Documentation | 0.1 | Comments on key logic, build notes |"
+        )}],
+        acceptance="…acceptance criteria…",
+    ))
+    if r.passed:
+        scores = [v.score for v in r.votes if v.score is not None]
+        log(f"quality {sum(scores)/len(scores):.2f} (per-dimension: {[(v.score, v.feedback[:40]) for v in r.votes]})")
+    # avg < 0.85 → r.passed=False; rework per r.feedback then verify() again
+```
+
+Use this tool for multi-step orchestration where control flow should be **deterministic** (loops, conditionals, fan-out) rather than model-driven.

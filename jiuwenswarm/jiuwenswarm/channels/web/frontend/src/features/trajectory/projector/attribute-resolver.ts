@@ -1,0 +1,940 @@
+/** Per-field semantic normalization for standard and OpenJiuwen spans. */
+
+import {
+  exactAttributeMap,
+  readBooleanAttribute,
+  readInt64Attribute,
+  readNumberAttribute,
+  readStringArrayAttribute,
+  readStringAttribute,
+  structuredOtlpValue,
+} from '../semconv/attributes.ts'
+import {
+  OPENJIUWEN_ATTRIBUTES,
+  OPENJIUWEN_EVENTS,
+  REQUEST_PURPOSES as REQUEST_PURPOSE_VALUES,
+  STANDARD_ATTRIBUTES,
+  STREAM_FRAME_KINDS,
+  TRAJECTORY_RECORD_KINDS,
+} from '../semconv/constants.ts'
+import type { OtlpAttributeMap } from '../semconv/attributes.ts'
+import type { OtlpAnyValue, OtlpKeyValue, OtlpSpanEvent } from '../shared/otlp.ts'
+import { sequenceContentOf } from '../shared/sequenceValue.ts'
+
+/** Stable facts consumed by the projector after profile-specific fallback. */
+export interface NormalizedTrajectoryAttributes {
+  raw: OtlpAttributeMap
+  sources: Readonly<Record<string, string>>
+  conversationId?: string
+  traceRoot?: boolean
+  trajectorySchemaVersion?: string
+  traceComplete?: boolean
+  traceForcedClose?: boolean
+  spanForcedClose?: boolean
+  spanForcedCloseReason?: string
+  operationName?: string
+  providerName?: string
+  requestId?: string
+  runId?: string
+  turnId?: string
+  agentMode?: string
+  requestModel?: string
+  responseModel?: string
+  requestMaxTokens?: bigint
+  requestTemperature?: number
+  requestTopP?: number
+  requestStopSequences?: readonly string[]
+  requestStream?: boolean
+  requestReasoningLevel?: string
+  responseId?: string
+  responseFinishReasons?: readonly string[]
+  responseTimeToFirstChunkSeconds?: number
+  /** Until the provider's response headers arrived, from the span start. */
+  responseTimeToFirstByteMs?: number
+  /** Until the first chunk carrying model output, from the span start. */
+  responseTimeToFirstTokenMs?: number
+  /** Transport retries the provider SDK made inside this request. */
+  requestRetryCount?: number
+  usageInputTokens?: bigint
+  usageOutputTokens?: bigint
+  usageReasoningTokens?: bigint
+  usageCacheReadTokens?: bigint
+  usageCacheWriteTokens?: bigint
+  inputCost?: number
+  outputCost?: number
+  totalCost?: number
+  totalLatencyMs?: number
+  timePerOutputTokenMs?: number
+  promptTokenIds?: unknown
+  completionTokenIds?: unknown
+  logprobs?: unknown
+  parserResult?: unknown
+  providerMetadata?: unknown
+  agentId?: string
+  agentName?: string
+  agentVersion?: string
+  agentDescription?: string
+  executionSubjectId?: string
+  executionSubjectKind?: string
+  executionSubjectParentId?: string
+  executionSubjectSessionId?: string
+  executionSubjectRequestNumber?: bigint
+  requestMessages?: unknown
+  requestMessagesComplete?: boolean
+  systemInstructions?: unknown
+  inputMessages?: unknown
+  inputMessagesComplete?: boolean
+  inputMessageProvenance?: unknown
+  outputMessages?: unknown
+  toolDefinitions?: unknown
+  toolName?: string
+  toolCallId?: string
+  toolType?: string
+  toolDescription?: string
+  toolResourceId?: string
+  toolProtocol?: string
+  toolAuthoritative?: boolean
+  toolCallArguments?: unknown
+  toolCallResult?: unknown
+  turnNumber?: bigint
+  stepId?: string
+  stepNumber?: bigint
+  inferenceId?: string
+  inferenceInputObserved?: boolean
+  trajectoryKind?: string
+  requestPurpose?: string
+  requestNumber?: bigint
+  compactionNumber?: bigint
+  contextOperationId?: string
+  langfuseObservationType?: string
+  errorType?: string
+  /** What a turn was handed, stated on the span that ran it. */
+  spanInput?: string
+}
+
+/** One replayable stream event read from the OpenJiuwen stream-chunk events. */
+export interface NormalizedTrajectoryStreamEvent {
+  sequence: number
+  kind: string
+  source: string
+  text?: string
+  toolCallId?: string
+  toolName?: string
+  argumentsDelta?: string
+}
+
+type MutableNormalized = Omit<NormalizedTrajectoryAttributes, 'sources'> & {
+  sources: Record<string, string>
+}
+
+interface Resolved<T> {
+  key: string
+  value: T
+  complete?: boolean
+}
+
+interface NormalizedPart {
+  type: string
+  content?: string
+  id?: string
+  name?: string
+  arguments?: unknown
+  response?: unknown
+}
+
+interface NormalizedMessage {
+  role: string
+  parts: readonly NormalizedPart[]
+  openjiuwen?: {
+    kind: 'prompt_attachment_history'
+    mode: 'snapshot' | 'delta'
+  }
+}
+
+// Foreign conventions the viewer also ingests: the legacy `tracer_otel`
+// handler and the Langfuse projection. OpenJiuwen's own emitter writes the
+// standard key alone, so it needs no entry here.
+const COMPATIBILITY = {
+  openJiuwenSessionId: 'openjiuwen.session_id',
+  langfuseObservationType: 'langfuse.observation.type',
+} as const
+
+const TRAJECTORY_KINDS = new Set<string>(TRAJECTORY_RECORD_KINDS)
+const REQUEST_PURPOSES = new Set<string>(REQUEST_PURPOSE_VALUES)
+const STREAM_KINDS = new Set<string>(STREAM_FRAME_KINDS)
+
+function parsedJson(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown
+  } catch {
+    return value
+  }
+}
+
+function flexibleValue(value: OtlpAnyValue): unknown {
+  // A value restated by reference parses element by element, and each
+  // element once: records restating the same message share its parse.
+  const elements = sequenceContentOf(value)?.parsedElements()
+  if (elements !== undefined) return [...elements]
+  if ('stringValue' in value) return parsedJson(value.stringValue)
+  return structuredOtlpValue(value)
+}
+
+function resolveString(attributes: OtlpAttributeMap, keys: readonly string[]): Resolved<string> | undefined {
+  for (const key of keys) {
+    const value = readStringAttribute(attributes, key)
+    if (value !== undefined) return { key, value }
+  }
+  return undefined
+}
+
+function resolveClosedString(
+  attributes: OtlpAttributeMap,
+  keys: readonly string[],
+  accepted: ReadonlySet<string>,
+): Resolved<string> | undefined {
+  for (const key of keys) {
+    const value = readStringAttribute(attributes, key)
+    if (value !== undefined && accepted.has(value)) return { key, value }
+  }
+  return undefined
+}
+
+function resolveBoolean(attributes: OtlpAttributeMap, keys: readonly string[]): Resolved<boolean> | undefined {
+  for (const key of keys) {
+    const value = readBooleanAttribute(attributes, key)
+    if (value !== undefined) return { key, value }
+  }
+  return undefined
+}
+
+function resolveNonNegativeInt64(
+  attributes: OtlpAttributeMap,
+  keys: readonly string[],
+): Resolved<bigint> | undefined {
+  for (const key of keys) {
+    const value = readInt64Attribute(attributes, key)
+    if (value !== undefined && value >= 0n) return { key, value }
+  }
+  return undefined
+}
+
+function resolvePositiveInt64(
+  attributes: OtlpAttributeMap,
+  keys: readonly string[],
+): Resolved<bigint> | undefined {
+  for (const key of keys) {
+    const value = readInt64Attribute(attributes, key)
+    if (value !== undefined && value > 0n) return { key, value }
+  }
+  return undefined
+}
+
+function resolveNumber(attributes: OtlpAttributeMap, keys: readonly string[]): Resolved<number> | undefined {
+  for (const key of keys) {
+    const value = readNumberAttribute(attributes, key)
+    if (value !== undefined && Number.isFinite(value)) return { key, value }
+  }
+  return undefined
+}
+
+function resolveNonNegativeNumber(
+  attributes: OtlpAttributeMap,
+  keys: readonly string[],
+): Resolved<number> | undefined {
+  for (const key of keys) {
+    const value = readNumberAttribute(attributes, key)
+    if (value !== undefined && Number.isFinite(value) && value >= 0) return { key, value }
+  }
+  return undefined
+}
+
+function resolveStringArray(attributes: OtlpAttributeMap, keys: readonly string[]): Resolved<readonly string[]> | undefined {
+  for (const key of keys) {
+    const value = readStringArrayAttribute(attributes, key)
+    if (value !== undefined) return { key, value }
+    const scalar = readStringAttribute(attributes, key)
+    if (scalar !== undefined) {
+      const parsed = parsedJson(scalar)
+      if (Array.isArray(parsed) && parsed.every(item => typeof item === 'string')) {
+        return { key, value: parsed }
+      }
+      return { key, value: [scalar] }
+    }
+  }
+  return undefined
+}
+
+function resolveFlexible(attributes: OtlpAttributeMap, keys: readonly string[]): Resolved<unknown> | undefined {
+  for (const key of keys) {
+    const value = attributes.get(key)
+    if (value !== undefined) return { key, value: flexibleValue(value) }
+  }
+  return undefined
+}
+
+function assign<T>(
+  target: MutableNormalized,
+  field: keyof NormalizedTrajectoryAttributes,
+  resolved: Resolved<T> | undefined,
+): void {
+  if (resolved === undefined) return
+  ;(target as unknown as Record<string, unknown>)[field] = resolved.value
+  target.sources[field] = resolved.key
+}
+
+function object(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+function text(value: unknown): string {
+  if (typeof value === 'string') return value
+  return JSON.stringify(value, null, 2) ?? String(value)
+}
+
+function normalizedToolCall(value: unknown): NormalizedPart | undefined {
+  const call = object(value)
+  if (call === undefined) return undefined
+  const functionValue = object(call.function)
+  const name = typeof call.name === 'string'
+    ? call.name
+    : typeof functionValue?.name === 'string' ? functionValue.name : undefined
+  const rawArguments = call.arguments ?? functionValue?.arguments
+  const id = typeof call.id === 'string' ? call.id : undefined
+  if (name === undefined && id === undefined && rawArguments === undefined) return undefined
+  return {
+    type: 'tool_call',
+    ...(id === undefined ? {} : { id }),
+    ...(name === undefined ? {} : { name }),
+    ...(rawArguments === undefined
+      ? {}
+      : { arguments: typeof rawArguments === 'string' ? parsedJson(rawArguments) : rawArguments }),
+  }
+}
+
+function normalizedContentParts(value: unknown, reasoning: boolean): NormalizedPart[] {
+  if (typeof value === 'string') return [{ type: reasoning ? 'reasoning' : 'text', content: value }]
+  if (!Array.isArray(value)) {
+    return value === undefined ? [] : [{ type: reasoning ? 'reasoning' : 'text', content: text(value) }]
+  }
+  const parts: NormalizedPart[] = []
+  for (const candidate of value) {
+    if (typeof candidate === 'string') {
+      parts.push({ type: reasoning ? 'reasoning' : 'text', content: candidate })
+      continue
+    }
+    const part = object(candidate)
+    if (part === undefined) {
+      parts.push({ type: reasoning ? 'reasoning' : 'text', content: text(candidate) })
+      continue
+    }
+    const typeValue = typeof part.type === 'string' ? part.type : reasoning ? 'reasoning' : 'text'
+    const content = typeof part.content === 'string'
+      ? part.content
+      : typeof part.text === 'string' ? part.text : undefined
+    const toolCall = typeValue === 'tool_call' || typeValue === 'tool-call'
+      ? normalizedToolCall(part)
+      : undefined
+    if (toolCall !== undefined) {
+      parts.push(toolCall)
+      continue
+    }
+    parts.push({
+      type: typeValue,
+      ...(content === undefined ? {} : { content }),
+      ...(typeof part.id === 'string' ? { id: part.id } : {}),
+      ...(typeof part.name === 'string' ? { name: part.name } : {}),
+      ...(part.arguments === undefined ? {} : { arguments: part.arguments }),
+      ...(part.response === undefined ? {} : { response: part.response }),
+    })
+  }
+  return parts
+}
+
+function normalizedMessage(value: unknown, defaultRole: string): NormalizedMessage | undefined {
+  const message = object(value)
+  if (message === undefined || !Array.isArray(message.parts)) return undefined
+  const role = typeof message.role === 'string' ? message.role : defaultRole
+  const parts = normalizedContentParts(message.parts, false)
+  const openjiuwen = object(message.openjiuwen)
+  const promptAttachmentHistory = openjiuwen?.kind === 'prompt_attachment_history'
+    && (openjiuwen.mode === 'snapshot' || openjiuwen.mode === 'delta')
+    ? {
+        kind: openjiuwen.kind,
+        mode: openjiuwen.mode,
+      } as const
+    : undefined
+  return {
+    role,
+    parts,
+    ...(promptAttachmentHistory === undefined
+      ? {}
+      : { openjiuwen: promptAttachmentHistory }),
+  }
+}
+
+function hasMessageContentShape(message: Record<string, unknown>): boolean {
+  return Array.isArray(message.parts)
+}
+
+function normalizedStructuredMessages(
+  value: unknown,
+  defaultRole: string,
+): readonly NormalizedMessage[] | undefined {
+  if (Array.isArray(value)) {
+    if (value.length === 0) return []
+    const messages = value.flatMap((candidate): NormalizedMessage[] => {
+      const candidateObject = object(candidate)
+      if (candidateObject === undefined || !hasMessageContentShape(candidateObject)) return []
+      const message = normalizedMessage(candidateObject, defaultRole)
+      return message === undefined ? [] : [message]
+    })
+    return messages.length === 0 ? undefined : messages
+  }
+  return undefined
+}
+
+function resolveMessages(
+  attributes: OtlpAttributeMap,
+  structuredKeys: readonly string[],
+  defaultRole: string,
+): Resolved<unknown> | undefined {
+  for (const key of structuredKeys) {
+    const value = attributes.get(key)
+    if (value === undefined) continue
+    const messages = normalizedStructuredMessages(flexibleValue(value), defaultRole)
+    if (messages !== undefined) return { key, value: messages, complete: true }
+  }
+  return undefined
+}
+
+function resolveStructuredParts(
+  attributes: OtlpAttributeMap,
+  keys: readonly string[],
+): Resolved<unknown> | undefined {
+  for (const key of keys) {
+    const value = attributes.get(key)
+    if (value === undefined) continue
+    const structured = flexibleValue(value)
+    if (!Array.isArray(structured)) continue
+    return { key, value: normalizedContentParts(structured, false) }
+  }
+  return undefined
+}
+
+function resolveStructuredArray(
+  attributes: OtlpAttributeMap,
+  keys: readonly string[],
+): Resolved<unknown> | undefined {
+  for (const key of keys) {
+    const value = attributes.get(key)
+    if (value === undefined) continue
+    const structured = flexibleValue(value)
+    if (Array.isArray(structured)) return { key, value: structured }
+  }
+  return undefined
+}
+
+function systemFromMessages(value: unknown): readonly NormalizedPart[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const systemParts = value.flatMap((candidate): NormalizedPart[] => {
+    const message = object(candidate)
+    if (message?.role !== 'system' || !Array.isArray(message.parts)) return []
+    return message.parts.flatMap((part): NormalizedPart[] => {
+      const valuePart = object(part)
+      return valuePart === undefined || typeof valuePart.type !== 'string'
+        ? []
+        : [valuePart as unknown as NormalizedPart]
+    })
+  })
+  return systemParts.length === 0 ? undefined : systemParts
+}
+
+/**
+ * Rebuild the full request as one ordered message list.
+ *
+ * The standard attributes split the request in two: the instructions given
+ * outside the chat history, and the history itself. Views that reason about
+ * where a message sat -- which system turn is the prompt-attachment snapshot,
+ * above all -- need them back in one sequence, instructions first.
+ */
+function composedRequestMessages(
+  history: Resolved<unknown> | undefined,
+  instructions: Resolved<unknown> | undefined,
+): Resolved<unknown> | undefined {
+  if (history === undefined || !Array.isArray(history.value)) return undefined
+  const leading = instructions === undefined
+    ? []
+    : [{ role: 'system', parts: instructions.value }]
+  return {
+    key: history.key,
+    value: [...leading, ...history.value],
+    complete: true,
+  }
+}
+
+
+function withoutSystemMessages(value: unknown): unknown {
+  if (!Array.isArray(value)) return value
+  return value.filter((candidate) => object(candidate)?.role !== 'system')
+}
+
+// What a model call was sent. Every call restates the whole conversation, its
+// instructions and its tools, so a long run holds that content once per call,
+// and parsed it is several times the size of its text.
+const LAZY_MESSAGE_FIELDS = [
+  'requestMessages',
+  'requestMessagesComplete',
+  'systemInstructions',
+  'inputMessages',
+  'inputMessagesComplete',
+] as const satisfies readonly (keyof NormalizedTrajectoryAttributes)[]
+
+const LAZY_TOOL_FIELDS = [
+  'toolDefinitions',
+] as const satisfies readonly (keyof NormalizedTrajectoryAttributes)[]
+
+function resolveMessageFields(raw: OtlpAttributeMap): MutableNormalized {
+  const target: MutableNormalized = { raw, sources: {} }
+  const history = resolveMessages(raw, [STANDARD_ATTRIBUTES.inputMessages], 'user')
+  const explicitSystem = resolveStructuredParts(raw, [
+    STANDARD_ATTRIBUTES.systemInstructions,
+  ])
+
+  const requestMessages = composedRequestMessages(history, explicitSystem)
+  assign(target, 'requestMessages', requestMessages)
+  if (requestMessages !== undefined) {
+    target.requestMessagesComplete = requestMessages.complete ?? true
+  }
+
+  if (history !== undefined) {
+    const inferredSystem = systemFromMessages(history.value)
+    const system = explicitSystem ?? (
+      inferredSystem === undefined
+        ? undefined
+        : { key: history.key, value: inferredSystem }
+    )
+    assign(target, 'systemInstructions', system)
+    assign(target, 'inputMessages', {
+      key: history.key,
+      value: withoutSystemMessages(history.value),
+    })
+    target.inputMessagesComplete = history.complete ?? true
+  } else {
+    assign(target, 'systemInstructions', explicitSystem)
+  }
+  return target
+}
+
+// A run restates the same few tool lists on every model call, so parsed lists
+// are shared: by the chain they were restated through, or else by their text.
+// Bounded, since a list that changed is not asked for again.
+const TOOL_DEFINITIONS_CACHE_LIMIT = 32
+const toolDefinitionsByText = new Map<string, Resolved<unknown> | null>()
+
+function resolveToolFields(raw: OtlpAttributeMap): MutableNormalized {
+  const target: MutableNormalized = { raw, sources: {} }
+  const keys = [STANDARD_ATTRIBUTES.toolDefinitions]
+  const value = raw.get(STANDARD_ATTRIBUTES.toolDefinitions)
+  if (value === undefined || !('stringValue' in value)) {
+    assign(target, 'toolDefinitions', resolveStructuredArray(raw, keys))
+    return target
+  }
+  // JSON text never starts with NUL, so a chain key cannot collide with a text.
+  const chain = sequenceContentOf(value)
+  const text = chain === undefined ? value.stringValue : `\u0000${chain.hash}`
+  let resolved = toolDefinitionsByText.get(text)
+  if (resolved === undefined) {
+    resolved = resolveStructuredArray(raw, keys) ?? null
+  } else {
+    toolDefinitionsByText.delete(text)
+  }
+  toolDefinitionsByText.set(text, resolved)
+  if (toolDefinitionsByText.size > TOOL_DEFINITIONS_CACHE_LIMIT) {
+    const oldest = toolDefinitionsByText.keys().next().value
+    if (oldest !== undefined) toolDefinitionsByText.delete(oldest)
+  }
+  assign(target, 'toolDefinitions', resolved ?? undefined)
+  return target
+}
+
+/**
+ * Resolve a group of fields only once something reads one of them.
+ *
+ * Turn assignment normalizes every span of every subject, while only the
+ * projection of model calls reads what they were sent. Parsing it up front
+ * kept a parsed copy of the full history per model call alive for as long as
+ * the record, which is what exhausted the page's heap on long Team runs.
+ */
+function defineLazyFields(
+  target: MutableNormalized,
+  fields: readonly (keyof NormalizedTrajectoryAttributes)[],
+  resolveFields: () => MutableNormalized,
+): void {
+  let resolved: MutableNormalized | undefined
+  const resolve = (): MutableNormalized => {
+    resolved ??= resolveFields()
+    return resolved
+  }
+  for (const field of fields) {
+    Object.defineProperty(target, field, {
+      configurable: true,
+      enumerable: true,
+      get: () => resolve()[field],
+    })
+    Object.defineProperty(target.sources, field, {
+      configurable: true,
+      enumerable: true,
+      get: () => resolve().sources[field],
+    })
+  }
+}
+
+// Records are immutable once received and a projection pass reads each span's
+// attributes more than once (turn assignment, then span building), across
+// every publish that re-projects the subject. Normalization is pure, so one
+// result per attribute array is enough.
+const normalizedByEntries = new WeakMap<readonly OtlpKeyValue[], NormalizedTrajectoryAttributes>()
+
+/** Resolve each fact independently, preserving the winning physical key. */
+export function normalizeTrajectoryAttributes(
+  entries: readonly OtlpKeyValue[] | undefined,
+): NormalizedTrajectoryAttributes {
+  if (entries === undefined) return normalizeAttributeEntries(entries)
+  const cached = normalizedByEntries.get(entries)
+  if (cached !== undefined) return cached
+  const normalized = normalizeAttributeEntries(entries)
+  normalizedByEntries.set(entries, normalized)
+  return normalized
+}
+
+function normalizeAttributeEntries(
+  entries: readonly OtlpKeyValue[] | undefined,
+): NormalizedTrajectoryAttributes {
+  const raw = exactAttributeMap(entries)
+  const target: MutableNormalized = { raw, sources: {} }
+  assign(target, 'conversationId', resolveString(raw, [
+    STANDARD_ATTRIBUTES.conversationId,
+    STANDARD_ATTRIBUTES.sessionId,
+    COMPATIBILITY.openJiuwenSessionId,
+  ]))
+  assign(target, 'traceRoot', resolveBoolean(raw, [
+    OPENJIUWEN_ATTRIBUTES.traceRoot,
+  ]))
+  assign(target, 'trajectorySchemaVersion', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.trajectorySchemaVersion,
+  ]))
+  assign(target, 'traceComplete', resolveBoolean(raw, [
+    OPENJIUWEN_ATTRIBUTES.traceComplete,
+  ]))
+  assign(target, 'traceForcedClose', resolveBoolean(raw, [
+    OPENJIUWEN_ATTRIBUTES.traceForcedClose,
+  ]))
+  assign(target, 'spanForcedClose', resolveBoolean(raw, [
+    OPENJIUWEN_ATTRIBUTES.spanForcedClose,
+  ]))
+  assign(target, 'spanForcedCloseReason', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.spanForcedCloseReason,
+  ]))
+  assign(target, 'operationName', resolveString(raw, [
+    STANDARD_ATTRIBUTES.operationName,
+  ]))
+  assign(target, 'providerName', resolveString(raw, [
+    STANDARD_ATTRIBUTES.providerName,
+  ]))
+  assign(target, 'requestId', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.requestId,
+  ]))
+  assign(target, 'runId', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.runId,
+  ]))
+  assign(target, 'turnId', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.turnId,
+  ]))
+  assign(target, 'stepId', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.stepId,
+  ]))
+  assign(target, 'inferenceId', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.inferenceId,
+  ]))
+  assign(target, 'inferenceInputObserved', resolveBoolean(raw, [
+    OPENJIUWEN_ATTRIBUTES.inferenceInputObserved,
+  ]))
+  assign(target, 'agentMode', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.agentMode,
+  ]))
+  assign(target, 'requestModel', resolveString(raw, [
+    STANDARD_ATTRIBUTES.requestModel,
+  ]))
+  assign(target, 'responseModel', resolveString(raw, [
+    STANDARD_ATTRIBUTES.responseModel,
+  ]))
+  assign(target, 'requestMaxTokens', resolveNonNegativeInt64(raw, [
+    STANDARD_ATTRIBUTES.requestMaxTokens,
+  ]))
+  assign(target, 'requestTemperature', resolveNumber(raw, [
+    STANDARD_ATTRIBUTES.requestTemperature,
+  ]))
+  assign(target, 'requestTopP', resolveNumber(raw, [
+    STANDARD_ATTRIBUTES.requestTopP,
+  ]))
+  assign(target, 'requestStopSequences', resolveStringArray(raw, [
+    STANDARD_ATTRIBUTES.requestStopSequences,
+  ]))
+  assign(target, 'requestStream', resolveBoolean(raw, [
+    STANDARD_ATTRIBUTES.requestStream,
+  ]))
+  assign(target, 'requestReasoningLevel', resolveString(raw, [
+    STANDARD_ATTRIBUTES.requestReasoningLevel,
+  ]))
+  assign(target, 'responseId', resolveString(raw, [
+    STANDARD_ATTRIBUTES.responseId,
+  ]))
+  assign(target, 'responseFinishReasons', resolveStringArray(raw, [
+    STANDARD_ATTRIBUTES.responseFinishReasons,
+  ]))
+
+  const firstChunk = resolveNonNegativeNumber(raw, [
+    STANDARD_ATTRIBUTES.responseTimeToFirstChunk,
+  ])
+  assign(target, 'responseTimeToFirstChunkSeconds', firstChunk)
+  assign(target, 'responseTimeToFirstByteMs', resolveNonNegativeNumber(raw, [
+    OPENJIUWEN_ATTRIBUTES.timeToFirstByteMs,
+  ]))
+  assign(target, 'responseTimeToFirstTokenMs', resolveNonNegativeNumber(raw, [
+    OPENJIUWEN_ATTRIBUTES.timeToFirstTokenMs,
+  ]))
+  assign(target, 'requestRetryCount', resolveNonNegativeNumber(raw, [
+    OPENJIUWEN_ATTRIBUTES.requestRetryCount,
+  ]))
+
+  // Token usage is read only in the standard shape, where every cache and
+  // reasoning count is a breakdown of the input respectively output total.
+  // Legacy and Langfuse spellings carve the cache out of the input instead, so
+  // mixing them would silently double-subtract cached tokens.
+  assign(target, 'usageInputTokens', resolveNonNegativeInt64(raw, [
+    STANDARD_ATTRIBUTES.usageInputTokens,
+  ]))
+  assign(target, 'usageOutputTokens', resolveNonNegativeInt64(raw, [
+    STANDARD_ATTRIBUTES.usageOutputTokens,
+  ]))
+  assign(target, 'usageReasoningTokens', resolveNonNegativeInt64(raw, [
+    STANDARD_ATTRIBUTES.usageReasoningTokens,
+  ]))
+  assign(target, 'usageCacheReadTokens', resolveNonNegativeInt64(raw, [
+    STANDARD_ATTRIBUTES.usageCacheReadTokens,
+  ]))
+  assign(target, 'usageCacheWriteTokens', resolveNonNegativeInt64(raw, [
+    STANDARD_ATTRIBUTES.usageCacheWriteTokens,
+  ]))
+  assign(target, 'inputCost', resolveNonNegativeNumber(raw, [
+    OPENJIUWEN_ATTRIBUTES.inputCost,
+  ]))
+  assign(target, 'outputCost', resolveNonNegativeNumber(raw, [
+    OPENJIUWEN_ATTRIBUTES.outputCost,
+  ]))
+  assign(target, 'totalCost', resolveNonNegativeNumber(raw, [
+    OPENJIUWEN_ATTRIBUTES.totalCost,
+  ]))
+  assign(target, 'totalLatencyMs', resolveNonNegativeNumber(raw, [
+    OPENJIUWEN_ATTRIBUTES.totalLatencyMs,
+  ]))
+  assign(target, 'timePerOutputTokenMs', resolveNonNegativeNumber(raw, [
+    OPENJIUWEN_ATTRIBUTES.timePerOutputTokenMs,
+  ]))
+  assign(target, 'promptTokenIds', resolveFlexible(raw, [
+    OPENJIUWEN_ATTRIBUTES.promptTokenIds,
+  ]))
+  assign(target, 'completionTokenIds', resolveFlexible(raw, [
+    OPENJIUWEN_ATTRIBUTES.completionTokenIds,
+  ]))
+  assign(target, 'logprobs', resolveFlexible(raw, [
+    OPENJIUWEN_ATTRIBUTES.logprobs,
+  ]))
+  assign(target, 'parserResult', resolveFlexible(raw, [
+    OPENJIUWEN_ATTRIBUTES.parserResult,
+  ]))
+  assign(target, 'providerMetadata', resolveFlexible(raw, [
+    OPENJIUWEN_ATTRIBUTES.providerMetadata,
+  ]))
+
+  assign(target, 'agentId', resolveString(raw, [
+    STANDARD_ATTRIBUTES.agentId,
+  ]))
+  assign(target, 'agentName', resolveString(raw, [
+    STANDARD_ATTRIBUTES.agentName,
+  ]))
+  assign(target, 'agentVersion', resolveString(raw, [
+    STANDARD_ATTRIBUTES.agentVersion,
+  ]))
+  assign(target, 'agentDescription', resolveString(raw, [
+    STANDARD_ATTRIBUTES.agentDescription,
+  ]))
+  assign(target, 'executionSubjectId', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.executionSubjectId,
+  ]))
+  assign(target, 'executionSubjectKind', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.executionSubjectKind,
+  ]))
+  assign(target, 'executionSubjectParentId', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.executionSubjectParentId,
+  ]))
+  assign(target, 'executionSubjectSessionId', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.executionSubjectSessionId,
+  ]))
+  assign(target, 'executionSubjectRequestNumber', resolvePositiveInt64(raw, [
+    OPENJIUWEN_ATTRIBUTES.executionSubjectRequestNumber,
+  ]))
+
+  defineLazyFields(target, LAZY_MESSAGE_FIELDS, () => resolveMessageFields(raw))
+  defineLazyFields(target, LAZY_TOOL_FIELDS, () => resolveToolFields(raw))
+  assign(target, 'inputMessageProvenance', resolveFlexible(raw, [
+    OPENJIUWEN_ATTRIBUTES.inputMessageProvenance,
+  ]))
+
+  const outputMessages = resolveMessages(
+    raw,
+    [
+      STANDARD_ATTRIBUTES.outputMessages,
+    ],
+    'assistant',
+  )
+  if (outputMessages !== undefined) {
+    assign(target, 'outputMessages', outputMessages)
+  }
+
+  assign(target, 'toolName', resolveString(raw, [
+    STANDARD_ATTRIBUTES.toolName,
+  ]))
+  assign(target, 'toolCallId', resolveString(raw, [
+    STANDARD_ATTRIBUTES.toolCallId,
+  ]))
+  assign(target, 'toolType', resolveString(raw, [
+    STANDARD_ATTRIBUTES.toolType,
+  ]))
+  assign(target, 'toolDescription', resolveString(raw, [
+    STANDARD_ATTRIBUTES.toolDescription,
+  ]))
+  assign(target, 'toolResourceId', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.toolResourceId,
+  ]))
+  assign(target, 'toolProtocol', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.toolProtocol,
+  ]))
+  assign(target, 'toolAuthoritative', resolveBoolean(raw, [
+    OPENJIUWEN_ATTRIBUTES.toolAuthoritative,
+  ]))
+  assign(target, 'toolCallArguments', resolveFlexible(raw, [
+    STANDARD_ATTRIBUTES.toolCallArguments,
+  ]))
+  assign(target, 'toolCallResult', resolveFlexible(raw, [
+    STANDARD_ATTRIBUTES.toolCallResult,
+  ]))
+
+  assign(target, 'turnNumber', resolvePositiveInt64(raw, [
+    OPENJIUWEN_ATTRIBUTES.turnNumber,
+  ]))
+  assign(target, 'stepNumber', resolvePositiveInt64(raw, [
+    OPENJIUWEN_ATTRIBUTES.stepNumber,
+  ]))
+  assign(target, 'trajectoryKind', resolveClosedString(raw, [
+    OPENJIUWEN_ATTRIBUTES.trajectoryKind,
+  ], TRAJECTORY_KINDS))
+  assign(target, 'requestPurpose', resolveClosedString(raw, [
+    OPENJIUWEN_ATTRIBUTES.requestPurpose,
+  ], REQUEST_PURPOSES))
+  assign(target, 'requestNumber', resolvePositiveInt64(raw, [
+    OPENJIUWEN_ATTRIBUTES.requestNumber,
+  ]))
+  assign(target, 'compactionNumber', resolvePositiveInt64(raw, [
+    OPENJIUWEN_ATTRIBUTES.compactionNumber,
+  ]))
+  assign(target, 'contextOperationId', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.contextOperationId,
+  ]))
+  assign(target, 'langfuseObservationType', resolveString(raw, [
+    COMPATIBILITY.langfuseObservationType,
+  ]))
+  assign(target, 'errorType', resolveString(raw, [
+    STANDARD_ATTRIBUTES.errorType,
+  ]))
+  assign(target, 'spanInput', resolveString(raw, [
+    OPENJIUWEN_ATTRIBUTES.spanInput,
+  ]))
+
+  return target
+}
+
+function safeEventSequence(value: bigint | undefined, fallback: number): number {
+  if (value === undefined || value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) return fallback
+  return Number(value)
+}
+
+/** Normalize replayable chunk events without treating ended spans as live revisions. */
+export function normalizeTrajectoryStreamEvents(
+  events: readonly OtlpSpanEvent[] | undefined,
+): readonly NormalizedTrajectoryStreamEvent[] {
+  const normalized: Array<NormalizedTrajectoryStreamEvent & { order: number }> = []
+  for (const [order, event] of (events ?? []).entries()) {
+    if (event.name !== OPENJIUWEN_EVENTS.streamChunk) continue
+    const attributes = exactAttributeMap(event.attributes)
+    const sequence = safeEventSequence(
+      resolveNonNegativeInt64(attributes, [
+        OPENJIUWEN_ATTRIBUTES.eventSequence,
+      ])?.value,
+      order,
+    )
+    const kind = resolveClosedString(attributes, [
+      OPENJIUWEN_ATTRIBUTES.streamKind,
+    ], STREAM_KINDS)?.value ?? 'lifecycle'
+    const textValue = resolveString(attributes, [
+      OPENJIUWEN_ATTRIBUTES.streamText,
+    ])?.value
+    const toolCallId = resolveString(attributes, [
+      STANDARD_ATTRIBUTES.toolCallId,
+    ])?.value
+    const toolName = resolveString(attributes, [
+      STANDARD_ATTRIBUTES.toolName,
+    ])?.value
+    const argumentsDelta = resolveString(attributes, [
+      OPENJIUWEN_ATTRIBUTES.streamArgumentsDelta,
+    ])?.value
+    normalized.push({
+      sequence,
+      kind,
+      source: event.name,
+      ...(textValue === undefined ? {} : { text: textValue }),
+      ...(toolCallId === undefined ? {} : { toolCallId }),
+      ...(toolName === undefined ? {} : { toolName }),
+      ...(argumentsDelta === undefined ? {} : { argumentsDelta }),
+      order,
+    })
+  }
+  const ordered = normalized
+    .sort((left, right) => left.sequence - right.sequence || left.order - right.order)
+  const hasReplayableEvent = ordered.some(event => event.kind !== 'lifecycle')
+  const selected = new Map<string, typeof ordered[number]>()
+  for (const event of ordered) {
+    if (hasReplayableEvent && event.kind === 'lifecycle') continue
+    const identity = [
+      event.sequence,
+      event.kind,
+      event.toolCallId ?? '',
+      event.toolName ?? '',
+    ].join('\u0000')
+    if (!selected.has(identity)) selected.set(identity, event)
+  }
+  return [...selected.values()]
+    .sort((left, right) => left.sequence - right.sequence || left.order - right.order)
+    .map(event => ({
+      sequence: event.sequence,
+      kind: event.kind,
+      source: event.source,
+      ...(event.text === undefined ? {} : { text: event.text }),
+      ...(event.toolCallId === undefined ? {} : { toolCallId: event.toolCallId }),
+      ...(event.toolName === undefined ? {} : { toolName: event.toolName }),
+      ...(event.argumentsDelta === undefined ? {} : { argumentsDelta: event.argumentsDelta }),
+    }))
+}

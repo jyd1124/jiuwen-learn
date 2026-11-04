@@ -1,0 +1,107 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+
+from __future__ import annotations
+
+import os
+from typing import Any, Optional
+
+from openjiuwen.harness.rails.base import DeepAgentRail
+from openjiuwen.harness.rails._multimodal import (
+    build_read_image_multimodal_resolver,
+)
+from openjiuwen.harness.tools import BashTool, PowerShellTool
+from openjiuwen.harness.tools.code import CodeTool
+from openjiuwen.harness.tools.filesystem import (
+    EditFileTool,
+    GlobTool,
+    GrepTool,
+    ListDirTool,
+    ReadFileTool,
+    WriteFileTool,
+)
+
+
+class SysOperationRail(DeepAgentRail):
+    """Rail for registering filesystem, shell and code tools.
+
+    Purely init-time: it registers its tools in :meth:`init` and takes part in
+    no lifecycle hook. The high ``priority`` is about that registration, not
+    about callbacks -- rails are initialized in priority order, so anything
+    that needs the filesystem toolset present at init time only has to declare
+    a lower priority than this rail.
+    """
+
+    priority = 100
+
+    def __init__(
+        self,
+        *,
+        with_code_tool: bool = False,
+        read_only: bool = False,
+        enable_read_image_multimodal: Optional[bool] = None,
+        bash_deny_patterns: list[str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.tools: list[Any] | None = None
+        self._with_code_tool = with_code_tool
+        self._read_only = read_only
+        self._enable_read_image_multimodal = enable_read_image_multimodal
+        self._bash_deny_patterns = list(bash_deny_patterns or [])
+
+    def init(self, agent) -> None:
+        lang = agent.system_prompt_builder.language
+        agent_id = getattr(getattr(agent, "card", None), "id", None)
+        enable_read_image_multimodal = build_read_image_multimodal_resolver(
+            agent,
+            self._enable_read_image_multimodal,
+        )
+        read_tool = ReadFileTool(
+            self.sys_operation,
+            lang,
+            agent_id,
+            enable_image_multimodal=enable_read_image_multimodal,
+        )
+        write_tool = WriteFileTool(self.sys_operation, lang, agent_id)
+        edit_tool = EditFileTool(self.sys_operation, lang, agent_id)
+        glob_tool = GlobTool(self.sys_operation, lang, agent_id)
+        list_dir_tool = ListDirTool(self.sys_operation, lang, agent_id)
+        grep_tool = GrepTool(self.sys_operation, lang, agent_id)
+        bash_tool = BashTool(
+            self.sys_operation,
+            lang,
+            agent_id=agent_id,
+            deny_patterns=self._bash_deny_patterns,
+        )
+        powershell_tool = PowerShellTool(self.sys_operation, lang, agent_id=agent_id) if os.name == "nt" else None
+
+        shared = [glob_tool, list_dir_tool, grep_tool, bash_tool]
+        if self._read_only:
+            self.tools = [read_tool, *shared]
+        else:
+            self.tools = [read_tool, write_tool, edit_tool, *shared]
+        if powershell_tool is not None:
+            self.tools.append(powershell_tool)
+
+        if self._with_code_tool and not self._read_only:
+            self.tools.append(CodeTool(self.sys_operation, lang, agent_id))
+
+        # 工具 id 形如 "write_file_<agent_id>" 与 SysOperation 实例无关; 若上一次 agent
+        # 生命周期里的同名工具仍残留在 resource_mgr (例如 adapter cleanup 未驱动 rail.uninit),
+        # 旧工具实例继续持有过期的 SysOperation 引用, 导致 SANDBOX 切换时 fs/shell 调用走
+        # LOCAL 并写穿宿主。add_ability 对有状态工具用 refresh=True 注册: 已存在则先 remove
+        # 再 add, 天然处理这种残留 rebind。
+        for tool in self.tools:
+            agent.ability_manager.add_ability(tool.card, tool)
+
+    def uninit(self, agent):
+        if self.tools:
+            for tool in self.tools:
+                name = getattr(tool.card, 'name', None)
+                if name and hasattr(agent, 'ability_manager'):
+                    agent.ability_manager.remove_ability(name)
+
+
+__all__ = [
+    "SysOperationRail",
+]

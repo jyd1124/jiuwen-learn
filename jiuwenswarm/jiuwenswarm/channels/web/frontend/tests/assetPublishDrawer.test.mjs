@@ -1,0 +1,534 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import React, { act } from 'react';
+import { JSDOM } from 'jsdom';
+import i18next from 'i18next';
+import { initReactI18next } from 'react-i18next';
+const dom = new JSDOM('<div id="root"></div>', { url: 'http://localhost/' });
+Object.assign(globalThis, {
+  window: dom.window,
+  document: dom.window.document,
+  sessionStorage: dom.window.sessionStorage,
+  CustomEvent: dom.window.CustomEvent,
+  IS_REACT_ACT_ENVIRONMENT: true,
+});
+const { createRoot } = await import('react-dom/client');
+await i18next
+  .use(initReactI18next)
+  .init({ lng: 'en', showSupportNotice: false, resources: { en: { translation: {} } } });
+const { AssetPublishHost } =
+  await import('../node_modules/.cache/asset-publish-ui/components/AssetPublishDrawer/index.js');
+const { assetPublishApi, openAssetPublish } =
+  await import('../node_modules/.cache/asset-publish-ui/services/assetPublishApi.js');
+const tick = () =>
+  act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
+const find = (id) => document.querySelector(`[data-testid="${id}"]`);
+const defaults = {
+  asset_name: 'demo',
+  display_name: 'Demo',
+  description: 'Example',
+  version: '1.0.0',
+  tags: [],
+  version_desc: '',
+  visibility: 'public',
+};
+const description = { defaults, can_publish: true, errors: [], records: [], identity_verified: false };
+const draft = {
+  draft_id: 'draft',
+  can_submit: true,
+  errors: [],
+  warnings: [],
+  files: ['SKILL.md'],
+  excluded: [],
+  normalizations: [],
+  dependencies: [],
+  expires_at: Date.now() / 1000 + 600,
+  size_bytes: 100,
+  package_name: 'demo',
+  version: '1.0.0',
+};
+const root = createRoot(document.getElementById('root'));
+test('all five RPCs send the current token and provider without frontend identity claims', async () => {
+  const { webClient } = await import('../node_modules/.cache/asset-publish-ui/services/webClient.js');
+  const original = webClient.request;
+  const calls = [];
+  webClient.request = async (method, params) => {
+    calls.push({ method, params });
+    return {};
+  };
+  sessionStorage.setItem('marketplace_oauth_access_token', 'token-one');
+  sessionStorage.setItem('marketplace_oauth_provider', 'gitcode');
+  const ref = { kind: 'skill', local_id: 'demo' };
+  await assetPublishApi.describe(ref);
+  await assetPublishApi.prepare(ref, defaults, '', false);
+  await assetPublishApi.commit('draft', 'same-request');
+  sessionStorage.setItem('marketplace_oauth_access_token', 'token-two');
+  sessionStorage.setItem('marketplace_oauth_provider', 'github');
+  await assetPublishApi.status('operation');
+  await assetPublishApi.records(ref);
+  assert.deepEqual(
+    calls.map((call) => call.method),
+    [
+      'assets.publish.describe',
+      'assets.publish.prepare',
+      'assets.publish.commit',
+      'assets.publish.status',
+      'assets.publish.records',
+    ],
+  );
+  assert.equal(calls[0].params.auth.access_token, 'token-one');
+  assert.equal(calls[4].params.auth.access_token, 'token-two');
+  assert.equal(calls[4].params.auth.oauth_provider, 'github');
+  assert.equal(calls[0].params.user_id, undefined);
+  webClient.request = original;
+});
+test('publish form uses compact resource, account, grouped settings, and folded secondary content', async () => {
+  sessionStorage.setItem('marketplace_oauth_access_token', 'test-token');
+  sessionStorage.setItem('marketplace_oauth_provider', 'gitcode');
+  sessionStorage.setItem(
+    'marketplace_oauth_user',
+    JSON.stringify({ id: 'user-1', name: 'Alice', login: 'alice', avatar_url: '', is_market_moderation_admin: false }),
+  );
+  assetPublishApi.describe = async () => ({
+    ...description,
+    hub_url: 'https://swarmskills.openjiuwen.com/',
+  });
+  await act(async () => root.render(React.createElement(AssetPublishHost)));
+  await act(async () =>
+    openAssetPublish({
+      kind: 'skill',
+      local_id: 'demo-skill',
+      avatar_url: 'data:image/png;base64,ZGVtby1hdmF0YXI=',
+    }),
+  );
+  await tick();
+
+  assert.match(find('asset-publish-resource-summary').textContent, /Demo/);
+  assert.match(find('asset-publish-resource-summary').textContent, /Skill/);
+  assert.equal(find('asset-publish-resource-avatar-image').getAttribute('src'), 'data:image/png;base64,ZGVtby1hdmF0YXI=');
+  assert.equal(find('asset-publish-resource-id').title, 'demo-skill');
+  assert.match(find('asset-publish-account-card').textContent, /GitCode/);
+  assert.equal(find('asset-publish-provider-icon').dataset.variant, 'gitcode');
+  assert.equal(find('asset-publish-provider-icon').getAttribute('alt'), '');
+  assert.match(find('asset-publish-account-card').textContent, /Alice/);
+  assert.match(find('asset-publish-account-card').textContent, /swarmskills\.openjiuwen\.com/);
+  assert.ok(find('asset-publish-switch-account'));
+  assert.equal(document.querySelectorAll('[data-testid="asset-publish-provider"]').length, 0);
+
+  assert.ok(document.querySelector('[data-testid="asset-publish-form-section"][data-variant="basic"]'));
+  assert.ok(document.querySelector('[data-testid="asset-publish-form-section"][data-variant="publish"]'));
+  assert.ok(document.querySelector('[data-testid="asset-publish-form-section"][data-variant="advanced"]'));
+  assert.equal(document.querySelectorAll('[data-testid="asset-publish-visibility-option"]').length, 2);
+  assert.equal(find('asset-publish-visibility'), null);
+  assert.ok(find('asset-publish-records-fold'));
+  assert.equal(find('asset-publish-records-fold').open, false);
+  assert.match(find('asset-publish-records-fold').textContent, /Local publishing history/);
+  assert.doesNotMatch(find('asset-publish-records-fold').querySelector('summary').textContent, /\(0\)/);
+  assert.match(find('asset-publish-records-help').dataset.tooltip, /does not represent the latest Hub moderation status/);
+  assert.equal(find('asset-publish-records-help').closest('summary') !== null, true);
+  assert.match(find('asset-publish-advanced-help').dataset.tooltip, /updating an existing resource/);
+  assert.equal(find('asset-publish-advanced-help').closest('summary') !== null, true);
+  assert.equal(find('asset-publish-advanced-help').className, find('asset-publish-records-help').className);
+  assert.equal(find('asset-publish-refresh').closest('[data-testid="asset-publish-records-fold"]') !== null, true);
+  assert.equal(find('asset-publish-refresh').closest('[data-testid="asset-publish-records-toolbar"]') !== null, true);
+  assert.match(find('asset-publish-records').textContent, /No local publishing records/);
+  assert.equal(find('asset-publish-tags').closest('label').textContent.includes('comma separated'), false);
+  const hints = [...document.querySelectorAll('[data-testid="asset-publish-field-hint"]')];
+  assert.equal(hints.length, 4);
+  assert.ok(hints.every((hint) => hint.dataset.tooltip?.length > 20));
+  assert.ok(hints.every((hint) => hint.tabIndex === 0));
+
+  await act(async () => find('asset-publish-close').click());
+  sessionStorage.removeItem('marketplace_oauth_user');
+});
+test('all four kinds open the shared review, retain moderation result, and never trust install ownership', async () => {
+  sessionStorage.setItem('marketplace_oauth_access_token', 'test-token');
+  const refs = [];
+  const submits = [];
+  assetPublishApi.describe = async (ref) => {
+    refs.push(ref);
+    return description;
+  };
+  assetPublishApi.prepare = async (...args) => {
+    submits.push(args);
+    return draft;
+  };
+  assetPublishApi.commit = async () => ({
+    operation_id: 'op',
+    execution_status: 'completed',
+    result: { publish_result: 'pending_moderation', visibility: null, asset_id: 'hub-asset', version: '1.0.0' },
+    error: null,
+    updated_at: '2026-09-16T06:49:59Z',
+  });
+  await act(async () => root.render(React.createElement(AssetPublishHost)));
+  for (const kind of ['skill', 'agent_template', 'agent_group', 'plugin', 'mcp']) {
+    await act(async () => openAssetPublish({ kind, local_id: 'demo' }));
+    await tick();
+    assert.ok(find('asset-publish-drawer'));
+    assert.equal(find('asset-publish-target').value, '');
+    await act(async () =>
+      find('asset-publish-form').dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true })),
+    );
+    await tick();
+    assert.ok(find('asset-publish-review'));
+    assert.equal(find('asset-publish-notice'), null);
+    assert.equal(submits.at(-1)[2], '');
+    assert.equal(submits.at(-1)[3], false);
+    await act(async () => find('asset-publish-commit').click());
+    await tick();
+    assert.equal(find('asset-publish-result').dataset.variant, 'submitted');
+    assert.ok(find('asset-publish-result-header'));
+    assert.ok(find('asset-publish-result-metadata'));
+    assert.match(find('asset-publish-result-metadata').textContent, /hub-asset/);
+    assert.match(find('asset-publish-result-metadata').textContent, /1\.0\.0/);
+    assert.ok(find('asset-publish-result-footer'));
+    assert.equal(find('asset-publish-new-version').closest('[data-testid="asset-publish-result-footer"]') !== null, true);
+    assert.equal(find('asset-publish-notice'), null);
+    assert.equal(find('asset-publish-visibility-unconfirmed'), null);
+    await act(async () => find('asset-publish-close').click());
+  }
+  assert.deepEqual(
+    refs.map((ref) => ref.kind),
+    ['skill', 'agent_template', 'agent_group', 'plugin', 'mcp'],
+  );
+});
+test('account change discards an in-flight prepare result', async () => {
+  let resolve;
+  assetPublishApi.prepare = () => new Promise((r) => (resolve = r));
+  await act(async () => openAssetPublish({ kind: 'mcp', local_id: 'custom' }));
+  await tick();
+  await act(async () =>
+    find('asset-publish-form').dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true })),
+  );
+  await act(async () => {
+    sessionStorage.setItem('marketplace_oauth_access_token', 'different-token');
+    window.dispatchEvent(new dom.window.Event('oauth-callback-complete'));
+  });
+  await act(async () => resolve(draft));
+  await tick();
+  assert.equal(find('asset-publish-commit').disabled, true);
+  await act(async () => find('asset-publish-close').click());
+});
+test('unresolved submission cannot be replaced by old history or lose its retry id', async () => {
+  const ids = [];
+  const old = {
+    operation_id: 'old',
+    draft_id: 'old-draft',
+    execution_status: 'completed',
+    result: { publish_result: 'published', version: '0.9.0' },
+    error: null,
+  };
+  assetPublishApi.describe = async () => description;
+  assetPublishApi.prepare = async () => draft;
+  assetPublishApi.commit = async (_draft, id) => {
+    ids.push(id);
+    throw Object.assign(new Error('Timed out'), { code: 'REQUEST_TIMEOUT' });
+  };
+  assetPublishApi.records = async () => ({ records: [old] });
+  await act(async () => openAssetPublish({ kind: 'plugin', local_id: 'uncertain' }));
+  await tick();
+  await act(async () =>
+    find('asset-publish-form').dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true })),
+  );
+  await tick();
+  await act(async () => find('asset-publish-commit').click());
+  await tick();
+  await act(async () => find('asset-publish-refresh').click());
+  await tick();
+  assert.equal(!!find('asset-publish-result'), false);
+  assert.equal(find('asset-publish-record').disabled, true);
+  assert.equal(find('asset-publish-edit').disabled, true);
+  await act(async () => find('asset-publish-record').click());
+  assert.equal(!!find('asset-publish-new-version'), false);
+  await act(async () => find('asset-publish-commit').click());
+  await tick();
+  assert.equal(ids.length, 2);
+  assert.equal(ids[0], ids[1]);
+  assetPublishApi.records = async () => ({
+    records: [
+      old,
+      {
+        ...old,
+        operation_id: 'recovered',
+        draft_id: 'draft',
+        result: { publish_result: 'pending_moderation', version: '1.0.0' },
+      },
+    ],
+  });
+  await act(async () => find('asset-publish-refresh').click());
+  await tick();
+  assert.equal(find('asset-publish-result').dataset.variant, 'submitted');
+  assert.ok(find('asset-publish-new-version'));
+  await act(async () => find('asset-publish-close').click());
+});
+test('definitive expired draft rejection unlocks editing and requires a new package check', async () => {
+  for (const rejection of [
+    Object.assign(new Error('Rejected'), { code: 'DRAFT_EXPIRED' }),
+    new Error('draft_expired'),
+  ]) {
+    assetPublishApi.describe = async () => description;
+    assetPublishApi.prepare = async () => draft;
+    assetPublishApi.commit = async () => {
+      throw rejection;
+    };
+    await act(async () => openAssetPublish({ kind: 'skill', local_id: 'expired' }));
+    await tick();
+    await act(async () =>
+      find('asset-publish-form').dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true })),
+    );
+    await tick();
+    await act(async () => find('asset-publish-commit').click());
+    await tick();
+    assert.equal(find('asset-publish-edit').disabled, false);
+    assert.equal(find('asset-publish-commit').disabled, true);
+    assert.match(find('asset-publish-error').textContent, /expired/i);
+    await act(async () => find('asset-publish-edit').click());
+    assert.ok(find('asset-publish-prepare'));
+    await act(async () => find('asset-publish-close').click());
+  }
+});
+test('Hub request rejection identifies Hub and gives actionable guidance', async () => {
+  assetPublishApi.describe = async () => description;
+  assetPublishApi.prepare = async () => draft;
+  assetPublishApi.commit = async () => ({
+    operation_id: 'hub-rejected-operation',
+    draft_id: 'draft',
+    execution_status: 'failed',
+    result: null,
+    error: { code: 'hub_request_failed' },
+    updated_at: '2026-09-24T06:00:00Z',
+  });
+  await act(async () => openAssetPublish({ kind: 'agent_template', local_id: 'hub-rejected' }));
+  await tick();
+  await act(async () =>
+    find('asset-publish-form').dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true })),
+  );
+  await tick();
+  await act(async () => find('asset-publish-commit').click());
+  await tick();
+  const message = document.querySelector('.asset-publish-result-error').textContent;
+  assert.match(message, /Hub did not accept this publishing request/);
+  assert.match(message, /contact the Hub administrator/);
+  assert.doesNotMatch(message, /hub_request_failed/i);
+  await act(async () => find('asset-publish-close').click());
+});
+test('record errors show the Hub guidance instead of the generic fallback', async () => {
+  const record = {
+    operation_id: 'hub-guidance',
+    execution_status: 'failed',
+    result: null,
+    error: {
+      code: 'hub_request_failed',
+      message: '发布新版本时不能修改 Skill 可见性，请沿用现有设置',
+    },
+  };
+  assetPublishApi.describe = async () => ({ ...description, records: [record] });
+  assetPublishApi.records = async () => ({ records: [record] });
+  await act(async () => openAssetPublish({ kind: 'skill', local_id: 'hub-guidance' }));
+  await tick();
+  const message = document.querySelector('.asset-publish-result-error').textContent;
+  assert.equal(message, '发布新版本时不能修改 Skill 可见性，请沿用现有设置');
+  assert.doesNotMatch(message, /Retry or sign in again/);
+  await act(async () => find('asset-publish-close').click());
+});
+test('curated local text keeps priority for known codes', async () => {
+  const record = {
+    operation_id: 'version-clash',
+    execution_status: 'failed',
+    result: null,
+    error: { code: 'VERSION_CONFLICT', message: 'hub-only wording' },
+  };
+  assetPublishApi.describe = async () => ({ ...description, records: [record] });
+  assetPublishApi.records = async () => ({ records: [record] });
+  await act(async () => openAssetPublish({ kind: 'skill', local_id: 'version-clash' }));
+  await tick();
+  const message = document.querySelector('.asset-publish-result-error').textContent;
+  assert.match(message, /This version exists/);
+  assert.doesNotMatch(message, /hub-only wording/);
+  await act(async () => find('asset-publish-close').click());
+});
+test('polling completion updates the matching history row', async () => {
+  const queued = { operation_id: 'polled', draft_id: 'draft', execution_status: 'queued', result: null, error: null };
+  assetPublishApi.describe = async () => ({ ...description, records: [queued] });
+  assetPublishApi.status = async () => ({
+    ...queued,
+    execution_status: 'completed',
+    result: { publish_result: 'pending_moderation' },
+  });
+  await act(async () => openAssetPublish({ kind: 'mcp', local_id: 'poll' }));
+  await tick();
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 2100));
+  });
+  const polledRow = find('asset-publish-record').textContent;
+  assert.match(polledRow, /submitted/i);
+  assert.doesNotMatch(polledRow, /pending moderation/i);
+  await act(async () => find('asset-publish-close').click());
+});
+test('completed records use the same local text, variants, and icon regardless of Hub result', async () => {
+  for (const publishResult of ['pending_moderation', 'published', 'unrecognized']) {
+    const record = {
+      operation_id: `local-${publishResult}`,
+      execution_status: 'completed',
+      result: { publish_result: publishResult, version: '1.0.0' },
+      error: null,
+    };
+    assetPublishApi.describe = async () => ({ ...description, records: [record] });
+    assetPublishApi.records = async () => ({ records: [record] });
+    await act(async () => openAssetPublish({ kind: 'plugin', local_id: record.operation_id }));
+    await tick();
+
+    assert.equal(find('asset-publish-result').dataset.variant, 'submitted');
+    assert.equal(find('asset-publish-result-status').textContent, 'Submitted');
+    assert.ok(find('asset-publish-result-icon').querySelector('svg.lucide-circle-check'));
+    const historyRow = find('asset-publish-record');
+    assert.equal(historyRow.dataset.variant, record.operation_id);
+    const status = find('asset-publish-record-status');
+    assert.equal(status.textContent, 'Submitted');
+    assert.equal(status.dataset.variant, 'submitted');
+    await act(async () => find('asset-publish-close').click());
+  }
+});
+test('unconfirmed submissions keep their local variant and waiting icon', async () => {
+  const record = {
+    operation_id: 'local-unconfirmed',
+    execution_status: 'unknown',
+    result: null,
+    error: null,
+  };
+  assetPublishApi.describe = async () => ({ ...description, records: [record] });
+  assetPublishApi.records = async () => ({ records: [record] });
+  await act(async () => openAssetPublish({ kind: 'plugin', local_id: record.operation_id }));
+  await tick();
+
+  assert.equal(find('asset-publish-result').dataset.variant, 'unconfirmed');
+  assert.equal(find('asset-publish-result-status').textContent, 'Submission result unconfirmed');
+  assert.ok(find('asset-publish-result-icon').querySelector('svg.lucide-clock-3'));
+  const status = find('asset-publish-record-status');
+  assert.equal(status.textContent, 'Submission result unconfirmed');
+  assert.equal(status.dataset.variant, 'unconfirmed');
+  // #4749: an unverified outcome must not lock the asset; the drawer keeps an exit.
+  const entry = find('asset-publish-new-version');
+  assert.ok(entry);
+  assert.equal(entry.disabled, false);
+  assert.equal(find('asset-publish-record').disabled, false);
+  await act(async () => entry.click());
+  await tick();
+  assert.equal(find('asset-publish-result'), null);
+  assert.ok(find('asset-publish-form'));
+  await act(async () => find('asset-publish-close').click());
+});
+test('undefined placeholders show a localized package error without asking for a new login', async () => {
+  assetPublishApi.describe = async () => description;
+  assetPublishApi.prepare = async () => {
+    throw Object.assign(new Error('privatevalue'), { code: 'UNDEFINED_PLACEHOLDER' });
+  };
+  let commitCalls = 0;
+  assetPublishApi.commit = async () => { commitCalls++; };
+  for (const language of ['zh', 'en']) {
+    await act(async () => i18next.changeLanguage(language));
+    await act(async () => openAssetPublish({ kind: 'mcp', local_id: 'canva' }));
+    await tick();
+    await act(async () =>
+      find('asset-publish-form').dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true })),
+    );
+    await tick();
+    const message = find('asset-publish-error').textContent;
+    assert.match(message, language === 'zh' ? /未声明的参数/ : /undeclared parameter/);
+    assert.doesNotMatch(message, /privatevalue|请求未完成|The request did not complete/);
+    assert.equal(find('asset-publish-commit').disabled, true);
+    assert.equal(commitCalls, 0);
+    await act(async () => find('asset-publish-close').click());
+  }
+  await act(async () => i18next.changeLanguage('en'));
+});
+
+test('persisted Hub MCP rejection shows a package error in both languages without resubmitting', async () => {
+  const record = {
+    operation_id: 'canva-failed',
+    execution_status: 'failed',
+    result: null,
+    error: { code: 'invalid_agent_mcp', http_status: 400, message: 'privatevalue' },
+    version: '1.0.0',
+  };
+  assetPublishApi.describe = async () => ({ ...description, records: [record] });
+  assetPublishApi.records = async () => ({ records: [record] });
+  let calls = 0;
+  assetPublishApi.commit = async () => { calls++; };
+  assetPublishApi.prepare = async () => { calls++; };
+  for (const language of ['zh', 'en']) {
+    await act(async () => i18next.changeLanguage(language));
+    await act(async () => openAssetPublish({ kind: 'mcp', local_id: 'canva' }));
+    await tick();
+    const content = find('asset-publish-result').textContent;
+    assert.match(content, /invalid_agent_mcp/);
+    assert.match(content, language === 'zh' ? /包校验/ : /package validation/);
+    assert.doesNotMatch(content, /privatevalue|请求未完成|The request did not complete/);
+    assert.equal(calls, 0);
+    await act(async () => find('asset-publish-close').click());
+  }
+  await act(async () => i18next.changeLanguage('en'));
+});
+
+test('logged-out publishing loads local names for all five kinds and preserves edits after login', async () => {
+  for (const kind of ['skill', 'agent_template', 'agent_group', 'plugin', 'mcp']) {
+    sessionStorage.removeItem('marketplace_oauth_access_token');
+    let resolveDescription;
+    assetPublishApi.describe = () => new Promise((resolve) => {
+      resolveDescription = resolve;
+    });
+    await act(async () => openAssetPublish({ kind, local_id: '1022' }));
+    await tick();
+    try {
+      assert.equal(find('asset-publish-display-name').closest('fieldset').disabled, true);
+      assert.equal(typeof resolveDescription, 'function');
+      await act(async () => resolveDescription({
+        ...description,
+        defaults: { ...defaults, display_name: '中文资产', description: '本地介绍' },
+      }));
+      assert.equal(find('asset-publish-display-name').value, '中文资产');
+      assert.equal(find('asset-publish-description').value, '本地介绍');
+      assert.equal(find('asset-publish-prepare').disabled, true);
+      const input = find('asset-publish-display-name');
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value').set.call(input, '用户修改名称');
+        input.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+        input.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+        input.dispatchEvent(new dom.window.FocusEvent('focusout', { bubbles: true }));
+      });
+      assetPublishApi.describe = async () => description;
+      await act(async () => {
+        sessionStorage.setItem('marketplace_oauth_access_token', 'test-token');
+        window.dispatchEvent(new dom.window.Event('storage'));
+      });
+      await tick();
+      assert.equal(find('asset-publish-display-name').value, '用户修改名称');
+    } finally {
+      await act(async () => find('asset-publish-close').click());
+    }
+  }
+});
+test('OAuth restore contains metadata and does not auto prepare or commit', async () => {
+  assetPublishApi.describe = async () => description;
+  let called = 0;
+  assetPublishApi.prepare = async () => {
+    called++;
+    return draft;
+  };
+  sessionStorage.setItem(
+    'asset-publish-metadata',
+    JSON.stringify({
+      reference: { kind: 'plugin', local_id: 'restored' },
+      metadata: { ...defaults, display_name: 'Restored' },
+    }),
+  );
+  await act(async () => window.dispatchEvent(new dom.window.Event('oauth-callback-complete')));
+  await tick();
+  assert.equal(find('asset-publish-display-name').value, 'Restored');
+  assert.equal(called, 0);
+  assert.equal(sessionStorage.getItem('asset-publish-metadata'), null);
+  await act(async () => root.unmount());
+  dom.window.close();
+});

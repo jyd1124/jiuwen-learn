@@ -1,0 +1,236 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+"""BM25 index adapter for deferred tool discovery.
+
+The scoring/tokenization implementation lives in the context engine's shared
+BM25 module. This adapter only maps ``ToolInfo`` records to searchable text
+and keeps the corresponding schemas beside the immutable index.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import inspect
+import json
+from typing import Any, List, Sequence
+
+from pydantic import BaseModel
+
+from openjiuwen.core.context_engine.processor.forked.compressor.recall.bm25 import (
+    BM25Index,
+)
+from openjiuwen.core.foundation.tool import ToolInfo
+
+
+def _parameters_text(parameters: Any) -> str:
+    if inspect.isclass(parameters) and issubclass(parameters, BaseModel):
+        try:
+            parameters = parameters.model_json_schema()
+        except Exception:
+            return str(parameters)
+    if isinstance(parameters, dict):
+        try:
+            return json.dumps(parameters, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return str(parameters)
+    return str(parameters or "")
+
+
+def _tool_text(tool: ToolInfo) -> str:
+    return " ".join(
+        [
+            str(getattr(tool, "name", "") or ""),
+            str(getattr(tool, "description", "") or ""),
+            _parameters_text(getattr(tool, "parameters", None)),
+        ]
+    )
+
+
+def _tool_signature(tool: ToolInfo) -> dict[str, str]:
+    """Return the searchable/schema fields used to identify a tool version."""
+    return {
+        "type": str(getattr(tool, "type", "") or ""),
+        "name": str(getattr(tool, "name", "") or ""),
+        "description": str(getattr(tool, "description", "") or ""),
+        "parameters": _parameters_text(getattr(tool, "parameters", None)),
+    }
+
+
+def _tool_fingerprint(tool: ToolInfo) -> str:
+    """Create a deterministic fingerprint for a model-facing tool record."""
+    serialized = json.dumps(
+        _tool_signature(tool),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _is_tool_name_boundary_char(value: str) -> bool:
+    """Return whether a character can be part of an ASCII tool identifier."""
+    return bool(value) and value.isascii() and (value.isalnum() or value in "_.-")
+
+
+def _contains_exact_tool_name(query: str, tool_name: str) -> bool:
+    """Check whether ``query`` contains ``tool_name`` as a complete identifier.
+
+    Tool names are normally ASCII identifiers such as ``search_skill``. Treat
+    Chinese characters and punctuation as boundaries so natural-language
+    queries like ``请调用search_skill搜索技能`` still match, while avoiding
+    false positives inside names such as ``search_skill_extra``.
+    """
+    normalized_query = str(query or "").casefold()
+    normalized_name = str(tool_name or "").strip().casefold()
+    if not normalized_query or not normalized_name:
+        return False
+
+    start = 0
+    while start < len(normalized_query):
+        match_index = normalized_query.find(normalized_name, start)
+        if match_index < 0:
+            return False
+
+        before = normalized_query[match_index - 1] if match_index else ""
+        end_index = match_index + len(normalized_name)
+        after = normalized_query[end_index] if end_index < len(normalized_query) else ""
+        if not _is_tool_name_boundary_char(before) and not _is_tool_name_boundary_char(after):
+            return True
+
+        start = match_index + 1
+
+    return False
+
+
+def _pair_documents_with_search_texts(
+    documents: Sequence[ToolInfo],
+    extra_search_texts: Sequence[str] | None,
+) -> list[tuple[ToolInfo, str]]:
+    """Align valid documents with their optional discovery-only text."""
+    if extra_search_texts is not None and len(extra_search_texts) != len(documents):
+        raise ValueError("extra_search_texts must align with documents")
+
+    pairs: list[tuple[ToolInfo, str]] = []
+    for index, document in enumerate(documents):
+        if document is None:
+            continue
+        extra_search_text = "" if extra_search_texts is None else extra_search_texts[index]
+        pairs.append((document, str(extra_search_text or "")))
+    return pairs
+
+
+class BM25ToolIndex:
+    """In-memory BM25 index over model-facing tool schemas.
+
+    The index is immutable after :meth:`build`; callers replace the whole
+    instance when the indexed tool metadata changes. This keeps searches
+    lock-free and makes it explicit when a rebuild occurs.
+    """
+
+    def __init__(
+        self,
+        documents: Sequence[ToolInfo],
+        index: BM25Index,
+        source_fingerprint: str | None = None,
+    ) -> None:
+        self._documents = tuple(documents)
+        self._index = index
+        self._source_fingerprint = source_fingerprint or self.fingerprint(documents)
+
+    @classmethod
+    def build(
+        cls,
+        documents: Sequence[ToolInfo],
+        *,
+        extra_search_texts: Sequence[str] | None = None,
+    ) -> "BM25ToolIndex":
+        pairs = _pair_documents_with_search_texts(documents, extra_search_texts)
+        normalized_documents = [document for document, _ in pairs]
+        normalized_extra_search_texts = [extra for _, extra in pairs]
+        index = BM25Index.build(
+            [
+                " ".join((_tool_text(document), extra_search_text)).strip()
+                for document, extra_search_text in pairs
+            ]
+        )
+        return cls(
+            normalized_documents,
+            index,
+            source_fingerprint=cls.fingerprint(
+                normalized_documents,
+                extra_search_texts=normalized_extra_search_texts,
+            ),
+        )
+
+    @staticmethod
+    def fingerprint(
+        documents: Sequence[ToolInfo],
+        *,
+        extra_search_texts: Sequence[str] | None = None,
+    ) -> str:
+        """Return a deterministic fingerprint for the complete document set."""
+        pairs = _pair_documents_with_search_texts(documents, extra_search_texts)
+        document_fingerprints = []
+        for document, extra_search_text in pairs:
+            document_fingerprints.append(
+                (
+                    _tool_fingerprint(document),
+                    extra_search_text,
+                )
+            )
+        document_fingerprints.sort()
+        serialized = json.dumps(
+            document_fingerprints,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def tool_fingerprint(document: ToolInfo) -> str:
+        """Return the fingerprint used for one search result authorization."""
+        return _tool_fingerprint(document)
+
+    @property
+    def document_count(self) -> int:
+        return self._index.document_count
+
+    @property
+    def documents(self) -> tuple[ToolInfo, ...]:
+        return self._documents
+
+    @property
+    def source_fingerprint(self) -> str:
+        """Fingerprint of the tool metadata used to build this index."""
+        return self._source_fingerprint
+
+    def search(self, query: str, *, limit: int = 5) -> List[ToolInfo]:
+        if limit <= 0:
+            return []
+
+        if not query or not self._documents:
+            return []
+
+        scored = []
+        for index, score in enumerate(self._index.scores(query)):
+            document = self._documents[index]
+            exact_name_match = _contains_exact_tool_name(
+                query,
+                str(getattr(document, "name", "") or ""),
+            )
+            if score <= 0.0 and not exact_name_match:
+                continue
+            scored.append((exact_name_match, score, index, document))
+
+        scored.sort(
+            key=lambda item: (
+                not item[0],
+                -item[1],
+                str(getattr(item[3], "name", "") or ""),
+                item[2],
+            )
+        )
+        return [document for _, _, _, document in scored[:limit]]
+
+
+__all__ = ["BM25ToolIndex"]

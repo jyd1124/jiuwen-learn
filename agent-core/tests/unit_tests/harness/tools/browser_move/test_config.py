@@ -1,0 +1,522 @@
+#!/usr/bin/env python
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+"""Tests for browser_move config and MCP compatibility plumbing."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from openjiuwen.core.foundation.tool import McpServerConfig
+from openjiuwen.harness.tools.browser_move.clients.streamable_http_client import (
+    BrowserMoveStreamableHttpClient,
+)
+from openjiuwen.harness.tools.browser_move.playwright_runtime import browser_tools as browser_tools_module
+from openjiuwen.harness.tools.browser_move.playwright_runtime.agents import (
+    ensure_execute_signature_compat,
+)
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools import (
+    build_browser_runtime_mcp_config,
+)
+from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
+    DEFAULT_BROWSER_TIMEOUT_S,
+    DEFAULT_GUARDRAIL_MAX_FAILURES,
+    DEFAULT_GUARDRAIL_MAX_STEPS,
+    DEFAULT_MODEL_NAME,
+    BrowserInstanceConfig,
+    build_playwright_mcp_config,
+    build_runtime_settings,
+    parse_command_args,
+)
+from openjiuwen.harness.tools.browser_move.utils.parsing import extract_json_object
+
+
+def _run(coro: Any) -> Any:
+    return asyncio.run(coro)
+
+
+class _ToolCall:
+    def __init__(self, name: str, arguments: str = "{}"):
+        self.name = name
+        self.arguments = arguments
+
+
+class _Agent:
+    def __init__(self, ability_manager: Any):
+        self.ability_manager = ability_manager
+
+
+class _HangingAbilityManager:
+    async def execute(self, ctx: Any, tool_call: Any, session: Any, tag: Any = None):
+        await asyncio.sleep(1.0)
+        return [({"ok": True, "shape": "ctx"}, None)]
+
+
+class _RecordingAbilityManager:
+    def __init__(self) -> None:
+        self.seen_arguments: str | None = None
+
+    async def execute(self, ctx: Any, tool_call: Any, session: Any, tag: Any = None):
+        del ctx, session, tag
+        self.seen_arguments = tool_call.arguments
+        return [({"ok": True, "shape": "ctx"}, None)]
+
+
+def test_build_runtime_settings_uses_shared_defaults() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        settings = build_runtime_settings()
+
+        assert settings.provider == "openai"
+        assert settings.api_key == ""
+        assert settings.api_base == "https://api.openai.com/v1"
+        assert settings.model_name == DEFAULT_MODEL_NAME
+        assert settings.guardrails.max_steps == DEFAULT_GUARDRAIL_MAX_STEPS
+        assert settings.guardrails.max_failures == DEFAULT_GUARDRAIL_MAX_FAILURES
+        assert settings.guardrails.timeout_s == DEFAULT_BROWSER_TIMEOUT_S
+        assert settings.mcp_cfg.params["timeout_s"] == DEFAULT_BROWSER_TIMEOUT_S
+
+
+def test_build_runtime_settings_respects_env_overrides() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "MODEL_PROVIDER": "openrouter",
+            "OPENROUTER_API_KEY": "test-key",
+            "MODEL_NAME": "google/gemini-3.1-pro-preview",
+            "BROWSER_TIMEOUT_S": "45",
+            "PLAYWRIGHT_MCP_ARGS": '["-y", "@playwright/mcp@0.0.78", "--headless"]',
+        },
+        clear=True,
+    ):
+        settings = build_runtime_settings()
+
+        assert settings.provider == "openrouter"
+        assert settings.api_key == "test-key"
+        assert settings.model_name == "google/gemini-3.1-pro-preview"
+        assert settings.guardrails.timeout_s == 45
+        assert settings.mcp_cfg.params["args"] == [
+            "-y",
+            "@playwright/mcp@0.0.78",
+            "--headless",
+            "--caps=pdf,vision,devtools,config,network,storage,testing",
+        ]
+        assert settings.mcp_cfg.params["timeout_s"] == 45
+
+
+def test_build_playwright_mcp_config_enables_all_optional_capabilities_by_default() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        cfg = build_playwright_mcp_config()
+
+    assert cfg.params["args"][-1] == "--caps=pdf,vision,devtools,config,network,storage,testing"
+
+
+def test_model_policy_capabilities_are_not_forwarded_as_playwright_caps() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        cfg = build_playwright_mcp_config()
+
+    caps_arg = cfg.params["args"][-1]
+    assert "advanced_code" not in caps_arg
+    assert "unsafe_dev" not in caps_arg
+
+
+def test_build_playwright_mcp_config_preserves_other_capabilities() -> None:
+    with patch.dict(
+        os.environ,
+        {"PLAYWRIGHT_MCP_ARGS": "-y @playwright/mcp@0.0.78 --caps=vision,devtools"},
+        clear=True,
+    ):
+        cfg = build_playwright_mcp_config()
+
+    assert cfg.params["args"] == [
+        "-y",
+        "@playwright/mcp@0.0.78",
+        "--caps=vision,devtools,pdf,config,network,storage,testing",
+    ]
+
+
+def test_build_playwright_mcp_config_deduplicates_capabilities() -> None:
+    with patch.dict(
+        os.environ,
+        {"PLAYWRIGHT_MCP_ARGS": "-y @playwright/mcp@0.0.78 --caps pdf,vision,pdf"},
+        clear=True,
+    ):
+        cfg = build_playwright_mcp_config()
+
+    assert cfg.params["args"] == [
+        "-y",
+        "@playwright/mcp@0.0.78",
+        "--caps=pdf,vision,devtools,config,network,storage,testing",
+    ]
+
+
+def test_parse_command_args_accepts_json_list() -> None:
+    assert parse_command_args('["-y", "@playwright/mcp@0.0.78"]') == ["-y", "@playwright/mcp@0.0.78"]
+
+
+def test_extract_json_object_handles_fenced_json() -> None:
+    assert extract_json_object('```json\n{"ok": true, "value": 1}\n```') == {"ok": True, "value": 1}
+
+
+def test_build_browser_runtime_mcp_config_disabled_by_default() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        assert build_browser_runtime_mcp_config() is None
+
+
+def test_build_browser_runtime_mcp_config_streamable_http_defaults() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "PLAYWRIGHT_RUNTIME_MCP_ENABLED": "1",
+            "PLAYWRIGHT_RUNTIME_MCP_CLIENT_TYPE": "http",
+            "PLAYWRIGHT_RUNTIME_MCP_HOST": "127.0.0.1",
+            "PLAYWRIGHT_RUNTIME_MCP_PORT": "8940",
+        },
+        clear=True,
+    ):
+        cfg = build_browser_runtime_mcp_config()
+
+    assert cfg is not None
+    assert cfg.client_type == "streamable-http"
+    assert cfg.server_path == "http://127.0.0.1:8940/mcp"
+
+
+def test_build_browser_runtime_mcp_config_stdio_defaults() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "PLAYWRIGHT_RUNTIME_MCP_ENABLED": "1",
+            "PLAYWRIGHT_RUNTIME_MCP_CLIENT_TYPE": "stdio",
+        },
+        clear=True,
+    ):
+        cfg = build_browser_runtime_mcp_config()
+
+    assert cfg is not None
+    assert cfg.client_type == "stdio"
+    assert cfg.server_path == "stdio://playwright-runtime-wrapper"
+    assert cfg.params["cwd"] == str(Path.cwd().resolve())
+    args = cfg.params["args"]
+    assert args[:2] == ["-m", "openjiuwen.harness.tools.browser_move.playwright_runtime_mcp_server"]
+    assert "--transport" in args
+    assert "stdio" in args
+    assert "--no-banner" in args
+    assert "--log-level" in args
+    assert "ERROR" in args
+
+
+def test_build_browser_runtime_mcp_config_supports_legacy_env_names() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "BROWSER_RUNTIME_MCP_ENABLED": "1",
+            "BROWSER_RUNTIME_MCP_CLIENT_TYPE": "streamable_http",
+            "BROWSER_RUNTIME_MCP_HOST": "localhost",
+            "BROWSER_RUNTIME_MCP_PORT": "9999",
+            "BROWSER_RUNTIME_MCP_PATH": "custom",
+        },
+        clear=True,
+    ):
+        cfg = build_browser_runtime_mcp_config()
+
+    assert cfg is not None
+    assert cfg.client_type == "streamable-http"
+    assert cfg.server_path == "http://localhost:9999/custom"
+
+
+def test_build_browser_runtime_mcp_config_stdio_passes_child_env_and_maps_openai() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "PLAYWRIGHT_RUNTIME_MCP_ENABLED": "1",
+            "PLAYWRIGHT_RUNTIME_MCP_CLIENT_TYPE": "stdio",
+            "API_KEY": "openai-key",
+            "API_BASE": "https://api.openai.com/v1",
+            "MODEL_PROVIDER": "OpenAI",
+            "PLAYWRIGHT_MCP_CDP_ENDPOINT": "http://127.0.0.1:9333",
+            "HTTP_PROXY": "http://127.0.0.1:9",
+        },
+        clear=True,
+    ):
+        cfg = build_browser_runtime_mcp_config()
+
+    assert cfg is not None
+    assert cfg.client_type == "stdio"
+    child_env = cfg.params["env"]
+    assert child_env["API_KEY"] == "openai-key"
+    assert child_env["OPENAI_API_KEY"] == "openai-key"
+    assert child_env["OPENAI_BASE_URL"] == "https://api.openai.com/v1"
+    assert child_env["MODEL_PROVIDER"] == "openai"
+    assert child_env["PLAYWRIGHT_MCP_CDP_ENDPOINT"] == "http://127.0.0.1:9333"
+    assert "HTTP_PROXY" not in child_env
+
+
+def test_build_browser_runtime_mcp_config_stdio_uses_explicit_runtime_cwd() -> None:
+    with (
+        tempfile.TemporaryDirectory() as tmp,
+        patch.dict(
+            os.environ,
+            {
+                "PLAYWRIGHT_RUNTIME_MCP_ENABLED": "1",
+                "PLAYWRIGHT_RUNTIME_MCP_CLIENT_TYPE": "stdio",
+                "PLAYWRIGHT_RUNTIME_MCP_CWD": tmp,
+            },
+            clear=True,
+        ),
+    ):
+        cfg = build_browser_runtime_mcp_config()
+
+    assert cfg is not None
+    assert cfg.params["cwd"] == str(Path(tmp).resolve())
+
+
+def test_build_browser_runtime_mcp_config_stdio_maps_openrouter_env() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "PLAYWRIGHT_RUNTIME_MCP_ENABLED": "1",
+            "PLAYWRIGHT_RUNTIME_MCP_CLIENT_TYPE": "stdio",
+            "API_KEY": "openrouter-key",
+            "API_BASE": "https://openrouter.ai/api/v1",
+        },
+        clear=True,
+    ):
+        cfg = build_browser_runtime_mcp_config()
+
+    assert cfg is not None
+    child_env = cfg.params["env"]
+    assert child_env["OPENROUTER_API_KEY"] == "openrouter-key"
+    assert child_env["OPENROUTER_BASE_URL"] == "https://openrouter.ai/api/v1"
+
+
+def test_browser_move_streamable_http_client_accepts_config_constructor() -> None:
+    cfg = McpServerConfig(
+        server_id="playwright-runtime-wrapper",
+        server_name="playwright-runtime-wrapper",
+        server_path="http://127.0.0.1:8940/mcp",
+        client_type="streamable-http",
+    )
+    client = BrowserMoveStreamableHttpClient(cfg)
+
+    assert client.server_path == "http://127.0.0.1:8940/mcp"
+    assert client.name == "playwright-runtime-wrapper"
+
+
+def test_browser_move_streamable_http_client_reuses_core_transport_connect() -> None:
+    client = BrowserMoveStreamableHttpClient("http://127.0.0.1:8940/mcp")
+    with patch(
+        "openjiuwen.harness.tools.browser_move.clients.streamable_http_client.StreamableHttpClient.connect",
+        new_callable=AsyncMock,
+        return_value=True,
+    ) as core_connect:
+        assert _run(client.connect(retry_times=1, timeout=5.0)) is True
+
+    core_connect.assert_awaited_once_with(timeout=5.0)
+
+
+def test_browser_move_streamable_http_client_retries_core_transport_connect() -> None:
+    client = BrowserMoveStreamableHttpClient("http://127.0.0.1:8940/mcp")
+    with patch(
+        "openjiuwen.harness.tools.browser_move.clients.streamable_http_client.StreamableHttpClient.connect",
+        new_callable=AsyncMock,
+        side_effect=[False, True],
+    ) as core_connect:
+        assert _run(client.connect(retry_times=2, timeout=5.0)) is True
+
+    assert core_connect.await_count == 2
+
+
+def test_browser_move_streamable_http_client_closes_transport_in_connect_task() -> None:
+    client = BrowserMoveStreamableHttpClient("http://127.0.0.1:8940/mcp")
+
+    class TaskBoundTransport:
+        async def __aenter__(self):
+            self.task = asyncio.current_task()
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            assert asyncio.current_task() is self.task
+
+    async def fake_core_connect(self, *, timeout):
+        await self._exit_stack.enter_async_context(TaskBoundTransport())
+        return True
+
+    async def check_lifecycle():
+        with patch(
+            "openjiuwen.harness.tools.browser_move.clients.streamable_http_client.StreamableHttpClient.connect",
+            new=fake_core_connect,
+        ):
+            assert await client.connect(timeout=5.0)
+            assert await client.disconnect()
+
+    _run(check_lifecycle())
+
+
+def test_browser_move_streamable_http_client_cleans_up_timed_out_retry() -> None:
+    client = BrowserMoveStreamableHttpClient("http://127.0.0.1:8940/mcp")
+    attempts = 0
+    closed = []
+
+    class TaskBoundTransport:
+        async def __aenter__(self):
+            self.task = asyncio.current_task()
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            assert asyncio.current_task() is self.task
+            closed.append(self)
+
+    async def fake_core_connect(self, *, timeout):
+        nonlocal attempts
+        attempts += 1
+        await self._exit_stack.enter_async_context(TaskBoundTransport())
+        if attempts == 1:
+            await asyncio.Event().wait()
+        return True
+
+    async def check_retries():
+        with patch(
+            "openjiuwen.harness.tools.browser_move.clients.streamable_http_client.StreamableHttpClient.connect",
+            new=fake_core_connect,
+        ):
+            assert await client.connect(retry_times=2, timeout=1.0)
+            assert attempts == 2
+            assert len(closed) == 1
+            assert await client.disconnect()
+            assert len(closed) == 2
+
+    _run(check_retries())
+
+
+def test_execute_wrapper_raises_timeout_error() -> None:
+    with patch.dict(os.environ, {"PLAYWRIGHT_TOOL_TIMEOUT_S": "0.05"}):
+        ability_manager = _HangingAbilityManager()
+        agent = _Agent(ability_manager)
+
+        ensure_execute_signature_compat(agent)
+
+        tool_call = _ToolCall("browser_run_task")
+
+        try:
+            _run(agent.ability_manager.execute(ctx=object(), tool_call=tool_call, session=object()))
+        except RuntimeError as exc:
+            message = str(exc)
+            assert "tool_execution_timeout:" in message
+            assert "browser_run_task" in message
+            assert "timeout_s=" in message
+        else:
+            raise AssertionError("expected RuntimeError")
+
+
+def test_execute_wrapper_drops_none_tool_arguments() -> None:
+    ability_manager = _RecordingAbilityManager()
+    agent = _Agent(ability_manager)
+
+    ensure_execute_signature_compat(agent)
+
+    tool_call = _ToolCall(
+        "browser_snapshot",
+        '{"filename": null, "depth": null}',
+    )
+    _run(agent.ability_manager.execute(ctx=object(), tool_call=tool_call, session=object()))
+
+    assert json.loads(ability_manager.seen_arguments or "{}") == {}
+
+
+def test_execute_wrapper_preserves_non_none_tool_arguments() -> None:
+    ability_manager = _RecordingAbilityManager()
+    agent = _Agent(ability_manager)
+
+    ensure_execute_signature_compat(agent)
+
+    tool_call = _ToolCall(
+        "browser_snapshot",
+        '{"filename": "snapshot.md", "depth": 10}',
+    )
+    _run(agent.ability_manager.execute(ctx=object(), tool_call=tool_call, session=object()))
+
+    assert json.loads(ability_manager.seen_arguments or "{}") == {
+        "filename": "snapshot.md",
+        "depth": 10,
+    }
+
+
+def test_local_browser_runtime_server_logs_are_written_under_runtime_log_dir() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        process = MagicMock()
+        process.poll.return_value = None
+        with (
+            patch.dict(os.environ, {"PLAYWRIGHT_RUNTIME_LOG_DIR": tmp}, clear=False),
+            patch.object(
+                browser_tools_module,
+                "_server_script",
+                return_value=Path(__file__),
+            ),
+            patch.object(
+                browser_tools_module,
+                "_build_child_env",
+                return_value={},
+            ),
+            patch.object(
+                browser_tools_module,
+                "_wait_port_open",
+                return_value=None,
+            ),
+            patch(
+                "openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools.subprocess.Popen",
+                return_value=process,
+            ) as mock_popen,
+        ):
+            getattr(browser_tools_module, "_start_local_server")("streamable-http", "127.0.0.1", 8940, "/mcp")
+            stdout_log = Path(tmp) / "browser_runtime_stdout.log"
+            stderr_log = Path(tmp) / "browser_runtime_stderr.log"
+            assert stdout_log.exists()
+            assert stderr_log.exists()
+            assert Path(mock_popen.call_args.kwargs["cwd"]).resolve() == Path.cwd().resolve()
+            browser_tools_module.stop_local_browser_runtime_server()
+
+        assert getattr(browser_tools_module, "_browser_runtime_stdout_handle") is None
+        assert getattr(browser_tools_module, "_browser_runtime_stderr_handle") is None
+
+
+# ---------------------------------------------------------------------------
+# Per-agent browser identity (BrowserInstanceConfig) — see plan: keyed server_id
+# ---------------------------------------------------------------------------
+
+
+def test_keyed_instance_suffixes_server_id() -> None:
+    """A non-empty key isolates the MCP registration via a suffixed server_id."""
+    cfg = build_playwright_mcp_config(BrowserInstanceConfig(key="alpha"))
+    assert cfg.server_id == "playwright_official_stdio__alpha"
+    assert cfg.server_name == "playwright-official-alpha"
+
+
+def test_distinct_keys_yield_distinct_server_ids() -> None:
+    """Different keys must not collide on the global resource_mgr registration."""
+    a = build_playwright_mcp_config(BrowserInstanceConfig(key="A"))
+    b = build_playwright_mcp_config(BrowserInstanceConfig(key="B"))
+    assert a.server_id != b.server_id
+
+
+def test_same_key_shares_server_id() -> None:
+    """Same key == intentional sharing of one browser (one MCP registration)."""
+    a = build_playwright_mcp_config(BrowserInstanceConfig(key="shared"))
+    b = build_playwright_mcp_config(BrowserInstanceConfig(key="shared"))
+    assert a.server_id == b.server_id
+
+
+def test_absent_key_preserves_legacy_server_id() -> None:
+    """No key (or empty instance) reproduces the historical constant id."""
+    assert build_playwright_mcp_config().server_id == "playwright_official_stdio"
+    assert build_playwright_mcp_config(BrowserInstanceConfig()).server_id == "playwright_official_stdio"
+
+
+def test_key_is_sanitized_into_server_id() -> None:
+    """Unsafe key characters are normalized so the server_id stays id-safe."""
+    cfg = build_playwright_mcp_config(BrowserInstanceConfig(key="team A/1"))
+    assert cfg.server_id == "playwright_official_stdio__team-A-1"

@@ -1,0 +1,313 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from typing import Literal, Optional, Dict, OrderedDict, Tuple
+
+import pulsar
+
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import build_error
+from openjiuwen.core.common.logging import logger
+from openjiuwen.core.runner.drunner.dmessage_queue.message_queue_fake import FakeMQ
+from openjiuwen.core.runner.drunner.dmessage_queue.message_serializer import serialize_message, deserialize_message
+from openjiuwen.core.runner.message_queue_base import (
+    MessageQueueBase,
+    SubscriptionBase,
+    QueueMessage,
+    AsyncMessageHandler,
+)
+from openjiuwen.core.runner.runner_config import PulsarConfig
+
+
+class PulsarSubscription(SubscriptionBase):
+    def __init__(
+        self,
+        topic: str,
+        consumer: pulsar.Consumer,
+        executor: ThreadPoolExecutor,
+        *,
+        legacy_key_encoding: Literal["literal", "escaped"] = "literal",
+    ) -> None:
+        """Configure a consumer with an explicit legacy key decoding mode."""
+        self._legacy_key_encoding = legacy_key_encoding
+        self._topic = topic
+        self._consumer = consumer
+        self._executor = executor
+        self._handler: Optional[AsyncMessageHandler] = None
+        self._task: Optional[asyncio.Task] = None
+        self._active = False
+        self._draining = False
+        self._drain_event = asyncio.Event()
+
+    def set_message_handler(self, handler: AsyncMessageHandler):
+        self._handler = handler
+
+    def activate(self):
+        if not self._active:
+            self._active = True
+            self._task = asyncio.create_task(self._consume_loop())
+            logger.info(f"[PulsarSubscription] activated topic={self._topic}")
+
+    async def deactivate(self, drain_timeout: Optional[float] = None):
+        if not self._active:
+            return
+
+        if drain_timeout is not None and self._handler is not None:
+            self._draining = True
+            self._drain_event.clear()
+            try:
+                await asyncio.wait_for(self._drain_event.wait(), timeout=drain_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[PulsarSubscription] drain timed out for topic={self._topic}"
+                )
+            self._draining = False
+
+        self._active = False
+
+        if self._task:
+            self._task.cancel()
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._executor, self._consumer.close)
+
+        if self._task:
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+        logger.info(f"[PulsarSubscription] deactivated topic={self._topic}")
+
+    def is_active(self) -> bool:
+        return self._active
+
+    async def _consume_loop(self):
+        loop = asyncio.get_running_loop()
+        while self._active:
+            try:
+                msg = await loop.run_in_executor(
+                    self._executor, lambda: self._consumer.receive(timeout_millis=1000)
+                )
+
+                data = msg.data()
+                payload = deserialize_message(data, legacy_key_encoding=self._legacy_key_encoding)
+                logger.info(
+                    f"[PulsarSubscription] Received message, topic={self._topic}, message_id={payload.message_id}, "
+                    f"type:{payload.type}")
+                if self._handler:
+                    await self._handler(payload)
+                await loop.run_in_executor(self._executor, lambda: self._consumer.acknowledge(msg))
+
+                if self._draining:
+                    self._drain_event.set()
+            except pulsar.Timeout:
+                if self._draining:
+                    self._drain_event.set()
+                continue
+            except Exception as e:
+                logger.exception(f"[PulsarSubscription] receive error: {e}")
+
+
+class MessageQueuePulsar(MessageQueueBase):
+    """Pulsar MQ Wrapper"""
+    MAX_PRODUCERS = 10000
+    DEFAULT_SUBSCRIPTION_NAME = "default"
+    DEFAULT_MAX_RETRIES = 3
+    DEFAULT_RETRY_DELAY = 1.0
+
+    def __init__(
+        self,
+        pulsar_config: PulsarConfig,
+        *,
+        wire_version: Literal[1, 2] = 1,
+        legacy_key_encoding: Literal["literal", "escaped"] = "literal",
+    ) -> None:
+        """Configure Pulsar with explicit writer and legacy reader formats."""
+        self._wire_version = wire_version
+        self._legacy_key_encoding = legacy_key_encoding
+        self._url = pulsar_config.url
+        self._max_workers = pulsar_config.max_workers or 8
+        self._client: Optional[pulsar.Client] = None
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._producers: OrderedDict[str, pulsar.Producer] = OrderedDict()
+        self._subs: Dict[str, PulsarSubscription] = {}
+        self._is_running = False
+        self._lock = asyncio.Lock()
+
+    @classmethod
+    async def start_with_retry(
+        cls,
+        pulsar_config: PulsarConfig,
+        *,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        retry_delay: float = DEFAULT_RETRY_DELAY,
+        fallback_to_fake: bool = True,
+        wire_version: Literal[1, 2] = 1,
+        legacy_key_encoding: Literal["literal", "escaped"] = "literal",
+    ) -> Tuple["MessageQueueBase", bool]:
+        """Start Pulsar with retries, preserving wire settings on local fallback."""
+        last_error: Optional[Exception] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                mq = cls(pulsar_config, wire_version=wire_version, legacy_key_encoding=legacy_key_encoding)
+                mq.start()
+                logger.info(
+                    f"[MessageQueuePulsar] initialized (attempt {attempt})"
+                )
+                return mq, False
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"[MessageQueuePulsar] init failed (attempt {attempt}/{max_retries}): {e}"
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(retry_delay * attempt)
+
+        if not fallback_to_fake:
+            raise last_error
+
+        logger.error(
+            f"[MessageQueuePulsar] All {max_retries} attempts failed, "
+            f"falling back to FakeMQ. Last error: {last_error}"
+        )
+
+        fake_mq = FakeMQ(wire_version=wire_version, legacy_key_encoding=legacy_key_encoding)
+        fake_mq.start()
+
+        fallback_msg = QueueMessage(
+            message_id="__mq_fallback__",
+            payload={
+                "event": "mq_fallback_to_local",
+                "reason": str(last_error),
+                "original_config": str(pulsar_config),
+            },
+            error_code=1,
+            error_msg=f"Pulsar unavailable, fell back to local mode: {last_error}",
+        )
+        try:
+            await fake_mq.produce_message("interrupt", fallback_msg)
+        except Exception as e:
+            logger.warning(f"[MessageQueuePulsar] failed to publish fallback interrupt: {e}")
+
+        return fake_mq, True
+
+    def start(self):
+        if self._is_running:
+            return
+        self._client = pulsar.Client(self._url)
+        self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
+        self._is_running = True
+        logger.info(f"[MessageQueuePulsar] started with url={self._url}")
+
+    async def stop(self, drain_timeout: float = 0.0):
+        if not self._is_running:
+            return
+        self._is_running = False
+        logger.info(f"[MessageQueuePulsar] closing {len(self._subs)} subscriptions")
+        for topic, sub in list(self._subs.items()):
+            await sub.deactivate(drain_timeout=drain_timeout or None)
+        self._subs.clear()
+
+        logger.info(f"[MessageQueuePulsar] closing {len(self._producers)} producers")
+        for pd in self._producers.values():
+            pd.close()
+        self._producers.clear()
+
+        self._executor.shutdown(wait=True)
+        self._client.close()
+        logger.info(f"[MessageQueuePulsar] stopped")
+
+    def subscribe(self, topic: str) -> PulsarSubscription:
+        try:
+            self._validate_running()
+            if topic in self._subs:
+                return self._subs[topic]
+            consumer = self._client.subscribe(topic, subscription_name=self.DEFAULT_SUBSCRIPTION_NAME,
+                                              consumer_type=pulsar.ConsumerType.KeyShared)
+            # All Pulsar operations reuse the same thread pool
+            sub = PulsarSubscription(
+                topic, consumer, self._executor, legacy_key_encoding=self._legacy_key_encoding,
+            )
+            self._subs[topic] = sub
+            logger.info(f"[MessageQueuePulsar] Create new subscription, topic={topic}")
+            return sub
+        except Exception as e:
+            raise build_error(StatusCode.MESSAGE_QUEUE_TOPIC_SUBSCRIPTION_ERROR, cause=e, topic=topic, reason=e)
+
+    async def unsubscribe(self, topic: str):
+        sub = self._subs.pop(topic, None)
+        if sub:
+            await sub.deactivate()
+            logger.info(f"[MessageQueuePulsar] unsubscribed {topic}")
+
+    def _get_subscribed_topics(self):
+        return list(self._subs.keys())
+
+    def _validate_running(self):
+        if not self._is_running:
+            raise RuntimeError("pulsar message queue is not running")
+
+    async def produce_message(self, topic: str, message: QueueMessage):
+        try:
+            self._validate_running()
+            # Get or create producer
+            producer = await self._get_or_create_producer(topic)
+            # Serialize and send
+            content = serialize_message(
+                message, wire_version=self._wire_version, legacy_key_encoding=self._legacy_key_encoding,
+            )
+
+            loop = asyncio.get_running_loop()
+
+            logger.info(
+                f"[MessageQueuePulsar] Sending message to topic={topic}, message_id={message.message_id}")
+
+            await loop.run_in_executor(
+                self._executor,
+                lambda: producer.send(
+                    content,
+                    partition_key=message.message_id
+                )
+            )
+
+            logger.info(
+                f"[MessageQueuePulsar] Message sent successfully: topic={topic}, message_id={message.message_id}"
+            )
+        except Exception as e:
+            raise build_error(StatusCode.MESSAGE_QUEUE_TOPIC_MESSAGE_PRODUCTION_ERROR, cause=e, topic=topic,
+                              message=message, reason=e)
+
+    async def _get_or_create_producer(self, topic: str) -> pulsar.Producer:
+        producer = self._producers.get(topic)
+        if producer:
+            # LRU move
+            self._producers.move_to_end(topic)
+            return producer
+
+        async with self._lock:
+            # Double-check inside lock
+            producer = self._producers.get(topic)
+            if producer:
+                self._producers.move_to_end(topic)
+                return producer
+
+            # LRU eviction if too many
+            if len(self._producers) >= self.MAX_PRODUCERS:
+                old_topic, old_producer = self._producers.popitem(last=False)
+                old_producer.close()
+                logger.debug(f"[MessageQueuePulsar] LRU producer evicted: {old_topic}")
+
+            logger.info(f"[MessageQueuePulsar] Creating new producer for topic={topic}")
+
+            loop = asyncio.get_running_loop()
+            producer = await loop.run_in_executor(
+                self._executor,
+                lambda: self._client.create_producer(topic)
+            )
+
+            self._producers[topic] = producer
+            return producer

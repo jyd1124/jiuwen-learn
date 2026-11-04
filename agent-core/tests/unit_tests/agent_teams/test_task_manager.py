@@ -1,0 +1,1873 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Unit tests for TeamTaskManager module"""
+
+import asyncio
+import json
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+import pytest_asyncio
+
+from openjiuwen.agent_teams.messager import Messager
+from openjiuwen.agent_teams.schema.events import TeamEvent
+from openjiuwen.agent_teams.schema.status import (
+    MemberMode,
+    TaskStatus,
+)
+from openjiuwen.agent_teams.context import (
+    reset_session_id,
+    set_session_id,
+)
+from openjiuwen.agent_teams.tools.database import (
+    DatabaseConfig,
+    DatabaseType,
+    TeamDatabase,
+)
+from openjiuwen.agent_teams.schema.task import TaskGraphSpec
+from openjiuwen.agent_teams.tools.task_manager import TeamTaskManager
+from openjiuwen.core.single_agent import AgentCard
+
+
+@pytest.fixture
+def db_config():
+    """Provide in-memory database config for testing"""
+    return DatabaseConfig(db_type=DatabaseType.SQLITE, connection_string=":memory:")
+
+
+@pytest_asyncio.fixture
+async def db(db_config):
+    """Provide initialized database instance"""
+    token = set_session_id("session_id")
+    database = TeamDatabase(db_config)
+    try:
+        await database.initialize()
+        yield database
+    finally:
+        reset_session_id(token)
+        await database.close()
+
+
+@pytest_asyncio.fixture
+async def message_bus():
+    """Provide Messager mock instance for testing"""
+    bus = AsyncMock(spec=Messager)
+    yield bus
+
+
+@pytest_asyncio.fixture
+async def task_manager(db, message_bus):
+    """Provide initialized task manager instance"""
+    await db.team.create_team(
+            team_name="test_team",
+            display_name="Test Team",
+            leader_member_name="leader1"
+    )
+    await db.member.create_member(
+            member_name="member1",
+            team_name="test_team",
+            display_name="member1",
+        agent_card=AgentCard().model_dump_json(),
+        status="BUSY",
+        mode=MemberMode.BUILD_MODE.value
+    )
+    return TeamTaskManager(team_name="test_team", member_name="member1", db=db, messager=message_bus)
+
+
+class TestTeamTaskManager:
+    """Test team task manager operations"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_add_task_success(self, task_manager):
+        """Test adding a task successfully"""
+        task = await task_manager.add(
+            title="Test Task",
+            content="Test content"
+        )
+        assert task is not None
+        assert task.title == "Test Task"
+        assert task.content == "Test content"
+        assert task.status == TaskStatus.PENDING.value
+        assert task.team_name == "test_team"
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_add_task_with_dependencies(self, task_manager):
+        """Test adding a task with dependencies"""
+        # Create dependency tasks
+        task1 = await task_manager.add(title="Task 1", content="Content 1")
+        task2 = await task_manager.add(title="Task 2", content="Content 2")
+
+        # Create task that depends on both
+        task3 = await task_manager.add(
+            title="Task 3",
+            content="Content 3",
+            dependencies=[task1.task_id, task2.task_id]
+        )
+
+        assert task3 is not None
+        assert task3.status == TaskStatus.BLOCKED.value
+
+        # Verify dependencies
+        deps = await task_manager.get_dependencies(task3.task_id)
+        assert len(deps) == 2
+        dep_ids = [d.depends_on_task_id for d in deps]
+        assert task1.task_id in dep_ids
+        assert task2.task_id in dep_ids
+
+
+class TestAddFailureReasons:
+    """Verify that failed creates surface a reason instead of a bare None."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_add_duplicate_task_id_returns_reason(self, task_manager):
+        """Reusing an existing task_id should report the collision."""
+        first = await task_manager.add(
+            title="Original",
+            content="Content",
+            task_id="dup-1",
+        )
+        assert first.ok
+
+        second = await task_manager.add(
+            title="Conflict",
+            content="Content",
+            task_id="dup-1",
+        )
+        assert not second.ok
+        assert "dup-1" in second.reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_add_graph_circular_dep_returns_reason(self, task_manager):
+        """Circular dependency rejection should surface a clear reason."""
+        task_a = await task_manager.add(title="A", content="ca", task_id="a")
+        assert task_a.ok
+
+        # Create B depending on A — fine.
+        task_b = await task_manager.add(title="B", content="cb", task_id="b", dependencies=["a"])
+        assert task_b.ok
+
+        # Now try to insert C such that A depends on C and C depends on B,
+        # which would form A → C → B → A. The DB should reject it.
+        result = await task_manager.add_graph(
+            [TaskGraphSpec(title="C", content="cc", task_id="c", depends_on=("b",), depended_by=("a",))]
+        )
+        assert not result.ok
+        assert result.reason
+
+
+class TestClaimConflict:
+    """Test claim conflict reporting."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_claim_by_second_member_reports_conflict_not_transition_error(self, db, message_bus):
+        """A second member claiming a held task should fail with the real reason."""
+        await db.team.create_team(
+            team_name="conflict_team",
+            display_name="Conflict Team",
+            leader_member_name="leader",
+        )
+        for name in ("m1", "m2"):
+            await db.member.create_member(
+                member_name=name,
+                team_name="conflict_team",
+                display_name=name,
+                agent_card=AgentCard().model_dump_json(),
+                status="BUSY",
+                mode=MemberMode.BUILD_MODE.value,
+            )
+        m1 = TeamTaskManager(
+            team_name="conflict_team", member_name="m1", db=db, messager=message_bus,
+        )
+        m2 = TeamTaskManager(
+            team_name="conflict_team", member_name="m2", db=db, messager=message_bus,
+        )
+
+        task = await m1.add(title="Shared Task", content="Work")
+        first = await m1.claim(task.task_id)
+        assert first.ok
+
+        # Second member tries to claim; must report assignee conflict and fail
+        # cleanly instead of raising an "invalid claimed → claimed" transition.
+        second = await m2.claim(task.task_id)
+        assert not second.ok
+        assert "already claimed by m1" in second.reason
+
+        task_state = await m1.get(task.task_id)
+        assert task_state.status == TaskStatus.IN_PROGRESS.value
+        assert task_state.assignee == "m1"
+
+
+class TestTaskCompletionWithDependencyResolution:
+    """Test task completion and dependency resolution"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_complete_task_is_idempotent(self, task_manager):
+        """Completing the same task twice should succeed and not raise."""
+        task = await task_manager.add(title="Idempotent Task", content="Content")
+        assert await task_manager.claim(task.task_id)
+
+        first = await task_manager.complete(task.task_id)
+        assert first.ok
+
+        second = await task_manager.complete(task.task_id)
+        assert second.ok
+
+        task_state = await task_manager.get(task.task_id)
+        assert task_state.status == TaskStatus.COMPLETED.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_complete_task_after_reset_is_noop_race(self, task_manager):
+        """A stale completion call after the task was reset must not error."""
+        task = await task_manager.add(title="Racy Task", content="Content")
+        assert await task_manager.claim(task.task_id)
+
+        # Simulate recovery/pause: task is reset to pending while an old
+        # completion coroutine is still in flight.
+        reset = await task_manager.reset(task.task_id)
+        assert reset.ok
+
+        reset_state = await task_manager.get(task.task_id)
+        assert reset_state.status == TaskStatus.PENDING.value
+        assert reset_state.assignee is None
+
+        # The old completion call should now be a safe no-op, not raise or log ERROR.
+        result = await task_manager.complete(task.task_id)
+        assert not result.ok
+
+        # Task must stay pending and unassigned.
+        final_state = await task_manager.get(task.task_id)
+        assert final_state.status == TaskStatus.PENDING.value
+        assert final_state.assignee is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_complete_task_sets_updated_at(self, task_manager):
+        """Completing a task bumps updated_at so it reflects completion time."""
+        task = await task_manager.add(title="Test Task", content="Content")
+        assert await task_manager.claim(task.task_id)
+        claimed = await task_manager.get(task.task_id)
+        claimed_at = claimed.updated_at
+        assert claimed_at is not None
+
+        await task_manager.complete(task.task_id)
+
+        task_updated = await task_manager.get(task.task_id)
+        assert task_updated.updated_at is not None
+        assert task_updated.updated_at >= claimed_at
+        assert task_updated.status == TaskStatus.COMPLETED.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_complete_task_unblocks_dependent_tasks(self, task_manager):
+        """Test that completing a task unblocks dependent tasks"""
+        # Create tasks: task2 depends on task1, task3 depends on task1
+        task1 = await task_manager.add(title="Task 1", content="Content 1")
+        task2 = await task_manager.add(title="Task 2", content="Content 2", dependencies=[task1.task_id])
+        task3 = await task_manager.add(title="Task 3", content="Content 3", dependencies=[task1.task_id])
+
+        # claim task1
+        assert await task_manager.claim(task1.task_id)
+
+        # task2 and task3 should be BLOCKED
+        task2_before = await task_manager.get(task2.task_id)
+        task3_before = await task_manager.get(task3.task_id)
+        assert task2.status == TaskStatus.BLOCKED.value
+        assert task3_before.status == TaskStatus.BLOCKED.value
+
+        # Complete task1
+        await task_manager.complete(task1.task_id)
+
+        # task2 and task3 should now be PENDING (unblocked)
+        task2_after = await task_manager.get(task2.task_id)
+        task3_after = await task_manager.get(task3.task_id)
+        assert task2_after.status == TaskStatus.PENDING.value
+        assert task3_after.status == TaskStatus.PENDING.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_complete_task_unblocks_under_concurrent_sessions(
+        self, tmp_path, message_bus
+    ):
+        """File-backed regression: complete_task must still unblock dependents
+        when a second coroutine is hammering the database in parallel.
+
+        StaticPool used to hand the same DBAPI connection to every
+        async session, so a sibling coroutine's COMMIT could land in
+        the middle of complete_task's "resolve deps -> select dependents"
+        sequence and silently roll back / mask the dependency update,
+        leaving downstream tasks blocked. AsyncAdaptedQueuePool with
+        size=1 prevents that by enforcing exclusive checkout.
+        """
+        token = set_session_id("concurrent_session")
+        db_path = tmp_path / "team_concurrent.sqlite"
+        database = TeamDatabase(
+            DatabaseConfig(
+                db_type=DatabaseType.SQLITE,
+                connection_string=str(db_path),
+            )
+        )
+        try:
+            await database.initialize()
+            await database.team.create_team(
+                team_name="t",
+                display_name="t",
+                leader_member_name="leader",
+            )
+            await database.member.create_member(
+                member_name="m1",
+                team_name="t",
+                display_name="m1",
+                agent_card=AgentCard().model_dump_json(),
+                status="BUSY",
+                mode=MemberMode.BUILD_MODE.value,
+            )
+            tm = TeamTaskManager(
+                team_name="t",
+                member_name="m1",
+                db=database,
+                messager=message_bus,
+            )
+
+            # Build a chain count-1 -> count-2 -> ... -> count-5
+            await tm.add(title="c1", content="", task_id="count-1")
+            for i in range(2, 6):
+                await tm.add(
+                    title=f"c{i}",
+                    content="",
+                    task_id=f"count-{i}",
+                    dependencies=[f"count-{i - 1}"],
+                )
+
+            assert await tm.claim("count-1")
+
+            # While complete() runs, a second coroutine pounds the DB
+            # with read+commit cycles to maximise the chance of session
+            # interleaving on the shared connection.
+            stop = asyncio.Event()
+
+            async def hammer():
+                while not stop.is_set():
+                    await database.task.get_team_tasks("t")
+                    await database.team.get_team("t")
+                    await asyncio.sleep(0)
+
+            hammer_task = asyncio.create_task(hammer())
+            try:
+                assert await tm.complete("count-1")
+            finally:
+                stop.set()
+                await hammer_task
+
+            count2 = await database.task.get_task("count-2")
+            assert count2 is not None
+            assert count2.status == TaskStatus.PENDING.value, (
+                f"count-2 should be unblocked after count-1 completion, "
+                f"got status={count2.status!r}"
+            )
+
+            unresolved = await database.task.get_unresolved_dependencies_count("count-2")
+            assert unresolved == 0, (
+                f"count-2 should have 0 unresolved deps, got {unresolved}"
+            )
+        finally:
+            await database.close()
+            reset_session_id(token)
+
+
+# ---- add_graph: atomic batch graph creation --------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_add_graph_forward_reference_within_batch(task_manager):
+    """depends_on may reference tasks created later in the same batch."""
+    result = await task_manager.add_graph(
+        [
+            TaskGraphSpec(title="Final", content="c", task_id="final", depends_on=("a1", "a2")),
+            TaskGraphSpec(title="A1", content="c", task_id="a1"),
+            TaskGraphSpec(title="A2", content="c", task_id="a2"),
+        ]
+    )
+    assert result.ok, result.reason
+    assert [t.task_id for t in result.tasks] == ["final", "a1", "a2"]
+
+    statuses = {t.task_id: t.status for t in result.tasks}
+    assert statuses["final"] == TaskStatus.BLOCKED.value
+    assert statuses["a1"] == TaskStatus.PENDING.value
+    assert statuses["a2"] == TaskStatus.PENDING.value
+
+    deps = await task_manager.get_dependencies("final")
+    assert sorted(d.depends_on_task_id for d in deps) == ["a1", "a2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_add_graph_depended_by_wires_existing_tasks(task_manager):
+    """depended_by inserts a new prerequisite before existing tasks."""
+    task_a = await task_manager.add(title="A", content="c", task_id="a")
+    task_c = await task_manager.add(title="C", content="c", task_id="c")
+    assert task_a.ok and task_c.ok
+
+    # Insert B between them: B depends on A, C now depends on B.
+    result = await task_manager.add_graph(
+        [TaskGraphSpec(title="B", content="c", task_id="b", depends_on=("a",), depended_by=("c",))]
+    )
+    assert result.ok, result.reason
+    assert result.tasks[0].status == TaskStatus.BLOCKED.value
+
+    c_updated = await task_manager.get("c")
+    assert c_updated.status == TaskStatus.BLOCKED.value
+    deps_c = await task_manager.get_dependencies("c")
+    assert "b" in [d.depends_on_task_id for d in deps_c]
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_add_graph_atomic_rollback_on_bad_reference(task_manager):
+    """One bad edge target rolls back the whole batch with the real reason."""
+    result = await task_manager.add_graph(
+        [
+            TaskGraphSpec(title="Good", content="c", task_id="good"),
+            TaskGraphSpec(title="Bad", content="c", task_id="bad", depends_on=("ghost",)),
+        ]
+    )
+    assert not result.ok
+    assert "ghost" in result.reason
+    assert await task_manager.get("good") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_add_graph_existing_id_collision_returns_reason(task_manager):
+    """Colliding with a task already on the board reports the id."""
+    first = await task_manager.add(title="First", content="c", task_id="dup")
+    assert first.ok
+
+    result = await task_manager.add_graph([TaskGraphSpec(title="Second", content="c", task_id="dup")])
+    assert not result.ok
+    assert "dup" in result.reason
+    assert "already exists" in result.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_add_graph_auto_generates_missing_task_ids(task_manager):
+    """Specs without task_id get generated ids and land normally."""
+    result = await task_manager.add_graph(
+        [
+            TaskGraphSpec(title="Auto 1", content="c"),
+            TaskGraphSpec(title="Auto 2", content="c"),
+        ]
+    )
+    assert result.ok, result.reason
+    ids = [t.task_id for t in result.tasks]
+    assert len(ids) == 2 and len(set(ids)) == 2
+    for task_id in ids:
+        assert await task_manager.get(task_id) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_add_graph_empty_specs(task_manager):
+    """An empty batch is a no-op success."""
+    result = await task_manager.add_graph([])
+    assert result.ok
+    assert result.tasks == []
+
+
+class TestCancel:
+    """Test cancel task functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_cancel_pending_task(self, task_manager):
+        """Test cancelling a pending task"""
+        task = await task_manager.add(title="Task 1", content="Content 1")
+        assert task.status == TaskStatus.PENDING.value
+
+        result = await task_manager.cancel(task.task_id)
+        assert result is not None
+        assert result.status == TaskStatus.CANCELLED.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_cancel_claimed_task(self, task_manager):
+        """Test cancelling a claimed task"""
+        task = await task_manager.add(title="Task 1", content="Content 1")
+        await task_manager.claim(task.task_id)
+        assert task.status == TaskStatus.PENDING.value
+
+        result = await task_manager.cancel(task.task_id)
+        assert result is not None
+        assert result.status == TaskStatus.CANCELLED.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_nonexistent_task(self, task_manager):
+        """Test cancelling a non-existent task"""
+        result = await task_manager.cancel("nonexistent-task-id")
+        assert result is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_completed_task_fails(self, task_manager):
+        """Test that cancelling a completed task fails (invalid state transition)"""
+        task = await task_manager.add(title="Task 1", content="Content 1")
+        await task_manager.claim(task.task_id)
+        await task_manager.complete(task.task_id)
+
+        # Cannot cancel a completed task
+        result = await task_manager.cancel(task.task_id)
+        assert result is None
+
+        updated_task = await task_manager.get(task.task_id)
+        assert updated_task.status == TaskStatus.COMPLETED.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_already_cancelled_task_is_idempotent(self, task_manager):
+        """Cancelling a task that is already CANCELLED is a no-op rather
+        than an error — the unified termination primitive treats the
+        target state as the contract, so a second cancel returns the
+        existing task unchanged."""
+        task = await task_manager.add(title="Task 1", content="Content 1")
+        await task_manager.cancel(task.task_id)
+
+        result = await task_manager.cancel(task.task_id)
+        assert result is not None
+        assert result.task_id == task.task_id
+        assert result.status == TaskStatus.CANCELLED.value
+
+        updated_task = await task_manager.get(task.task_id)
+        assert updated_task.status == TaskStatus.CANCELLED.value
+
+
+class TestGetClaimableTasks:
+    """Test get_claimable_tasks functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_claimable_tasks_empty(self, task_manager):
+        """Test getting claimable tasks when there are none"""
+        claimable = await task_manager.get_claimable_tasks()
+        assert claimable == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_claimable_tasks_pending(self, task_manager):
+        """Test getting claimable tasks includes pending tasks"""
+        task1 = await task_manager.add(title="Task 1", content="Content 1")
+        task2 = await task_manager.add(title="Task 2", content="Content 2")
+
+        claimable = await task_manager.get_claimable_tasks()
+        assert len(claimable) == 2
+        claimable_ids = [t.task_id for t in claimable]
+        assert task1.task_id in claimable_ids
+        assert task2.task_id in claimable_ids
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_claimable_tasks_excludes_blocked(self, task_manager):
+        """Test that blocked tasks are not claimable"""
+        task1 = await task_manager.add(title="Task 1", content="Content 1")
+        task2 = await task_manager.add(title="Task 2", content="Content 2", dependencies=[task1.task_id])
+
+        claimable = await task_manager.get_claimable_tasks()
+        assert len(claimable) == 1
+        assert claimable[0].task_id == task1.task_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_claimable_tasks_excludes_claimed(self, task_manager):
+        """Test that claimed tasks are not claimable"""
+        task1 = await task_manager.add(title="Task 1", content="Content 1")
+        task2 = await task_manager.add(title="Task 2", content="Content 2")
+
+        await task_manager.claim(task1.task_id)
+
+        claimable = await task_manager.get_claimable_tasks()
+        assert len(claimable) == 1
+        assert claimable[0].task_id == task2.task_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_claimable_tasks_excludes_completed(self, task_manager):
+        """Test that completed tasks are not claimable"""
+        task1 = await task_manager.add(title="Task 1", content="Content 1")
+        task2 = await task_manager.add(title="Task 2", content="Content 2")
+
+        await task_manager.claim(task1.task_id)
+        await task_manager.complete(task1.task_id)
+
+        claimable = await task_manager.get_claimable_tasks()
+        assert len(claimable) == 1
+        assert claimable[0].task_id == task2.task_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_claimable_tasks_excludes_cancelled(self, task_manager):
+        """Test that cancelled tasks are not claimable"""
+        task1 = await task_manager.add(title="Task 1", content="Content 1")
+        task2 = await task_manager.add(title="Task 2", content="Content 2")
+
+        await task_manager.cancel(task1.task_id)
+
+        claimable = await task_manager.get_claimable_tasks()
+        assert len(claimable) == 1
+        assert claimable[0].task_id == task2.task_id
+
+
+class TestUpdateTask:
+    """Test update_task functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_update_task_title_only(self, task_manager):
+        """Test updating task title only"""
+        task = await task_manager.add(title="Original Title", content="Content")
+        assert task.title == "Original Title"
+
+        result = await task_manager.update_task(task.task_id, title="Updated Title")
+        assert result.ok
+
+        updated_task = await task_manager.get(task.task_id)
+        assert updated_task.title == "Updated Title"
+        assert updated_task.content == "Content"
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_update_task_content_only(self, task_manager):
+        """Test updating task content only"""
+        task = await task_manager.add(title="Title", content="Original Content")
+        assert task.content == "Original Content"
+
+        result = await task_manager.update_task(task.task_id, content="Updated Content")
+        assert result.ok
+
+        updated_task = await task_manager.get(task.task_id)
+        assert updated_task.title == "Title"
+        assert updated_task.content == "Updated Content"
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_update_task_both_title_and_content(self, task_manager):
+        """Test updating both task title and content"""
+        task = await task_manager.add(title="Original Title", content="Original Content")
+
+        result = await task_manager.update_task(
+            task.task_id,
+            title="Updated Title",
+            content="Updated Content"
+        )
+        assert result.ok
+
+        updated_task = await task_manager.get(task.task_id)
+        assert updated_task.title == "Updated Title"
+        assert updated_task.content == "Updated Content"
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_update_task_not_found(self, task_manager):
+        """Test updating non-existent task surfaces a reason."""
+        result = await task_manager.update_task("nonexistent-task", title="New Title")
+        assert not result.ok
+        assert "not found" in result.reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_update_task_none_parameters(self, task_manager):
+        """Test updating task with None parameters (no change)"""
+        task = await task_manager.add(title="Title", content="Content")
+
+        # Update with None values - should still succeed
+        result = await task_manager.update_task(task.task_id, title=None, content=None)
+        assert result.ok
+
+        # Task should remain unchanged
+        updated_task = await task_manager.get(task.task_id)
+        assert updated_task.title == "Title"
+        assert updated_task.content == "Content"
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_add_graph_batch_mixed_new_and_existing_deps(task_manager):
+    """A batch may mix in-batch depends_on and edges to existing tasks."""
+    existing = await task_manager.add(title="Existing", content="c", task_id="existing")
+    assert existing.ok
+
+    result = await task_manager.add_graph(
+        [
+            TaskGraphSpec(title="T1", content="c", task_id="t1", depends_on=("existing",)),
+            TaskGraphSpec(title="T2", content="c", task_id="t2", depends_on=("t1",)),
+            TaskGraphSpec(title="T3", content="c", task_id="t3"),
+        ]
+    )
+    assert result.ok, result.reason
+    statuses = {t.task_id: t.status for t in result.tasks}
+    assert statuses["t1"] == TaskStatus.BLOCKED.value
+    assert statuses["t2"] == TaskStatus.BLOCKED.value
+    assert statuses["t3"] == TaskStatus.PENDING.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_add_graph_duplicate_ids_within_batch(task_manager):
+    """Duplicate task_ids inside one batch fail atomically with a reason."""
+    result = await task_manager.add_graph(
+        [
+            TaskGraphSpec(title="First", content="c", task_id="same"),
+            TaskGraphSpec(title="Second", content="c", task_id="same"),
+        ]
+    )
+    assert not result.ok
+    assert "same" in result.reason
+    assert await task_manager.get("same") is None
+
+
+class TestCancelAllTasks:
+    """Test cancel_all_tasks functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_all_multiple_tasks(self, task_manager):
+        """Test cancelling multiple tasks at once"""
+        # Create multiple pending tasks
+        task1 = await task_manager.add(title="Task 1", content="Content 1")
+        task2 = await task_manager.add(title="Task 2", content="Content 2")
+        task3 = await task_manager.add(title="Task 3", content="Content 3")
+
+        # Cancel all tasks
+        cancelled = await task_manager.cancel_all_tasks()
+
+        assert len(cancelled) == 3
+
+        # Verify all tasks are cancelled
+        assert all(t.status == TaskStatus.CANCELLED.value for t in cancelled)
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_all_mixed_status(self, task_manager):
+        """Test cancelling tasks with mixed statuses"""
+        # Create tasks with different statuses
+        task_pending = await task_manager.add(title="Pending", content="Content")
+        task_claimed = await task_manager.add(title="Claimed", content="Content")
+        await task_manager.claim(task_claimed.task_id)
+        task_cancelled = await task_manager.add(title="Cancelled", content="Content")
+        await task_manager.cancel(task_cancelled.task_id)
+        task_completed = await task_manager.add(title="Completed", content="Content")
+        await task_manager.claim(task_completed.task_id)
+        await task_manager.complete(task_completed.task_id)
+
+        # Cancel all - should only cancel non-cancelled, non-completed
+        cancelled = await task_manager.cancel_all_tasks()
+
+        # Should have cancelled pending, claimed tasks (and skipped cancelled, completed)
+        assert len(cancelled) == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_all_no_active_tasks(self, task_manager):
+        """Test cancelling when no active tasks"""
+        # Only have cancelled and completed tasks
+        task_cancelled = await task_manager.add(title="Cancelled", content="Content")
+        await task_manager.cancel(task_cancelled.task_id)
+        task_completed = await task_manager.add(title="Completed", content="Content")
+        await task_manager.claim(task_completed.task_id)
+        await task_manager.complete(task_completed.task_id)
+
+        # Cancel all
+        cancelled = await task_manager.cancel_all_tasks()
+
+        assert len(cancelled) == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_all_empty_team(self, task_manager):
+        """Test cancelling when team has no tasks"""
+        cancelled = await task_manager.cancel_all_tasks()
+        assert len(cancelled) == 0
+
+
+class TestResetTask:
+    """Test reset functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_reset_claimed_task(self, task_manager):
+        """Test resetting a claimed task back to pending"""
+        task = await task_manager.add(title="Test Task", content="Content")
+        await task_manager.claim(task.task_id)
+
+        task_claimed = await task_manager.get(task.task_id)
+        assert task_claimed.status == TaskStatus.IN_PROGRESS.value
+        assert task_claimed.assignee == "member1"
+
+        result = await task_manager.reset(task.task_id)
+        assert result.ok
+
+        task_reset = await task_manager.get(task.task_id)
+        assert task_reset.status == TaskStatus.PENDING.value
+        assert task_reset.assignee is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_reset_nonexistent_task(self, task_manager):
+        """Test resetting a non-existent task"""
+        result = await task_manager.reset("nonexistent-task-id")
+        assert not result.ok
+        assert "not found" in result.reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_reset_pending_task_fails(self, task_manager):
+        """Test resetting a pending task fails with a clear reason."""
+        task = await task_manager.add(title="Test Task", content="Content")
+        assert task.status == TaskStatus.PENDING.value
+
+        result = await task_manager.reset(task.task_id)
+        assert not result.ok
+        assert "pending" in result.reason
+
+        task_after = await task_manager.get(task.task_id)
+        assert task_after.status == TaskStatus.PENDING.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_reset_completed_task_fails(self, task_manager):
+        """Test resetting a completed task fails with a clear reason."""
+        task = await task_manager.add(title="Test Task", content="Content")
+        await task_manager.claim(task.task_id)
+        await task_manager.complete(task.task_id)
+
+        result = await task_manager.reset(task.task_id)
+        assert not result.ok
+        assert "completed" in result.reason
+
+        task_after = await task_manager.get(task.task_id)
+        assert task_after.status == TaskStatus.COMPLETED.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_reset_cancelled_task_fails(self, task_manager):
+        """Test resetting a cancelled task fails with a clear reason."""
+        task = await task_manager.add(title="Test Task", content="Content")
+        await task_manager.cancel(task.task_id)
+
+        result = await task_manager.reset(task.task_id)
+        assert not result.ok
+        assert "cancelled" in result.reason
+
+        task_after = await task_manager.get(task.task_id)
+        assert task_after.status == TaskStatus.CANCELLED.value
+
+
+class TestGetTasksByAssignee:
+    """Test get_tasks_by_assignee functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_tasks_by_assignee_empty(self, task_manager):
+        """Test getting tasks by assignee when none exist"""
+        tasks = await task_manager.get_tasks_by_assignee(member_name="member1")
+        assert tasks == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_tasks_by_assignee_with_claimed_tasks(self, task_manager):
+        """Test getting tasks assigned to a specific member"""
+        task1 = await task_manager.add(title="Task 1", content="Content 1")
+        await task_manager.claim(task1.task_id)
+
+        task2 = await task_manager.add(title="Task 2", content="Content 2")
+        await task_manager.claim(task2.task_id)
+
+        tasks = await task_manager.get_tasks_by_assignee(member_name="member1")
+        assert len(tasks) == 2
+        task_ids = [t.task_id for t in tasks]
+        assert task1.task_id in task_ids
+        assert task2.task_id in task_ids
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_tasks_by_assignee_with_status_filter(self, task_manager):
+        """Test getting tasks by assignee with status filter"""
+        task1 = await task_manager.add(title="Task 1", content="Content 1")
+        await task_manager.claim(task1.task_id)
+        await task_manager.reset(task1.task_id)  # Reset back to pending
+
+        task2 = await task_manager.add(title="Task 2", content="Content 2")
+        await task_manager.claim(task2.task_id)
+
+        # Get only in-progress tasks
+        claimed_tasks = await task_manager.get_tasks_by_assignee(
+            member_name="member1",
+            status=TaskStatus.IN_PROGRESS.value
+        )
+        assert len(claimed_tasks) == 1
+        assert claimed_tasks[0].task_id == task2.task_id
+
+        await task_manager.complete(task2.task_id)
+        # Get only completed tasks
+        completed_tasks = await task_manager.get_tasks_by_assignee(
+            member_name="member1",
+            status=TaskStatus.COMPLETED.value
+        )
+        assert len(completed_tasks) == 1
+        assert completed_tasks[0].task_id == task2.task_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_tasks_by_assignee_different_members(self, task_manager):
+        """Test that tasks are correctly filtered by member"""
+        task1 = await task_manager.add(title="Task 1", content="Content 1")
+        await task_manager.claim(task1.task_id)
+
+        tasks_member1 = await task_manager.get_tasks_by_assignee(member_name="member1")
+        assert len(tasks_member1) == 1
+
+        tasks_member2 = await task_manager.get_tasks_by_assignee(member_name="member2")
+        assert len(tasks_member2) == 0
+
+
+# ---------------------------------------------------------------------------
+# Dependency-graph mutations through the manager layer.
+#
+# Plain pytest function style. Covers the manager-level guarantees on top
+# of the database primitives: that a cycle bubbles up as TaskOpResult.fail
+# with the diagnostic and that cancel propagates unblocking events.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_add_dependencies_rejects_cycle(task_manager):
+    """add_dependencies surfaces a cycle as a TaskOpResult failure.
+
+    Regression guard: previously add_dependencies skipped cycle detection
+    entirely and silently inserted a cycle-creating edge.
+    """
+    a = await task_manager.add(title="A", content="c")
+    b = await task_manager.add(title="B", content="c", dependencies=[a.task_id])
+
+    # b -> a already; trying to make a -> b would close A -> B -> A.
+    result = await task_manager.add_dependencies(a.task_id, [b.task_id])
+    assert result.ok is False
+    assert "Circular dependency" in result.reason
+
+    # a's dependency table stays empty — the rejected edge did not commit.
+    deps_a = await task_manager.get_dependencies(a.task_id)
+    assert deps_a == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_add_dependencies_refreshes_status(task_manager):
+    """Adding an unresolved dep flips the task from PENDING to BLOCKED."""
+    upstream = await task_manager.add(title="Up", content="c")
+    downstream = await task_manager.add(title="Down", content="c")
+    assert downstream.status == TaskStatus.PENDING.value
+
+    result = await task_manager.add_dependencies(downstream.task_id, [upstream.task_id])
+    assert result.ok is True
+
+    refreshed = await task_manager.get(downstream.task_id)
+    assert refreshed.status == TaskStatus.BLOCKED.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_cancel_unblocks_downstream_at_manager_layer(task_manager):
+    """task_manager.cancel propagates downstream unblocking.
+
+    The manager layer must surface the unblocked tasks as published
+    TaskUnblockedEvent messages — this is what wakes the leader's
+    coordinator loop.
+    """
+    upstream = await task_manager.add(title="Up", content="c")
+    downstream = await task_manager.add(
+        title="Down", content="c", dependencies=[upstream.task_id]
+    )
+    assert downstream.status == TaskStatus.BLOCKED.value
+
+    result = await task_manager.cancel(upstream.task_id)
+    assert result is not None
+    assert result.status == TaskStatus.CANCELLED.value
+
+    refreshed = await task_manager.get(downstream.task_id)
+    assert refreshed.status == TaskStatus.PENDING.value
+
+
+class TestAssign:
+    """Test leader-driven task assignment."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_assign_to_existing_member_succeeds(self, task_manager):
+        """Happy path: assigning a pending task to a real member binds it."""
+        task = await task_manager.add(title="T", content="c")
+
+        result = await task_manager.assign(task.task_id, "member1")
+
+        assert result.ok
+        refreshed = await task_manager.get(task.task_id)
+        assert refreshed.status == TaskStatus.IN_PROGRESS.value
+        assert refreshed.assignee == "member1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_assign_to_unknown_member_fails_at_manager_layer(self, task_manager):
+        """Assignee must exist in team_member, otherwise the task would
+        silently bind to a name no one serves (assignee has no DB FK)."""
+        task = await task_manager.add(title="T", content="c")
+
+        result = await task_manager.assign(task.task_id, "ghost")
+
+        assert not result.ok
+        assert "ghost" in result.reason
+        refreshed = await task_manager.get(task.task_id)
+        assert refreshed.status == TaskStatus.PENDING.value
+        assert refreshed.assignee is None
+
+
+def _published_events(message_bus, event_type: str) -> list:
+    """Collect published EventMessage instances of a given event_type."""
+    events = []
+    for call in message_bus.publish.call_args_list:
+        message = call.kwargs.get("message")
+        if message is not None and message.event_type == event_type:
+            events.append(message)
+    return events
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_reset_emits_task_released(task_manager, message_bus):
+    """Resetting a claimed task returns it to the claimable pool and
+    publishes TASK_RELEASED so idle teammates learn it is claimable
+    again."""
+    task = await task_manager.add(title="T", content="c")
+    assert await task_manager.claim(task.task_id)
+
+    result = await task_manager.reset(task.task_id)
+    assert result.ok
+
+    released = _published_events(message_bus, TeamEvent.TASK_RELEASED)
+    assert len(released) == 1
+    assert released[0].payload["task_id"] == task.task_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_reset_failure_emits_no_task_released(task_manager, message_bus):
+    """A failed reset (task not claimed) must not publish TASK_RELEASED."""
+    task = await task_manager.add(title="T", content="c")
+
+    result = await task_manager.reset(task.task_id)
+    assert not result.ok
+
+    assert _published_events(message_bus, TeamEvent.TASK_RELEASED) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_complete_last_task_emits_task_list_drained(task_manager, message_bus):
+    """Completing the only task drains the board and emits TASK_LIST_DRAINED."""
+    task = await task_manager.add(title="T", content="c")
+    assert await task_manager.claim(task.task_id)
+
+    await task_manager.complete(task.task_id)
+
+    drained = _published_events(message_bus, TeamEvent.TASK_LIST_DRAINED)
+    assert len(drained) == 1
+    assert drained[0].payload["task_count"] == 1
+    assert drained[0].payload["team_name"] == "test_team"
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_complete_non_last_task_does_not_drain(task_manager, message_bus):
+    """Completing one of several tasks leaves the board non-terminal."""
+    task1 = await task_manager.add(title="T1", content="c")
+    await task_manager.add(title="T2", content="c")
+    assert await task_manager.claim(task1.task_id)
+
+    await task_manager.complete(task1.task_id)
+
+    assert _published_events(message_bus, TeamEvent.TASK_LIST_DRAINED) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_cancel_last_task_emits_task_list_drained(task_manager, message_bus):
+    """Cancelling the only task drains the board and emits TASK_LIST_DRAINED."""
+    task = await task_manager.add(title="T", content="c")
+
+    await task_manager.cancel(task.task_id)
+
+    drained = _published_events(message_bus, TeamEvent.TASK_LIST_DRAINED)
+    assert len(drained) == 1
+    assert drained[0].payload["task_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_cancel_all_tasks_emits_task_list_drained(task_manager, message_bus):
+    """cancel_all_tasks drives every task terminal and drains the board once."""
+    await task_manager.add(title="T1", content="c")
+    await task_manager.add(title="T2", content="c")
+
+    await task_manager.cancel_all_tasks()
+
+    drained = _published_events(message_bus, TeamEvent.TASK_LIST_DRAINED)
+    assert len(drained) == 1
+    assert drained[0].payload["task_count"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_empty_task_list_never_drains(task_manager, message_bus):
+    """An empty board is not 'drained' — cancel_all_tasks on it emits nothing."""
+    await task_manager.cancel_all_tasks()
+
+    assert _published_events(message_bus, TeamEvent.TASK_LIST_DRAINED) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_plan_mode_submit_approve_and_complete(db, message_bus, tmp_path):
+    await db.team.create_team(
+        team_name="plan_team",
+        display_name="Plan Team",
+        leader_member_name="leader",
+    )
+    await db.member.create_member(
+        member_name="member1",
+        team_name="plan_team",
+        display_name="member1",
+        agent_card=AgentCard().model_dump_json(),
+        status="BUSY",
+        mode=MemberMode.PLAN_MODE.value,
+    )
+    manager = TeamTaskManager(
+        team_name="plan_team",
+        member_name="member1",
+        db=db,
+        messager=message_bus,
+        plans_dir=tmp_path / "plans",
+        team_plan_id="plan_1",
+    )
+
+    task = await manager.add(title="Plan task", content="Do work")
+    assert task.ok
+    assert task.status == TaskStatus.PENDING.value
+
+    claim_result = await manager.claim(task.task_id)
+    assert not claim_result.ok
+    assert "submit_plan" in claim_result.reason
+
+    assign_result = await manager.assign(task.task_id, "member1")
+    assert assign_result.ok
+    approval_without_plan = await manager.approve_plan(
+        plan_id="missing-plan",
+        approved=True,
+        feedback="too early",
+        leader_name="leader",
+    )
+    assert not approval_without_plan.ok
+    assert "not found" in approval_without_plan.reason
+
+    before_missing_plan = await manager.get(task.task_id)
+    missing_plan_result = await manager.submit_plan(
+        task.task_id,
+        plan_path=str(tmp_path / "missing_member_plan.md"),
+    )
+    assert missing_plan_result["success"] is False
+    after_missing_plan = await manager.get(task.task_id)
+    assert after_missing_plan.status == before_missing_plan.status
+    plan_index_path = tmp_path / "plans" / "index.json"
+    if plan_index_path.exists():
+        plan_index = json.loads(plan_index_path.read_text(encoding="utf-8"))
+        assert task.task_id not in plan_index.get("tasks", {})
+
+    draft_plan_path = tmp_path / "draft_member_plan.md"
+    draft_plan_path.write_text("1. inspect\n2. implement\n", encoding="utf-8")
+    submit_result = await manager.submit_plan(
+        task.task_id,
+        plan_path=str(draft_plan_path),
+    )
+    assert submit_result["success"] is True
+    assert submit_result["status"] == TaskStatus.PLANNING.value
+    first_plan_id = submit_result["plan_id"]
+    assert submit_result["leader_message_id"]
+    leader_messages = await db.message.get_messages("plan_team", "leader")
+    assert len(leader_messages) == 1
+    assert leader_messages[0].from_member_name == "member1"
+    assert f"Plan ID: {first_plan_id}" in leader_messages[0].content
+    assert submit_result["member_plan_md"] in leader_messages[0].content
+    assert Path(submit_result["member_plan_md"]).read_text(encoding="utf-8").startswith("1. inspect")
+    assert Path(submit_result["member_plan_md"]).resolve() != draft_plan_path.resolve()
+
+    claimed_task = await manager.get(task.task_id)
+    assert claimed_task.status == TaskStatus.PLANNING.value
+    assert claimed_task.assignee == "member1"
+
+    before_approval = await manager.complete(task.task_id)
+    assert not before_approval.ok
+
+    rejection_result = await manager.approve_plan(
+        plan_id=first_plan_id,
+        approved=False,
+        feedback="revise",
+        leader_name="leader",
+    )
+    assert rejection_result.ok
+    rejected_task = await manager.get(task.task_id)
+    assert rejected_task.status == TaskStatus.PLANNING.value
+    task_plan_dir = tmp_path / "plans" / "plan_1" / "tasks" / task.task_id
+    assert not (task_plan_dir / "approval.json").exists()
+    assert not (task_plan_dir / "manifest.json").exists()
+    plan_index = json.loads((tmp_path / "plans" / "index.json").read_text(encoding="utf-8"))
+    assert plan_index["tasks"][task.task_id]["decision"] == "reject"
+    assert plan_index["tasks"][task.task_id]["latest_plan_id"] == first_plan_id
+    assert plan_index["task_plans"][first_plan_id]["decision"] == "reject"
+
+    still_before_approval = await manager.complete(task.task_id)
+    assert not still_before_approval.ok
+
+    stale_approval_result = await manager.approve_plan(
+        plan_id=first_plan_id,
+        approved=True,
+        feedback="ok",
+        leader_name="leader",
+    )
+    assert not stale_approval_result.ok
+    assert "already reject" in stale_approval_result.reason
+
+    revised_plan_path = tmp_path / "revised_member_plan.md"
+    revised_plan_path.write_text("1. inspect deeper\n2. implement\n", encoding="utf-8")
+    resubmit_result = await manager.submit_plan(
+        task.task_id,
+        plan_path=str(revised_plan_path),
+    )
+    assert resubmit_result["success"] is True
+    assert resubmit_result["status"] == TaskStatus.PLANNING.value
+    second_plan_id = resubmit_result["plan_id"]
+    assert second_plan_id != first_plan_id
+
+    approval_result = await manager.approve_plan(
+        plan_id=second_plan_id,
+        approved=True,
+        feedback="ok",
+        leader_name="leader",
+    )
+    assert approval_result.ok
+    plan_index = json.loads((tmp_path / "plans" / "index.json").read_text(encoding="utf-8"))
+    assert plan_index["tasks"][task.task_id]["decision"] == "approve"
+    assert plan_index["tasks"][task.task_id]["latest_plan_id"] == second_plan_id
+    assert plan_index["task_plans"][second_plan_id]["decision"] == "approve"
+
+    approved_task = await manager.get(task.task_id)
+    assert approved_task.status == TaskStatus.IN_PROGRESS.value
+    assert approved_task.assignee == "member1"
+
+    complete_result = await manager.complete(task.task_id)
+    assert complete_result.ok
+    completed_task = await manager.get(task.task_id)
+    assert completed_task.status == TaskStatus.COMPLETED.value
+
+    index = json.loads((tmp_path / "plans" / "index.json").read_text(encoding="utf-8"))
+    assert index["tasks"][task.task_id]["status"] == TaskStatus.COMPLETED.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_in_progress_task_rejects_new_dependency(db, message_bus, tmp_path):
+    """An IN_PROGRESS task is being executed, so it cannot gain a new prerequisite."""
+    await db.team.create_team(team_name="dep_team", display_name="DT", leader_member_name="leader")
+    await db.member.create_member(
+        member_name="member1",
+        team_name="dep_team",
+        display_name="member1",
+        agent_card=AgentCard().model_dump_json(),
+        status="READY",
+        mode=MemberMode.BUILD_MODE.value,
+    )
+    manager = TeamTaskManager(
+        team_name="dep_team", member_name="member1", db=db, messager=message_bus, plans_dir=tmp_path / "plans"
+    )
+    await manager.add_graph(
+        [
+            TaskGraphSpec(title="running", content="c", task_id="r", assignee="member1"),
+            TaskGraphSpec(title="prereq", content="c", task_id="pre"),
+        ]
+    )
+    assert (await manager.start_task("r")).ok
+    assert (await manager.get("r")).status == TaskStatus.IN_PROGRESS.value
+
+    # Wiring "r depends on pre" is rejected — r is already executing.
+    result = await manager.add_dependencies("r", ["pre"])
+    assert not result.ok
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_list_tasks_with_deps_avoids_n_plus_1(task_manager, monkeypatch):
+    """list_tasks_with_deps fetches all deps in one batch query, never per-task.
+
+    Regression guard for the N+1 that made view_task O(tasks) queries: it must
+    call get_team_dependencies exactly once and get_task_dependencies zero
+    times, regardless of how many tasks are on the board.
+    """
+    t1 = await task_manager.add(title="T1", content="c1")
+    t2 = await task_manager.add(title="T2", content="c2")
+    t3 = await task_manager.add(title="T3", content="c3", dependencies=[t1.task_id, t2.task_id])
+
+    dao = task_manager.db.task
+    per_task_calls = 0
+    batch_calls = 0
+    orig_per_task = dao.get_task_dependencies
+    orig_batch = dao.get_team_dependencies
+
+    async def spy_per_task(task_id):
+        nonlocal per_task_calls
+        per_task_calls += 1
+        return await orig_per_task(task_id)
+
+    async def spy_batch(team_name):
+        nonlocal batch_calls
+        batch_calls += 1
+        return await orig_batch(team_name)
+
+    monkeypatch.setattr(dao, "get_task_dependencies", spy_per_task)
+    monkeypatch.setattr(dao, "get_team_dependencies", spy_batch)
+
+    result = await task_manager.list_tasks_with_deps()
+
+    assert batch_calls == 1
+    assert per_task_calls == 0
+    # Grouping is correct: t3 blocked by both deps; t1/t2 have none.
+    by_id = {s.task_id: s for s in result.tasks}
+    assert set(by_id[t3.task_id].blocked_by) == {t1.task_id, t2.task_id}
+    assert by_id[t1.task_id].blocked_by == []
+    assert by_id[t2.task_id].blocked_by == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_count_tasks_terminality(task_manager):
+    """count_tasks_terminality returns (total, non_terminal) in one aggregate query."""
+    dao = task_manager.db.task
+    team = "test_team"
+
+    assert await dao.count_tasks_terminality(team) == (0, 0)
+
+    t1 = await task_manager.add(title="T1", content="c")
+    await task_manager.add(title="T2", content="c")
+    # Two pending tasks -> both non-terminal.
+    assert await dao.count_tasks_terminality(team) == (2, 2)
+
+    assert await task_manager.claim(t1.task_id)
+    await task_manager.complete(t1.task_id)
+    # One completed (terminal) + one pending -> total 2, non_terminal 1.
+    assert await dao.count_tasks_terminality(team) == (2, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_get_dependent_task_ids_single_query(task_manager):
+    """get_dependent_task_ids returns every downstream task id from the edge table."""
+    a = await task_manager.add(title="A", content="ca")
+    b = await task_manager.add(title="B", content="cb", dependencies=[a.task_id])
+    c = await task_manager.add(title="C", content="cc", dependencies=[a.task_id])
+
+    downstream = await task_manager.db.task.get_dependent_task_ids(a.task_id)
+    assert set(downstream) == {b.task_id, c.task_id}
+    # A leaf task nobody depends on has no downstream ids.
+    assert await task_manager.db.task.get_dependent_task_ids(b.task_id) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_get_task_detail_reports_blocks_and_blocked_by(task_manager):
+    """get_task_detail: blocks = downstream tasks, blocked_by = unresolved deps."""
+    a = await task_manager.add(title="A", content="ca")
+    b = await task_manager.add(title="B", content="cb", dependencies=[a.task_id])
+
+    detail_a = await task_manager.get_task_detail(a.task_id)
+    assert detail_a is not None
+    assert detail_a.blocks == [b.task_id]
+    assert detail_a.blocked_by == []
+
+    detail_b = await task_manager.get_task_detail(b.task_id)
+    assert detail_b is not None
+    assert detail_b.blocked_by == [a.task_id]
+    assert detail_b.blocks == []
+
+
+@pytest_asyncio.fixture
+async def member2(task_manager, db):
+    """Create a second BUILD_MODE member 'member2' in test_team.
+
+    Depends on ``task_manager`` so the team and first member exist before
+    the second member row is inserted.
+    """
+    await db.member.create_member(
+        member_name="member2",
+        team_name="test_team",
+        display_name="member2",
+        agent_card=AgentCard().model_dump_json(),
+        status="BUSY",
+        mode=MemberMode.BUILD_MODE.value,
+    )
+    return "member2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_get_other_active_task_id_finds_other_and_excludes_self(task_manager):
+    """get_other_active_task_id returns the task_id of a member's other
+    active task and excludes the task being (re)acted on itself."""
+    task_a = await task_manager.add(title="A", content="c")
+    assert (await task_manager.assign(task_a.task_id, "member1")).ok
+
+    found = await task_manager.get_other_active_task_id("member1", exclude_task_id="another-id")
+    assert found == task_a.task_id
+
+    # Excluding the only active task returns None — an idempotent re-claim /
+    # re-assign of the same task must not be flagged as a conflict.
+    assert await task_manager.get_other_active_task_id("member1", exclude_task_id=task_a.task_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_get_other_active_task_id_none_without_active(task_manager, member2):
+    """A member holding no active task yields None."""
+    assert await task_manager.get_other_active_task_id("member2", exclude_task_id="x") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_reassign_transfers_task_and_revokes_old_assignee(task_manager, member2, message_bus):
+    """reassign atomically swaps the assignee — the task stays IN_PROGRESS and
+    never bounces through PENDING — and fires exactly two targeted events:
+    TASK_REVOKED for the former owner, TASK_CLAIMED for the new owner. It must
+    NOT fire TASK_RELEASED: the task never re-enters the claimable pool, so
+    idle teammates are not spuriously woken."""
+    task = await task_manager.add(title="T", content="c")
+    assert (await task_manager.assign(task.task_id, "member1")).ok
+    message_bus.publish.reset_mock()
+
+    result = await task_manager.reassign(task.task_id, "member2")
+    assert result.ok
+
+    refreshed = await task_manager.get(task.task_id)
+    assert refreshed.assignee == "member2"
+    assert refreshed.status == TaskStatus.IN_PROGRESS.value
+
+    revoked = _published_events(message_bus, TeamEvent.TASK_REVOKED)
+    assert len(revoked) == 1
+    assert revoked[0].payload["task_id"] == task.task_id
+    assert revoked[0].payload["member_name"] == "member1"
+
+    claimed = _published_events(message_bus, TeamEvent.TASK_CLAIMED)
+    assert any(c.payload["member_name"] == "member2" for c in claimed)
+
+    # Atomic swap: no reset means no spurious TASK_RELEASED for idle teammates.
+    assert _published_events(message_bus, TeamEvent.TASK_RELEASED) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_reassign_assigned_but_not_started_task_keeps_it_pending(task_manager, member2, message_bus):
+    """An assigned-but-not-yet-started task can be handed over, and stays put.
+
+    This is the scheduled mode's resting state (``PENDING`` with an assignee,
+    waiting for the scheduler to start it) and the cheapest possible handover
+    — nobody is working, so nothing is discarded. The swap must not start the
+    task, and must not drop it back into the claimable pool.
+    """
+    result = await task_manager.add_graph(
+        [TaskGraphSpec(title="T", content="c", task_id="t1", assignee="member1")]
+    )
+    assert result.ok
+    assert result.tasks[0].status == TaskStatus.PENDING.value
+    message_bus.publish.reset_mock()
+
+    assert (await task_manager.reassign("t1", "member2")).ok
+
+    refreshed = await task_manager.get("t1")
+    assert refreshed.assignee == "member2"
+    assert refreshed.status == TaskStatus.PENDING.value
+
+    revoked = _published_events(message_bus, TeamEvent.TASK_REVOKED)
+    assert [e.payload["member_name"] for e in revoked] == ["member1"]
+    claimed = _published_events(message_bus, TeamEvent.TASK_CLAIMED)
+    assert any(c.payload["member_name"] == "member2" for c in claimed)
+    # Still owned throughout — it never re-entered the claimable pool.
+    assert _published_events(message_bus, TeamEvent.TASK_RELEASED) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_reassign_task_in_review_is_refused(task_manager, member2, message_bus):
+    """A task inside the verify gate is not reassignable.
+
+    ``IN_REVIEW`` has an artifact bound to the current owner (the submitted
+    work a reviewer is judging); swapping the owner underneath would attribute
+    it to someone who never produced it.
+    """
+    task = await task_manager.add(title="T", content="c")
+    assert (await task_manager.assign(task.task_id, "member1")).ok
+    assert await task_manager.db.task.update_task_status(task.task_id, TaskStatus.IN_REVIEW.value)
+    message_bus.publish.reset_mock()
+
+    result = await task_manager.reassign(task.task_id, "member2")
+    assert not result.ok
+
+    refreshed = await task_manager.get(task.task_id)
+    assert refreshed.assignee == "member1"
+    assert refreshed.status == TaskStatus.IN_REVIEW.value
+    assert _published_events(message_bus, TeamEvent.TASK_REVOKED) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_reassign_missing_new_member_leaves_task_intact(task_manager, message_bus):
+    """A reassign to an unknown member must not strand the task as an
+    ownerless PENDING: the current owner and IN_PROGRESS status stay, and no
+    TASK_REVOKED is emitted."""
+    task = await task_manager.add(title="T", content="c")
+    assert (await task_manager.assign(task.task_id, "member1")).ok
+
+    result = await task_manager.reassign(task.task_id, "ghost")
+    assert not result.ok
+
+    refreshed = await task_manager.get(task.task_id)
+    assert refreshed.assignee == "member1"
+    assert refreshed.status == TaskStatus.IN_PROGRESS.value
+    assert _published_events(message_bus, TeamEvent.TASK_REVOKED) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_cancel_claimed_task_notifies_assignee(task_manager, message_bus):
+    """Cancelling a claimed task fires TASK_CANCELLED carrying the (former)
+    assignee, so its dispatcher can steer it off — no member-wide cancel."""
+    task = await task_manager.add(title="T", content="c")
+    assert (await task_manager.assign(task.task_id, "member1")).ok
+    message_bus.publish.reset_mock()
+
+    cancelled = await task_manager.cancel(task.task_id)
+    assert cancelled is not None
+
+    events = _published_events(message_bus, TeamEvent.TASK_CANCELLED)
+    assert len(events) == 1
+    assert events[0].payload["task_id"] == task.task_id
+    assert events[0].payload["member_name"] == "member1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_update_claimed_task_keeps_claim_and_notifies(task_manager, message_bus):
+    """Editing an IN_PROGRESS task now succeeds (no reset) and fires TASK_UPDATED
+    carrying the current owner, so the assignee is told to re-read. The task
+    stays in progress under the same member."""
+    task = await task_manager.add(title="T", content="c")
+    assert (await task_manager.assign(task.task_id, "member1")).ok
+    message_bus.publish.reset_mock()
+
+    result = await task_manager.update_task(task.task_id, content="revised")
+    assert result.ok
+
+    refreshed = await task_manager.get(task.task_id)
+    assert refreshed.status == TaskStatus.IN_PROGRESS.value
+    assert refreshed.assignee == "member1"
+    assert refreshed.content == "revised"
+
+    events = _published_events(message_bus, TeamEvent.TASK_UPDATED)
+    assert len(events) == 1
+    assert events[0].payload["task_id"] == task.task_id
+    assert events[0].payload["member_name"] == "member1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_update_task_event_carries_post_write_status(task_manager, message_bus):
+    """TASK_UPDATED carries the post-write status, so a consumer whose view
+    missed a transition resyncs from the event instead of re-querying."""
+    task = await task_manager.add(title="T", content="c")
+    assert (await task_manager.assign(task.task_id, "member1")).ok
+    message_bus.publish.reset_mock()
+
+    result = await task_manager.update_task(task.task_id, title="Revised")
+    assert result.ok
+
+    events = _published_events(message_bus, TeamEvent.TASK_UPDATED)
+    assert len(events) == 1
+    assert events[0].payload["status"] == TaskStatus.IN_PROGRESS.value
+    assert events[0].payload["member_name"] == "member1"
+
+    message_bus.publish.reset_mock()
+    pending = await task_manager.add(title="P", content="c")
+    assert (await task_manager.update_task(pending.task_id, content="edited")).ok
+
+    events = _published_events(message_bus, TeamEvent.TASK_UPDATED)
+    assert len(events) == 1
+    assert events[0].payload["status"] == TaskStatus.PENDING.value
+
+
+# ---------------------------------------------------------------------------
+# F_118 / D7: the author's completion note is persisted on the task row
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_complete_persists_note_on_the_row(task_manager):
+    task = await task_manager.add(title="T", content="c")
+    assert await task_manager.claim(task.task_id)
+
+    result = await task_manager.complete(task.task_id, note="artifact at out/report.md")
+
+    assert result.ok
+    detail = await task_manager.get_task_detail(task.task_id)
+    assert detail.note == "artifact at out/report.md"
+    assert detail.status == TaskStatus.COMPLETED.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_submit_for_review_persists_note_too(task_manager):
+    """A reviewed task lands in IN_REVIEW with the note already on the row for reviewers."""
+    graph = await task_manager.add_graph(
+        [
+            TaskGraphSpec(
+                title="T",
+                content="c",
+                task_id="r1",
+                assignee=task_manager.member_name,
+                reviewer=({"type": "verifier", "reviewer_id": "v1", "instruction": ""},),
+            )
+        ]
+    )
+    assert graph.ok
+    assert await task_manager.claim("r1")
+
+    result = await task_manager.complete("r1", note="see pr #12")
+
+    assert result.ok
+    detail = await task_manager.get_task_detail("r1")
+    assert detail.status == TaskStatus.IN_REVIEW.value
+    assert detail.note == "see pr #12"
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_get_tasks_by_ids_skips_unknown_ids(task_manager):
+    a = await task_manager.add(title="A", content="c")
+    b = await task_manager.add(title="B", content="c")
+
+    rows = await task_manager.db.task.get_tasks_by_ids([a.task_id, "nope", b.task_id])
+
+    assert {row.task_id for row in rows} == {a.task_id, b.task_id}
+    assert await task_manager.db.task.get_tasks_by_ids([]) == []
+
+
+# ---------------------------------------------------------------------------
+# F_119: completion summary beside the note; both cleared when ownership moves
+# ---------------------------------------------------------------------------
+
+
+async def _reviewed_task_back_in_progress(task_manager, db, message_bus, *, summary: str, note: str) -> str:
+    """Submit a reviewed task with a summary / note, then fail its review so it is IN_PROGRESS again."""
+    graph = await task_manager.add_graph(
+        [
+            TaskGraphSpec(
+                title="T",
+                content="c",
+                task_id="r2",
+                assignee=task_manager.member_name,
+                reviewer=({"type": "verifier", "reviewer_id": "v1", "instruction": ""},),
+            )
+        ]
+    )
+    assert graph.ok
+    assert await task_manager.claim("r2")
+    assert (await task_manager.complete("r2", summary=summary, note=note)).ok
+    reviewer = TeamTaskManager(team_name="test_team", member_name="v1", db=db, messager=message_bus)
+    assert (await reviewer.verify_task("r2", "fail", "redo")).ok
+    assert (await task_manager.get("r2")).status == TaskStatus.IN_PROGRESS.value
+    return "r2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_complete_persists_summary_beside_note(task_manager):
+    task = await task_manager.add(title="T", content="c")
+    assert await task_manager.claim(task.task_id)
+
+    result = await task_manager.complete(task.task_id, summary="report at out/r.md", note="full detail")
+
+    assert result.ok
+    detail = await task_manager.get_task_detail(task.task_id)
+    assert detail.summary == "report at out/r.md"
+    assert detail.note == "full detail"
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_resubmission_keeps_fields_that_are_not_given(task_manager, db, message_bus):
+    task_id = await _reviewed_task_back_in_progress(
+        task_manager,
+        db,
+        message_bus,
+        summary="first summary",
+        note="first note",
+    )
+
+    assert (await task_manager.complete(task_id, note="revised note")).ok
+
+    row = await task_manager.get(task_id)
+    assert row.summary == "first summary"
+    assert row.note == "revised note"
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_summary_is_stored_in_full(task_manager):
+    task = await task_manager.add(title="T", content="c")
+    assert await task_manager.claim(task.task_id)
+    long_summary = "x" * 500
+
+    assert (await task_manager.complete(task.task_id, summary=long_summary)).ok
+
+    assert (await task_manager.get(task.task_id)).summary == long_summary
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_reassign_clears_summary_and_note(task_manager, db, message_bus):
+    await db.member.create_member(
+        member_name="member2",
+        team_name="test_team",
+        display_name="member2",
+        agent_card=AgentCard().model_dump_json(),
+        status="BUSY",
+        mode=MemberMode.BUILD_MODE.value,
+    )
+    task_id = await _reviewed_task_back_in_progress(task_manager, db, message_bus, summary="s", note="n")
+
+    assert (await task_manager.reassign(task_id, "member2")).ok
+
+    row = await task_manager.get(task_id)
+    assert row.assignee == "member2"
+    assert row.status == TaskStatus.IN_PROGRESS.value
+    assert row.summary is None
+    assert row.note is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_reassign_cas_miss_leaves_completion_text(task_manager, db, message_bus):
+    task_id = await _reviewed_task_back_in_progress(task_manager, db, message_bus, summary="s", note="n")
+
+    swapped = await task_manager.db.task.reassign_task(task_id, "someone-else", "member2")
+
+    assert swapped is False
+    row = await task_manager.get(task_id)
+    assert (row.summary, row.note) == ("s", "n")
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_reset_clears_summary_and_note_even_in_review(task_manager):
+    graph = await task_manager.add_graph(
+        [
+            TaskGraphSpec(
+                title="T",
+                content="c",
+                task_id="r3",
+                assignee=task_manager.member_name,
+                reviewer=({"type": "verifier", "reviewer_id": "v1", "instruction": ""},),
+            )
+        ]
+    )
+    assert graph.ok
+    assert await task_manager.claim("r3")
+    assert (await task_manager.complete("r3", summary="s", note="n")).ok
+    assert (await task_manager.get("r3")).status == TaskStatus.IN_REVIEW.value
+
+    assert (await task_manager.reset("r3")).ok
+
+    row = await task_manager.get("r3")
+    assert row.assignee is None
+    assert row.summary is None
+    assert row.note is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_content_update_keeps_summary_and_note(task_manager, db, message_bus):
+    task_id = await _reviewed_task_back_in_progress(task_manager, db, message_bus, summary="s", note="n")
+
+    await task_manager.update_task(task_id, content="revised content")
+
+    row = await task_manager.get(task_id)
+    assert (row.summary, row.note) == ("s", "n")
+
+
+@pytest.mark.level1
+def test_dispatch_mode_is_exposed_read_only(db, message_bus):
+    manager = TeamTaskManager(
+        team_name="test_team",
+        member_name="member1",
+        db=db,
+        messager=message_bus,
+        dispatch_mode="scheduled",
+    )
+
+    assert manager.dispatch_mode == "scheduled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_has_open_tasks_counts_only_non_terminal_tasks(task_manager):
+    assert not await task_manager.has_open_tasks()
+
+    await task_manager.add_graph(
+        [
+            TaskGraphSpec(title="done", content="c", task_id="done"),
+            TaskGraphSpec(title="dropped", content="c", task_id="dropped"),
+        ]
+    )
+    assert await task_manager.has_open_tasks()
+
+    assert await task_manager.claim("done")
+    assert (await task_manager.complete("done")).ok
+    assert await task_manager.cancel("dropped") is not None
+    assert not await task_manager.has_open_tasks()
+
+    await task_manager.add_graph([TaskGraphSpec(title="review", content="c", task_id="review")])
+    assert await task_manager.claim("review")
+    assert await task_manager.db.task.update_task_status("review", TaskStatus.IN_REVIEW.value)
+    assert await task_manager.has_open_tasks()
+    assert await task_manager.board_counts() == (3, 1)
+
+    assert await task_manager.db.task.update_task_status("review", TaskStatus.COMPLETED.value)
+    await task_manager.add_graph(
+        [
+            TaskGraphSpec(title="next", content="c", task_id="next", depends_on=("later",)),
+            TaskGraphSpec(title="later", content="c", task_id="later"),
+        ]
+    )
+    assert await task_manager.has_open_tasks()

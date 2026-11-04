@@ -1,0 +1,306 @@
+# -*- coding: UTF-8 -*-
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+import asyncio
+import time
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any, List, Optional
+
+from openjiuwen.core.common.clients.client_registry import get_client_registry
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import BaseError, build_error
+from openjiuwen.core.common.logging import runner_logger as logger
+from openjiuwen.core.foundation.tool import (
+    McpClient,
+    McpServerConfig,
+    MCPTool,
+    McpToolCard,
+    Tool,
+)
+from openjiuwen.core.session.tracer import decorate_tool_with_trace
+
+
+@dataclass
+class McpServerResource:
+    config: McpServerConfig
+    client: McpClient
+    tool_ids: list[str]
+    last_update_time: Any
+    expiry_time: Optional[float] = None
+
+
+@dataclass
+class SysOpToolResource:
+    sys_op_id: str
+    tool_ids: list[str]
+    last_update_time: Any
+
+
+class ToolMgr:
+    def __init__(self) -> None:
+        self._tools: dict[str, Tool] = {}
+        self._mcp_server_name_to_ids: dict[str, list[str]] = {}
+        self._mcp_server_resources: dict[str, McpServerResource] = {}
+        self._sys_op_resources: dict[str, SysOpToolResource] = {}
+        # Per-server_id locks serialize concurrent ``add_tool_server`` calls
+        # for the same logical server. Multiple agents (e.g. team members
+        # sharing a DeepAgentSpec) can race here when started together; the
+        # first caller registers the resource and later callers find it
+        # already-present and return the cached cards instead of crashing
+        # with "already exist tool".
+        self._mcp_server_locks: dict[str, asyncio.Lock] = {}
+
+    def _mcp_server_lock(self, server_id: str) -> asyncio.Lock:
+        """Return the lock guarding registration of a given server_id."""
+        lock = self._mcp_server_locks.get(server_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._mcp_server_locks[server_id] = lock
+        return lock
+
+    def add_tool(self, tool_id: str, tool: Tool) -> None:
+        if self._tools.get(tool_id) is not None:
+            raise ValueError(f"already exist tool {tool_id}")
+        self._tools[tool_id] = tool
+
+    def get_tool(self, tool_id: str, session=None) -> Optional[Tool]:
+        tool = self._tools.get(tool_id)
+        return decorate_tool_with_trace(tool, session)
+
+    def get_mcp_tool(self, tool_name: str, server_id: str, session):
+        resource = self._mcp_server_resources.get(server_id)
+        if resource:
+            tool_id = self.generate_mcp_tool_id(server_id, resource.config.server_name, tool_name)
+            return self.get_tool(tool_id, session)
+        return None
+
+    def get_mcp_tools(self, server_id: str, session):
+        resource = self._mcp_server_resources.get(server_id)
+        if resource:
+            tool_ids = resource.tool_ids
+            results = []
+            for tool_id in tool_ids:
+                results.append(self.get_tool(tool_id, session))
+            return results
+        return None
+
+    def get_mcp_tool_id(self, server_id: str, tool_name=None):
+        resource = self._mcp_server_resources.get(server_id)
+        if resource:
+            if tool_name is None:
+                return resource.tool_ids
+            tool_id = self.generate_mcp_tool_id(server_id, resource.config.server_name, tool_name)
+            return tool_id
+        else:
+            return None
+
+    def remove_tool(self, tool_id: str) -> Optional[Tool]:
+        return self._tools.pop(tool_id, None)
+
+    @staticmethod
+    def generate_mcp_tool_id(server_id, server_name, tool_name):
+        return f"{server_id}.{server_name}.{tool_name}"
+
+    async def add_tool_server(
+        self, server_config: McpServerConfig, expiry_time: Optional[float] = None
+    ) -> List[McpToolCard]:
+        # Serialize registrations for the same server_id so concurrent callers
+        # (e.g. team members starting in parallel and sharing a DeepAgentSpec)
+        # don't race past the existence check and collide inside add_tool.
+        async with self._mcp_server_lock(server_config.server_id):
+            existing = self._mcp_server_resources.get(server_config.server_id)
+            if existing is not None:
+                # Already registered — return the cached tool cards so the
+                # caller observes a successful add without spinning up a
+                # second stdio subprocess or duplicating tool entries.
+                cards: list[McpToolCard] = []
+                for tool_id in existing.tool_ids:
+                    tool = self._tools.get(tool_id)
+                    if isinstance(tool, MCPTool):
+                        cards.append(deepcopy(tool.card))
+                return cards
+            client = self._create_client(server_config)
+            connected = False
+            try:
+                connected = await client.connect()
+                if not connected:
+                    last_err = getattr(client, "_last_connect_error", None)
+                    reason = f"{type(last_err).__name__}: {last_err}" if last_err else ""
+                    raise build_error(
+                        StatusCode.RESOURCE_MCP_SERVER_CONNECTION_ERROR,
+                        server_config=server_config, reason=reason,
+                    )
+                results = await self._inner_refresh_mcp_tools(client, server_config, expiry_time)
+                self._mcp_server_name_to_ids.setdefault(server_config.server_name, []).append(server_config.server_id)
+                return results
+            except BaseException as e:
+                # ``connect``/``list_tools`` may raise a bare ``CancelledError`` or a
+                # ``BaseExceptionGroup`` (anyio task-group teardown, closing the
+                # generator-based client). Both are ``BaseException`` subclasses that
+                # escape ``except Exception``; coerce them into a ``BaseError`` so
+                # ``add_mcp_server`` wraps it in an ``Error`` and the real reason
+                # reaches the frontend instead of a silent "task cancelled".
+                if isinstance(e, KeyboardInterrupt):
+                    raise
+                # ``connect()`` False path already raised CONNECTION_ERROR above;
+                # let it through to keep its status/reason.
+                if isinstance(e, BaseError) and e.status is StatusCode.RESOURCE_MCP_SERVER_CONNECTION_ERROR:
+                    raise
+                if connected:
+                    try:
+                        await client.disconnect()
+                    except BaseException as disconnect_exc:  # noqa: BLE001
+                        logger.warning(
+                            "add_tool_server cleanup failed: %s, server_id=%s",
+                            disconnect_exc, server_config.server_id,
+                        )
+                if isinstance(e, Exception) and not isinstance(e, asyncio.CancelledError):
+                    cause = e
+                elif isinstance(e, asyncio.CancelledError):
+                    cause = RuntimeError(
+                        f"MCP server '{server_config.server_name}' connect/register cancelled "
+                        f"(anyio task-group teardown): {e}"
+                    )
+                elif isinstance(e, BaseExceptionGroup):
+                    exc_subgroup, base_subgroup = e.split(Exception)
+                    if exc_subgroup is not None and base_subgroup is None:
+                        subs = list(exc_subgroup.exceptions)
+                        cause = subs[0] if len(subs) == 1 else exc_subgroup
+                    elif base_subgroup is not None:
+                        cause = RuntimeError(
+                            f"MCP server '{server_config.server_name}' register failed: {base_subgroup}"
+                        )
+                    else:
+                        cause = RuntimeError(
+                            f"MCP server '{server_config.server_name}' register failed: {e}"
+                        )
+                else:
+                    cause = RuntimeError(
+                        f"MCP server '{server_config.server_name}' register failed: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                raise build_error(
+                    StatusCode.RESOURCE_MCP_SERVER_ADD_ERROR, cause=cause, server_config=server_config,
+                    reason=str(cause),
+                ) from e
+
+    @staticmethod
+    def _create_client(config: McpServerConfig) -> McpClient:
+        try:
+            client = get_client_registry().get_client(name=config.client_type, client_type="mcp", config=config)
+            if client is None or not isinstance(client, McpClient):
+                raise ValueError(f"Unsupported MCP client type: {config.client_type}")
+            return client
+        except ValueError as e:
+            raise ValueError(f"Unsupported MCP client type: {config.client_type}") from e
+        except Exception as e:
+            raise e
+
+    def get_mcp_server_ids(self, server_name: str):
+        return self._mcp_server_name_to_ids.get(server_name, [])
+
+    def get_mcp_client(self, server_id: str) -> Optional[McpClient]:
+        resource = self._mcp_server_resources.get(server_id)
+        return resource.client if resource else None
+
+    def get_mcp_server_config(self, server_id: str) -> Optional[McpServerConfig]:
+        resource = self._mcp_server_resources.get(server_id)
+        return deepcopy(resource.config) if resource else None
+
+    def get_mcp_tool_ids(self, server_id: str) -> list[str]:
+        resource = self._mcp_server_resources.get(server_id)
+        return deepcopy(resource.tool_ids) if resource else []
+
+    async def remove_tool_server(self, server_id: str, ignore_not_exist: bool = True) -> list[str]:
+        mcp_server_resource = self._mcp_server_resources.pop(server_id, None)
+        if not mcp_server_resource:
+            if not ignore_not_exist:
+                raise build_error(
+                    StatusCode.RESOURCE_MCP_SERVER_REMOVE_ERROR, server_id=server_id, reason="server is not exist"
+                )
+            else:
+                return []
+        try:
+            await mcp_server_resource.client.disconnect()
+        except Exception as e:
+            logger.warn(f"remove tool server discount {str(e)}, server_id={server_id}")
+        finally:
+            self._inner_remove_mcp_tools(mcp_server_resource.tool_ids)
+            ids = self._mcp_server_name_to_ids.get(mcp_server_resource.config.server_name)
+            if ids and server_id in ids:
+                ids.remove(server_id)
+            if not ids:
+                self._mcp_server_name_to_ids.pop(mcp_server_resource.config.server_name)
+        return mcp_server_resource.tool_ids
+
+    def add_sys_operation_tools(self, sys_op_id: str, tool_ids: list[str]) -> None:
+        """Register tools associated with a SysOperation."""
+        if not tool_ids:
+            return
+        self._sys_op_resources[sys_op_id] = SysOpToolResource(
+            sys_op_id=sys_op_id, tool_ids=deepcopy(tool_ids), last_update_time=time.time()
+        )
+
+    def remove_sys_operation_tools(self, sys_op_id: str) -> list[str]:
+        """Unregister and return tool IDs associated with a SysOperation."""
+        resource = self._sys_op_resources.pop(sys_op_id, None)
+        return resource.tool_ids if resource else []
+
+    def get_sys_operation_tool_ids(self, sys_op_id: str) -> list[str]:
+        """Get tool IDs associated with a SysOperation."""
+        resource = self._sys_op_resources.get(sys_op_id)
+        return resource.tool_ids if resource else []
+
+    async def refresh_tool_server(
+        self, server_id: str, skip_not_exist: bool = False, force: bool = False
+    ) -> list[McpToolCard]:
+        mcp_resource = self._mcp_server_resources.get(server_id)
+        if not mcp_resource:
+            if not skip_not_exist:
+                raise build_error(
+                    StatusCode.RESOURCE_MCP_SERVER_REFRESH_ERROR, server_id=server_id, reason="server is not exist"
+                )
+            return []
+        need_refresh = force
+        if not force:
+            if mcp_resource.expiry_time and time.time() - mcp_resource.last_update_time >= mcp_resource.expiry_time:
+                need_refresh = True
+
+        if need_refresh:
+            return await self._inner_refresh_mcp_tools(
+                mcp_resource.client, mcp_resource.config, mcp_resource.expiry_time
+            )
+        else:
+            return []
+
+    async def _inner_refresh_mcp_tools(self, client, server_config, expiry_time):
+        mcp_cards = await client.list_tools()
+        mcp_cards = mcp_cards if mcp_cards else []
+        for card in mcp_cards:
+            card.id = self.generate_mcp_tool_id(server_config.server_id, server_config.server_name, card.name)
+            self.add_tool(card.id, MCPTool(mcp_client=client, tool_info=deepcopy(card)))
+        mcp_ids = [card.id for card in mcp_cards]
+        self._mcp_server_resources[server_config.server_id] = McpServerResource(
+            config=server_config,
+            expiry_time=expiry_time,
+            client=client,
+            last_update_time=time.time(),
+            tool_ids=deepcopy(mcp_ids),
+        )
+        return mcp_cards
+
+    def _inner_remove_mcp_tools(self, tools):
+        if not tools:
+            return
+        for tool_id in tools:
+            try:
+                self.remove_tool(tool_id)
+            except Exception:
+                continue
+
+    async def release(self):
+        for res in self._mcp_server_resources.values():
+            try:
+                await res.client.disconnect()
+            except Exception:
+                continue

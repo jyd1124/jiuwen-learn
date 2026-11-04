@@ -1,0 +1,2185 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""The DSL primitives: ``agent / parallel / pipeline / map_parallel /
+phase / log / workflow / budget`` plus ``compact`` / ``flatten_filter``.
+
+A workflow imports these (``from swarmflow import agent, parallel, ...``) and
+calls them from inside ``async def run(args)``. They read the active
+:class:`~workflow.engine.runtime.Runtime` and the current structural path from
+``contextvars`` — so each call resolves the run it belongs to, and concurrent
+workflows in one event loop stay isolated (each runs in its own Task → its own
+context copy). There is no shared ``ctx`` object to misplace across runs.
+
+Concurrency model:
+
+* The cap is a single ``asyncio.Semaphore`` acquired **only inside** ``agent()``
+  around the backend call — orchestration coroutines hold no permit, so nested
+  ``parallel(parallel(...))`` never deadlocks against the cap.
+* ``parallel`` is a fork-join **barrier** (``gather`` over safe-wrapped thunks):
+  a failing thunk resolves to ``None`` and the call never raises. We do **not**
+  use ``asyncio.TaskGroup`` (it cancels siblings on first error — wrong here).
+* ``pipeline`` streams with **no barrier**: each item is an independent chain
+  coroutine; ``gather`` runs them concurrently so item A can be in stage 3 while
+  B is still in stage 1.
+
+``contextvars`` isolation: ``asyncio.gather`` wraps each coroutine in a Task,
+which copies the current context — so a branch/chain's ``_path``/``_seq`` writes
+are private to that branch. ``CancelledError`` is a ``BaseException`` (not
+``Exception``), so the broad ``except Exception`` guards never swallow it and
+runs stay cancellable without an explicit re-raise clause.
+
+Observability hooks (the one divergence from a pure port): ``phase`` / ``log``
+and ``agent`` start/end emit structured :class:`WorkflowProgressEvent`s to
+``rt.progress_sink``; internal diagnostics go to ``rt.log_sink``.
+"""
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, is_dataclass
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, Sequence, TypeVar, overload
+
+from .errors import BackendError, BudgetExhausted, EngineError, WorkflowAborted
+from .journal import call_signature, key_str
+from .progress import ProgressKind, WorkflowProgressEvent
+from .schema import coerce, resolve_schema
+from .verify import SCORE_SCHEMA, VERDICT_SCHEMA, Reviewer, VerifyResult, VerifyVote, settle_verify_tally
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
+
+# For typing overloads: `schema=MyModel` narrows the return to `MyModel | None`.
+M = TypeVar("M", bound="BaseModel")
+
+# Active runtime + current structural location.
+_rt: ContextVar = ContextVar("wf_runtime")
+_path: ContextVar[tuple] = ContextVar("wf_path", default=())
+_seq: ContextVar[dict | None] = ContextVar("wf_seq", default=None)
+# Nesting depth of the *current execution path* (how many ``workflow()`` frames
+# this call chain is inside). A ContextVar — not a shared Runtime counter — so it
+# is copied per asyncio Task: parallel()/pipeline() branches each inherit the
+# parent depth and advance their OWN copy, which lets sibling ``workflow()`` calls
+# run concurrently while still capping genuine recursion (a sub-workflow calling
+# ``workflow()`` again runs in the same Task, so it sees the incremented depth).
+_wf_depth: ContextVar[int] = ContextVar("wf_depth", default=0)
+# Max nesting of ``workflow()`` calls along one path. 1 = a script may call a
+# sub-workflow, but that sub-workflow may not call another (recursion guard).
+_MAX_WORKFLOW_DEPTH = 1
+# Frozen parent-phase, set by ``phase()``; survives concurrent sibling branch races.
+_parent_phase: ContextVar[str | None] = ContextVar("wf_parent_phase", default=None)
+# Per-task display name (``▸ {name} #{N}``), immune to parallel branch races.
+_wf_display_name: ContextVar[str | None] = ContextVar("wf_display_name", default=None)
+# Per-task current phase, replaces ``rt.current_phase`` — immune to parallel branch races.
+_current_phase: ContextVar[str | None] = ContextVar("wf_current_phase", default=None)
+# Max items in a single ``parallel()`` / ``pipeline()`` call. Exceeding it raises
+# rather than silently truncating — a bounded fan-out keeps one call from
+# spawning an unbounded agent fleet by accident.
+_MAX_FANOUT = 4096
+# Seconds the cancel path of ``parallel()`` waits for branch tasks to actually
+# terminate before the engine unwinds (see its ``except CancelledError``). A
+# slow-to-finish branch would otherwise hold the teardown hostage for its
+# whole natural run; the cap bounds the drain.
+_BRANCH_DRAIN_TIMEOUT = 2.0
+
+
+@dataclass
+class _BackendCallResult:
+    """Result of a backend call attempt cycle — avoids unwieldy multi-tuple returns.
+
+    Attributes:
+        result:        The final, coerced result (str, pydantic model, dict, or None).
+        succeeded:     True if the backend call + coercion succeeded.
+        error_detail:  Short error description when ``succeeded`` is False.
+        raw_text:      The LLM's original text reply before coercion — used as
+                       ``outcome`` in ``AGENT_COMPLETED`` progress events.
+        tokens:        Tokens billed by this call (``AgentResult.tokens``); ``None`` on skip / failure.
+        cache_tokens:  Prompt-cache-hit tokens of this call (``AgentResult.cache_tokens``);
+                       ``None`` when the provider reported none.
+        input_tokens / output_tokens: the prompt / completion split of ``tokens``
+                       for display (``AgentResult.input_tokens`` / ``.output_tokens``).
+        model:         The model the backend actually ran the call on, as reported
+                       by the provider (``AgentResult.model`` / ``BackendError.
+                       model``); ``None`` for native calls. Display-only, never
+                       journaled.
+        attempts:      Attempts actually spent when the call failed — the loop can
+                       short-circuit (skip / budget fail-fast) before using all
+                       ``rt.retries + 1``; ``None`` when no attempt ran (e.g. a
+                       spawn-limit rejection before the backend call).
+    """
+
+    result: Any = None
+    succeeded: bool = False
+    error_detail: str | None = None
+    raw_text: str | None = None
+    tokens: int | None = None
+    cache_tokens: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    model: str | None = None
+    attempts: int | None = None
+
+
+def _task_id():
+    try:
+        t = asyncio.current_task()
+    except RuntimeError:
+        return None
+    return id(t) if t is not None else None
+
+
+def _fresh_holder() -> dict:
+    """A new per-scope child counter, tagged with the Task that owns it."""
+    return {"n": 0, "owner": _task_id()}
+
+
+def _warn_concurrent_scope() -> None:
+    """Emitted once if two flows race the same scope counter (the raw-gather anti-pattern)."""
+    rt = _rt.get(None)
+    if rt is None or getattr(rt, "warned_concurrent_scope", False):
+        return
+    rt.warned_concurrent_scope = True
+    rt.log_sink(
+        "[wf] WARNING: multiple orchestration blocks/agents were started concurrently in "
+        "the same scope (e.g. a raw asyncio.gather/create_task that bypasses the DSL). This "
+        "races structural resume keys and can corrupt --resume. Fan out with "
+        "parallel()/pipeline() (each branch gets its own scope) or await blocks sequentially."
+    )
+
+
+def _next_ordinal() -> int:
+    """Next child-ordinal in the current scope.
+
+    A *single* per-scope counter over **all** structural children (agent calls
+    *and* parallel/pipeline/workflow blocks) is what guarantees sibling blocks —
+    two parallels, or a parallel then a pipeline at the same level — receive
+    distinct keys. Within any one scope execution is sequential (one coroutine),
+    so the counter advances deterministically; concurrency only ever happens
+    across child scopes, each of which resets its own counter.
+
+    The ``owner`` tag detects the one unsafe case: if a *different* Task advances
+    this counter (only reachable by raw-gathering sibling blocks in one scope,
+    bypassing parallel/pipeline), we warn once — that pattern races resume keys.
+    """
+    holder = _seq.get()
+    if holder is None:
+        holder = _fresh_holder()
+        _seq.set(holder)
+    cur = _task_id()
+    owner = holder.get("owner")
+    if owner is None:
+        holder["owner"] = cur
+    elif owner != cur:
+        _warn_concurrent_scope()
+    k = holder["n"]
+    holder["n"] = k + 1
+    return k
+
+
+def _preview(value: Any) -> str | None:
+    """A text preview of an agent result for progress events.
+
+    For strings: returns the full text. For structured results (dicts,
+    pydantic models, dataclasses): renders a fixed preamble + complete JSON.
+    No truncation — the full data is provided to downstream consumers.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        if hasattr(value, "model_dump") and callable(value.model_dump):
+            body = json.dumps(value.model_dump(mode="json"), ensure_ascii=False, default=str)
+        elif is_dataclass(value) and not isinstance(value, type):
+            body = json.dumps(asdict(value), ensure_ascii=False, default=str)
+        else:
+            body = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        body = str(value)
+    return body
+
+
+def _outcome_from_result(raw_text: str | None, result: Any) -> str | None:
+    """Build AGENT_COMPLETED outcome text from backend raw text or coerced result.
+
+    Prefer non-empty ``raw_text``. Empty string is treated as missing — structured
+    schema agents often capture a dict via StructuredOutputTool with ``raw_text=""``,
+    and UI must fall back to a JSON preview of ``result``.
+    """
+    if isinstance(raw_text, str) and raw_text.strip():
+        return raw_text
+    return _preview(result)
+
+
+def _check_abort(rt) -> None:
+    """Raise ``WorkflowAborted`` when an external pause/stop signal is set.
+
+    Called twice per ``agent()`` / session ``send()``: an entry gate (before the
+    concurrency permit / backend) stops a queued call; a pre-journal guard (after
+    the backend succeeds, before ``journal.use``) ensures a call that finished
+    inside the pause window does NOT persist to the WAL — so a resume reruns it.
+    The raised ``WorkflowAborted`` carries the signal's ``reason`` (``"pause"``
+    vs ``"stop"``) so the caller can tell a resumable pause from a terminal stop.
+    A ``None`` signal disables both checks (the back-compat default).
+    """
+    ev = rt.abort_event
+    if ev is not None and ev.is_set():
+        raise WorkflowAborted(reason=ev.reason)
+
+
+def _top_phases(rt) -> list[tuple[str, int]] | None:
+    """Top-3 author phases by per-phase token consumption, or ``None`` when empty.
+
+    Reads the per-run ledger's ``phase_tokens`` tally (accumulated by the emit
+    hooks below), so an exhausted run can tell the leader which phases burned
+    the most tokens — the data the leader needs to redesign a workflow that
+    keeps hitting its ceiling.
+    """
+    acc = rt.workflow_budget.phase_tokens
+    if not acc:
+        return None
+    return sorted(acc.items(), key=lambda kv: kv[1], reverse=True)[:3]
+
+
+def _budget_exhaustion(rt) -> tuple[str, str, int, int] | None:
+    """Return ``(scope, message, spent, total)`` for whichever ledger is dry.
+
+    One message format for every report of a drained ledger — the entry gate
+    (``_check_budget``) raises it, the retry loop (``_attempt_calls``) puts it
+    in the node's failure detail — so both read the same
+    ``"workflow token budget exhausted: X/Y"`` wording.
+
+    Order-sensitive — **session first**: when both ledgers are dry, the
+    terminal (not retryable) session reason wins. Relaunching after a session
+    exhaustion hits the same gate immediately, so reporting ``"workflow"``
+    would mislead the leader into "redesign the workflow" when raising the
+    ceiling is the only way forward. A session still holding headroom never
+    masks a per-run (workflow) exhaustion — that check still runs right after.
+    """
+    if rt.budget.exhausted:
+        return (
+            "session",
+            f"session token budget exhausted: {rt.budget.spent}/{rt.budget.total}",
+            rt.budget.spent,
+            rt.budget.total,
+        )
+    if rt.workflow_budget.exhausted:
+        return (
+            "workflow",
+            f"workflow token budget exhausted: {rt.workflow_budget.spent}/{rt.workflow_budget.total}",
+            rt.workflow_budget.spent,
+            rt.workflow_budget.total,
+        )
+    return None
+
+
+def _check_budget(rt) -> None:
+    """Raise ``BudgetExhausted`` when either ledger has hit its ceiling.
+
+    Two ceilings, checked once per ``agent()`` / session ``send()``, at the
+    entry gate only: a call already paid for must reach its journal record, or
+    a resume would rerun (and re-pay for) it.
+
+    This gate alone cannot hold the line — one agent's own loop can burn the
+    whole budget long before it returns here. It is the backend's rails that
+    stop an agent mid-loop; this stops the *next* one from starting.
+    """
+    ex = _budget_exhaustion(rt)
+    if ex is None:
+        return
+    scope, message, spent, total = ex
+    raise BudgetExhausted(
+        message,
+        scope=scope, spent=spent, total=total,
+        workflow_spent=rt.workflow_budget.spent, workflow_total=rt.workflow_budget.total,
+        top_phases=_top_phases(rt),
+    )
+
+
+def _branch_disambig(path: tuple) -> str:
+    """Serial-disambig over ALL branch segments for ``correlation_id`` uniqueness.
+
+    ``("par", k, i)`` → ``p{i}``, ``("pipe", k, i, s)`` → ``i{i}s{s}``, joined with ``.``.
+    Non-branch segments skipped. Empty when no branch (serial / top-level).
+    """
+    parts = []
+    for seg in path:
+        if not isinstance(seg, tuple) or len(seg) < 3:
+            continue
+        tag = seg[0]
+        if tag == "par" and len(seg) == 3:
+            parts.append(f"p{seg[2]}")
+        elif tag == "pipe" and len(seg) == 4:
+            parts.append(f"i{seg[2]}s{seg[3]}")
+    return ".".join(parts)
+
+
+def _deepest_branch_i(path: tuple) -> int | None:
+    """Deepest branch ``i`` (drop ``s``) for sub-workflow display name ``#N``. ``None`` if no branch.
+
+    Separate from :func:`_branch_disambig`: single-layer ``#N`` for display, vs multi-segment serial for correlation_id.
+    """
+    i = None
+    for seg in path:
+        if not isinstance(seg, tuple):
+            continue
+        if seg and seg[0] == "par" and len(seg) == 3:
+            i = seg[2]
+        elif seg and seg[0] == "pipe" and len(seg) == 4:
+            i = seg[2]  # drop s
+    return i
+
+
+def _budget_snapshot(ledger, scope: str = "session") -> dict:
+    """Freeze a ``BudgetLedger`` into the wire shape ``{total, spent, remaining, scope, exhausted}``.
+
+    ``scope`` is ``"session"`` for the team-wide ledger (``rt.budget``) or
+    ``"workflow"`` for the per-run ledger (``rt.workflow_budget``). Kept as a
+    parameter so emit sites can tag which ledger a snapshot came from; the
+    snapshot is a point-in-time observation under concurrency, not a strong
+    consistency guarantee.
+    """
+    return {
+        "total": ledger.total,
+        "spent": ledger.spent,
+        "remaining": ledger.remaining(),
+        "scope": scope,
+        "exhausted": ledger.exhausted,
+    }
+
+
+def _wf_budget_snapshot(rt) -> dict | None:
+    """Snapshot the per-run ledger, always — even when it has no ceiling set.
+
+    A script that does not declare ``workflow_token_limit`` gets an unbounded
+    per-run ledger (``total=None``); its snapshot still reports ``spent`` so a
+    frontend can render an "unbounded" run-budget badge with live consumption
+    (the TUI's own formatter ignores snapshots without a numeric ``total``,
+    so this changes nothing for it).
+    """
+    wb = rt.workflow_budget
+    if wb is None:
+        return None
+    return _budget_snapshot(wb, scope="workflow")
+
+
+def _resolved_nested_phase(explicit: str | None = None) -> str | None:
+    """Return ``explicit`` nested phase, or the per-task display name when inside a sub-workflow."""
+    return explicit if explicit is not None else _wf_display_name.get()
+
+
+def _emit_log(rt, message: str, *, nested_phase: str | None = None) -> None:
+    """Emit a LOG progress event with author phase and optional nested display name."""
+    rt.progress_sink(
+        WorkflowProgressEvent(
+            kind=ProgressKind.LOG,
+            phase=_current_phase.get(),
+            nested_phase=_resolved_nested_phase(nested_phase),
+            message=message,
+        )
+    )
+
+
+def _display_model(rt, opts: dict) -> str | None:
+    """The model name to show for this call: backend-described, else the raw hint."""
+    describe = getattr(rt.backend, "describe_model", None)
+    described = describe(opts) if callable(describe) else None
+    return described or opts.get("model")
+
+
+def _display_agent_template(rt, opts: dict) -> str | None:
+    """The expert display name for this call, when the backend can name it."""
+    describe = getattr(rt.backend, "describe_agent_template", None)
+    return describe(opts) if callable(describe) else None
+
+
+def _emit_agent_started(
+    rt,
+    opts: dict,
+    prompt: str,
+    *,
+    node_type: str,
+    agent_id: str | None = None,
+    correlation_id: str | None = None,
+    parent_session_id: str | None = None,
+    member_name: str | None = None,
+    nested_phase: str | None = None,
+) -> None:
+    rt.current_agent = {
+        "agent_id": agent_id,
+        "label": opts.get("label"),
+        "started_spent": rt.workflow_budget.spent,
+    }
+    rt.progress_sink(
+        WorkflowProgressEvent(
+            kind=ProgressKind.AGENT_STARTED,
+            phase=opts.get("phase") or _current_phase.get(),
+            label=opts.get("label"),
+            prompt=prompt,
+            model=_display_model(rt, opts),
+            agent_type=opts.get("agent_type"),
+            agent_template=opts.get("agent_template"),
+            display_name=_display_agent_template(rt, opts),
+            agent_id=agent_id,
+            node_type=node_type,
+            parent_session_id=parent_session_id,
+            member_name=member_name,
+            correlation_id=correlation_id,
+            nested_phase=_resolved_nested_phase(nested_phase),
+        )
+    )
+
+
+def _emit_agent_completed(
+    rt, opts: dict, outcome_text: str | None, *, agent_id: str | None = None,
+    tokens: int | None = None, budget_snapshot: dict | None = None,
+    nested_phase: str | None = None, cache_tokens: int | None = None,
+    token_input: int | None = None, token_output: int | None = None,
+    model: str | None = None,
+) -> None:
+    """Emit an AGENT_COMPLETED progress event.
+
+    ``outcome_text``: LLM raw text (preferred) or JSON fallback.
+    ``tokens``: per-call tokens from ``AgentResult.tokens`` (``None`` on cache-hit).
+    ``budget_snapshot``: frozen ``_budget_snapshot(rt.budget)`` at emit time.
+    ``nested_phase``: defaults to ``_wf_display_name`` when inside a sub-workflow.
+    ``cache_tokens``: prompt-cache-hit tokens from ``AgentResult.cache_tokens``
+    (``None`` when the provider reported none; a subset of ``tokens``).
+    ``token_input`` / ``token_output``: the prompt / completion split of
+    ``tokens`` for display (``None`` when the provider reported no split).
+    ``model``: the model the provider reported running this call on, when it
+    did (an external CLI); display-only, never journaled.
+    """
+    rt.workflow_budget.add_phase(opts.get("phase") or _current_phase.get() or "?", tokens)
+    rt.current_agent = None
+    rt.progress_sink(
+        WorkflowProgressEvent(
+            kind=ProgressKind.AGENT_COMPLETED,
+            phase=opts.get("phase") or _current_phase.get(),
+            label=opts.get("label"),
+            outcome=_preview(outcome_text),
+            agent_id=agent_id,
+            tokens=tokens,
+            cache_tokens=cache_tokens,
+            token_input=token_input,
+            token_output=token_output,
+            model=model,
+            budget=budget_snapshot,
+            workflow_budget=_wf_budget_snapshot(rt),
+            nested_phase=_resolved_nested_phase(nested_phase),
+        )
+    )
+
+
+def _emit_agent_failed(
+    rt, opts: dict, message: str, *, agent_id: str | None = None,
+    tokens: int | None = None, budget_snapshot: dict | None = None,
+    nested_phase: str | None = None, model: str | None = None,
+) -> None:
+    rt.workflow_budget.add_phase(opts.get("phase") or _current_phase.get() or "?", tokens)
+    rt.current_agent = None
+    rt.progress_sink(
+        WorkflowProgressEvent(
+            kind=ProgressKind.AGENT_FAILED,
+            phase=opts.get("phase") or _current_phase.get(),
+            label=opts.get("label"),
+            message=message,
+            agent_id=agent_id,
+            tokens=tokens,
+            model=model,
+            budget=budget_snapshot,
+            workflow_budget=_wf_budget_snapshot(rt),
+            nested_phase=_resolved_nested_phase(nested_phase),
+        )
+    )
+
+
+# ─────────────────────────── options bag ───────────────────────────
+#: Engine-owned ``options`` keys. A backend may widen this via its
+#: ``KNOWN_OPTIONS``; anything outside the union is a typo and fails fast.
+_ENGINE_OPTIONS = frozenset(
+    {"label", "phase", "schema", "model", "timeout", "isolation", "agent_type",
+     "builtin_model", "effort"}
+)
+
+
+def _build_opts(rt, explicit: dict, options: dict | None = None) -> dict:
+    """Merge explicit kwargs over an ``options`` bag, drop ``None``, validate keys.
+
+    The session primitives accept tuning knobs through a single ``options`` dict
+    (so new knobs need no signature change), with explicit keyword arguments
+    taking precedence. Every resulting key must be in
+    ``_ENGINE_OPTIONS | rt.backend.KNOWN_OPTIONS`` — an unknown key raises rather
+    than silently no-opping, which is the whole point of the bag.
+
+    Args:
+        rt: The active runtime (its ``backend`` declares extra allowed keys).
+        explicit: Keyword arguments passed directly to the primitive.
+        options: The optional ``options`` bag.
+
+    Returns:
+        The merged, validated, ``None``-stripped options dict.
+
+    Raises:
+        EngineError: If any key is outside the allowed set, or ``agent_template``
+            carries a non-string value (it can never name a member).
+    """
+    merged: dict = {}
+    for key, value in (options or {}).items():
+        if value is not None:
+            merged[key] = value
+    for key, value in explicit.items():
+        if value is not None:
+            merged[key] = value
+    allowed = _ENGINE_OPTIONS | getattr(rt.backend, "KNOWN_OPTIONS", frozenset())
+    unknown = sorted(k for k in merged if k not in allowed)
+    if unknown:
+        raise EngineError(
+            f"unknown option(s) {unknown}; allowed: {sorted(allowed)}"
+        )
+    # Validated here, not in agent(): one validator covers agent(),
+    # AgentSession.send() and fork-merged options, all before AGENT_STARTED is
+    # emitted. The backend keeps its own isinstance guard (defence in depth).
+    template = merged.get("agent_template")
+    if template is not None and not isinstance(template, str):
+        raise EngineError(
+            f"agent_template must be a member name string, got {type(template).__name__}"
+        )
+    return merged
+
+
+def _validate_model_hint(rt, opts: dict) -> None:
+    """Fail fast on a ``model`` hint the backend cannot honor.
+
+    Symmetric with ``_build_opts``' unknown-KEY fail-fast: an untrusted
+    script's option VALUE gets the same treatment. Runs before the signature
+    and the start event, so the journal and the UI never see a call that
+    would silently fall back to the base spec's model.
+    """
+    name = opts.get("model")
+    if name is None:
+        return
+    names = rt.backend.model_pool_names()
+    if names is None or name in names:
+        return
+    raise EngineError(
+        f"agent(options={{'model': {name!r}}}) is not in the model pool; "
+        f"available: {sorted(names) or '(empty — no model pool configured)'}"
+    )
+
+
+def _resolve_agent_gate(rt):
+    """Return the active admission gate, lazily constructing the default sem."""
+    from .admission import SemaphoreAdmission
+
+    if rt.agent_gate is None:
+        rt.agent_gate = SemaphoreAdmission(rt.make_cap())
+    return rt.agent_gate
+
+
+# ─────────────────────────── agent ───────────────────────────
+# Typed return per schema kind:
+#   schema=MyModel (pydantic) -> MyModel | None   (attribute access, static types)
+#   schema=<JSON Schema dict>  -> dict | None      (interop default)
+#   schema=None                -> str | None
+@overload
+async def agent(
+    prompt: str, *, schema: type[M],
+    label: str | None = ..., phase: str | None = ...,
+    options: dict | None = ...,
+) -> "M | None":
+    """Overload: ``schema=<pydantic model>`` narrows the result to that model."""
+    ...
+
+
+@overload
+async def agent(
+    prompt: str, *, schema: dict,
+    label: str | None = ..., phase: str | None = ...,
+    options: dict | None = ...,
+) -> "dict | None":
+    """Overload: ``schema=<JSON Schema dict>`` returns a plain ``dict``."""
+    ...
+
+
+@overload
+async def agent(
+    prompt: str, *, schema: None = ...,
+    label: str | None = ..., phase: str | None = ...,
+    options: dict | None = ...,
+) -> "str | None":
+    """Overload: no ``schema`` returns the agent's raw text."""
+    ...
+
+
+async def agent(
+    prompt: str,
+    *,
+    label: str | None = None,
+    phase: str | None = None,
+    schema: Any = None,
+    options: dict | None = None,
+) -> Any:
+    rt = _rt.get()
+    # Orchestration/identity params (label/phase/schema) are explicit; tuning and
+    # forward-compat params (model/timeout/isolation/agent_type) ride in the
+    # validated ``options`` bag, mirroring ``AgentSession.send``. ``_build_opts``
+    # whitelists every key against ``_ENGINE_OPTIONS | backend.KNOWN_OPTIONS``.
+    opts = _build_opts(rt, {"label": label, "phase": phase, "schema": schema}, options)
+    if opts.get("isolation") not in (None, "worktree"):
+        raise EngineError("agent(options={'isolation': ...}) only supports 'worktree'")
+    _validate_model_hint(rt, opts)
+    json_schema, model_cls = resolve_schema(opts.get("schema"))
+
+    ks = key_str(_path.get() + (("call", _next_ordinal()),))
+    sig = call_signature(prompt, opts, json_schema)
+
+    _emit_agent_started(rt, opts, prompt, node_type="agent", agent_id=ks)
+
+    cached = rt.journal.get_cached(ks, sig, rt.run_id)
+    if cached is not None:  # resume hit — no semaphore, no backend
+        rt.log_sink(f"[wf] agent {opts.get('label') or 'agent'!r} key={ks} CACHE_HIT sig={sig[:12]}")
+        await rt.journal.use(ks, cached)
+        result = _rehydrate(cached, model_cls)
+        # Prefer stored raw_text; if absent (old journal), fall back to
+        # preamble + structured data via _preview()
+        outcome_text = _outcome_from_result(cached.get("raw_text"), result)
+        # Re-bill the per-run ledger from the record's stored tokens so a
+        # resume rebuilds spent by replaying cache hits — the run's tally is
+        # recomputed agent-by-agent, not restored from a stale snapshot.
+        cached_tokens = cached.get("tokens")
+        if isinstance(cached_tokens, int) and cached_tokens > 0:
+            rt.workflow_budget.add(cached_tokens)
+        _emit_agent_completed(
+            rt, opts, outcome_text, agent_id=ks,
+            tokens=cached_tokens if isinstance(cached_tokens, int) else None,
+            cache_tokens=cached.get("cache_tokens"),
+            token_input=cached.get("token_input"),
+            token_output=cached.get("token_output"),
+            budget_snapshot=_budget_snapshot(rt.budget),
+        )
+        return result
+
+    rt.log_sink(f"[wf] agent {opts.get('label') or 'agent'!r} key={ks} CACHE_MISS sig={sig[:12]} (live run)")
+    _check_abort(rt)  # entry gate: a paused run starts no new agent()
+    _check_budget(rt)  # entry gate: a run out of tokens starts no new agent()
+
+    if rt.spawn_count >= rt.spawn_limit:
+        rt.log_sink(f"[wf] spawn limit {rt.spawn_limit} reached; skipping {opts.get('label')!r}")
+        _emit_agent_failed(
+            rt, opts, f"spawn limit {rt.spawn_limit} reached; skipping {opts.get('label')!r}",
+            agent_id=ks, tokens=None, budget_snapshot=_budget_snapshot(rt.budget),
+        )
+        return None
+
+    gate = _resolve_agent_gate(rt)
+
+    async with gate.acquire():
+        rt.spawn_count += 1
+        # ``ks`` (the journal key) rides into the spec twice: as ``agent_id`` so
+        # the backend can tag live activity events, and as ``call_key`` so
+        # backend-side per-call identity (worker member names) is deterministic
+        # across replays.
+        call_result = await _call_backend(
+            rt,
+            _BackendCallSpec(
+                prompt=prompt,
+                opts=opts,
+                json_schema=json_schema,
+                model=model_cls,
+                agent_id=ks,
+                call_key=ks,
+            ),
+        )
+
+    if not call_result.succeeded:
+        label = opts.get("label") or "agent"
+        msg = f"agent {label!r} failed"
+        if call_result.attempts is not None and call_result.attempts > 1:
+            msg = f"{msg} after {call_result.attempts} attempts"
+        if call_result.error_detail:
+            msg = f"{msg}: {call_result.error_detail}"
+        _emit_agent_failed(
+            rt, opts, msg, agent_id=ks,
+            tokens=call_result.tokens, budget_snapshot=_budget_snapshot(rt.budget),
+            model=call_result.model,
+        )
+        return None
+
+    _check_abort(rt)  # pre-journal guard: a call finished mid-pause does not persist
+
+    await rt.journal.use(
+        ks,
+        _make_record(
+            _JournalRecordInput(
+                key=ks,
+                sig=sig,
+                opts=opts,
+                result=call_result.result,
+                model=model_cls,
+                raw_text=call_result.raw_text,
+                run_id=rt.run_id,
+                tokens=call_result.tokens,
+                cache_tokens=call_result.cache_tokens,
+                input_tokens=call_result.input_tokens,
+                output_tokens=call_result.output_tokens,
+            )
+        ),
+    )
+    outcome_text = _outcome_from_result(call_result.raw_text, call_result.result)
+    _emit_agent_completed(
+        rt, opts, outcome_text, agent_id=ks,
+        tokens=call_result.tokens, budget_snapshot=_budget_snapshot(rt.budget),
+        cache_tokens=call_result.cache_tokens,
+        token_input=call_result.input_tokens,
+        token_output=call_result.output_tokens,
+        model=call_result.model,
+    )
+    return call_result.result
+
+
+@dataclass
+class _BackendCallSpec:
+    """Everything ``_call_backend`` needs to run one single-shot ``agent()`` call.
+
+    Bundles the correlated per-call arguments (prompt / opts / json_schema /
+    model / agent_id / call_key) into one named value instead of a long
+    positional list, mirroring ``_BackendCallResult`` / ``_JournalRecordInput``.
+    """
+
+    prompt: str
+    opts: dict
+    json_schema: dict | None
+    model: Any
+    agent_id: str | None = None
+    # The engine's structural call-path key, forwarded to ``backend.run`` as the
+    # ``call_key`` kwarg so backends derive per-call identity deterministically.
+    call_key: str | None = None
+
+
+async def _call_backend(rt, spec: _BackendCallSpec) -> _BackendCallResult:
+    """Run the single-shot ``agent()`` call (``backend.run``) with retries.
+
+    ``spec.agent_id`` is the deterministic call-path key computed in ``agent()``
+    and used for the started/completed events. It is injected into a *copy* of
+    ``spec.opts`` (never the journaled original) so the backend can tag live
+    activity events with the same id its worker node was created under.
+    ``spec.call_key`` is forwarded verbatim to ``backend.run`` for per-call
+    identity (e.g. worker member names), independent of the opts bag.
+    """
+    opts = spec.opts
+    if spec.agent_id:
+        opts = {**opts, "agent_id": spec.agent_id}
+    return await _attempt_calls(
+        rt, opts, spec.json_schema, spec.model,
+        lambda feedback=None: rt.backend.run(
+            _with_retry_feedback(spec.prompt, feedback), opts, spec.json_schema, call_key=spec.call_key,
+        ),
+    )
+
+
+def _validation_retry_feedback(error: str) -> str:
+    """Feedback appended to the next attempt's prompt after a schema failure.
+
+    A blind retry replays the same prompt, so a model that misread the schema
+    (missing required property, wrong nesting) repeats the exact mistake until
+    attempts run out. Carrying the validator's error tells the next attempt
+    exactly what to fix.
+    """
+    return (
+        "[RETRY FEEDBACK] Your previous structured_output submission was rejected: "
+        f"it failed schema validation ({error}). Submit again via structured_output "
+        "with a JSON object that satisfies the input schema exactly: include every "
+        "required property at every nesting level (including each item inside "
+        "arrays), keep the exact property names and structure the schema defines, "
+        "and do not wrap or reshape the result."
+    )
+
+
+def _with_retry_feedback(prompt: str, feedback: str | None) -> str:
+    """Append retry feedback to a prompt (no-op when there is none)."""
+    return f"{prompt}\n\n{feedback}" if feedback else prompt
+
+
+async def _attempt_calls(
+    rt, opts, json_schema, model, make_call, *, is_human: bool = False,
+) -> _BackendCallResult:
+    """Run ``make_call(feedback)`` with retries + schema validation.
+
+    Shared by the single-shot ``agent()`` path (``backend.run``) and the stateful
+    session path (``backend.send_turn``); the only difference between them is the
+    bound ``make_call`` closure. A human turn (``is_human``) carries no
+    attempt-level ``asyncio.timeout``: its ``timeout`` option is the
+    person-wait limit by contract, enforced inside ``_await_human_reply``
+    (expiring as ``skipped`` with no retry), and the classify/format model
+    calls afterwards hold no per-call bound by design — the same contract
+    as any agent turn without a ``timeout`` option, a hung model call being
+    terminated by the control plane (pause/stop abort cancels the run task).
+    Wrapping the whole turn instead would bill the person's answer time to
+    the classify/format segment and turn a slow reply into a
+    retryable failure that re-asks the person. Returns a
+    ``_BackendCallResult``: a backend/timeout error or schema-validation failure
+    retries up to ``rt.retries`` extra times; a ``skipped`` result short-circuits
+    to a non-success with no retry, and so does a failed attempt that leaves a
+    token ledger dry — the budget never refunds, so a retry can only fail
+    again (and a human turn would re-ask the person).
+
+    ``make_call(feedback)`` receives the previous attempt's schema-validation
+    error (``None`` on the first attempt and after backend errors) so a retry
+    is not blind: a model that misread the schema gets told which property
+    failed and can self-correct instead of repeating the same malformed
+    submission until attempts run out.
+    """
+    timeout = opts.get("timeout")
+    attempts = rt.retries + 1
+    last_err: Exception | None = None
+    label = opts.get("label") or "agent"
+    feedback: str | None = None
+    # Accumulate tokens burned across every retry attempt: each failed call
+    # attaches its budget_rail tally to the raised BackendError (backend) or
+    # turn delta (session), so a budget-exhausted/failed agent's real
+    # consumption reaches the AGENT_FAILED event instead of being dropped.
+    burned_tokens = 0
+    for attempt in range(1, attempts + 1):
+        # A pause/stop may have landed while this call was queued or in flight:
+        # every attempt re-checks the abort gate before touching the backend, so
+        # a straggler (e.g. one the parallel() drain timed out on) ends with the
+        # proper WorkflowAborted instead of retrying into a torn-down backend.
+        # Outside the try — an abort is not a retryable failure.
+        _check_abort(rt)
+        try:
+            if timeout is not None and not is_human:
+                async with asyncio.timeout(timeout):  # py3.11+
+                    res = await make_call(feedback)
+            else:
+                res = await make_call(feedback)
+        except Exception as e:  # backend / timeout error -> retry, then skip
+            # A non-retryable BackendError (e.g. a third-party model-option
+            # rule violation) is deterministic: repeating it can only fail
+            # again, so surface it immediately instead of retrying it.
+            if isinstance(e, BackendError) and not e.retryable:
+                rt.log_sink(
+                    f"[wf] agent {label!r} failed (non-retryable): {str(e)}"
+                )
+                return _BackendCallResult(
+                    result=None, succeeded=False, error_detail=str(e), attempts=attempt,
+                    tokens=getattr(e, "tokens", 0) or None,
+                    model=getattr(e, "model", None) or None,
+                )
+            last_err = e
+            if isinstance(e, TimeoutError) and timeout is not None:
+                # py3.11 bare TimeoutError str() is empty; inject the budget so
+                # the existing error_detail pipeline carries it to AGENT_FAILED.
+                last_err = TimeoutError(f"timed out after {timeout}s")
+            # This attempt burned real tokens before failing (budget-exhausted,
+            # backend error, etc.). Accumulate so the final failed result can
+            # attribute the agent's full cost, not just the last attempt's.
+            burned_tokens += getattr(e, "tokens", 0) or 0
+            # A drained ledger can only fail again — the budget never refunds,
+            # and for a human turn a retry would re-ask the person. Fail fast
+            # and surface the same message the entry gate raises, so the node's
+            # failure carries the budget root cause (the rail stops the call
+            # with a force-finish, not an exception).
+            ex = _budget_exhaustion(rt)
+            if ex is not None:
+                rt.log_sink(
+                    f"[wf] agent {label!r} attempt {attempt}/{attempts} failed: "
+                    f"{str(last_err)}; no retry — {ex[1]}"
+                )
+                return _BackendCallResult(
+                    result=None, succeeded=False, error_detail=ex[1], attempts=attempt,
+                    tokens=burned_tokens if burned_tokens > 0 else None,
+                    model=getattr(last_err, "model", None) or None,
+                )
+            rt.log_sink(
+                f"[wf] agent {label!r} attempt {attempt}/{attempts} failed: {str(last_err)}"
+            )
+            continue
+        # Token accounting here: the backend already billed this call to the
+        # shared ledger as its model calls returned (``AgentBackend.bind_budget``);
+        # ``res.tokens`` is the per-call total, threaded through so the emitter
+        # can attach it to the AGENT_COMPLETED progress event. The skipped branch
+        # leaves ``tokens`` at its default ``None`` — there was no call, so
+        # nothing was billed.
+        if res.skipped:
+            detail = "backend declined (skipped)"
+            rt.log_sink(f"[wf] agent {label!r} skipped")
+            return _BackendCallResult(result=None, succeeded=False, error_detail=detail, attempts=attempt)
+        if json_schema is not None:
+            try:
+                coerced = coerce(res.structured, json_schema, model)
+                return _BackendCallResult(
+                    result=coerced, succeeded=True, raw_text=res.text, tokens=res.tokens,
+                    cache_tokens=res.cache_tokens,
+                    input_tokens=res.input_tokens,
+                    output_tokens=res.output_tokens,
+                    model=getattr(res, "model", None),
+                )
+            except Exception as e:  # validation failure -> retry with feedback
+                last_err = e
+                feedback = _validation_retry_feedback(str(e))
+                rt.log_sink(
+                    f"[wf] agent {label!r} attempt {attempt}/{attempts} "
+                    f"validation failed: {str(e)}"
+                )
+                continue
+        return _BackendCallResult(
+            result=res.text, succeeded=True, raw_text=res.text, tokens=res.tokens,
+            cache_tokens=res.cache_tokens,
+            input_tokens=res.input_tokens,
+            output_tokens=res.output_tokens,
+            model=getattr(res, "model", None),
+        )
+    detail = str(last_err) if last_err else "unknown error"
+    rt.log_sink(f"[wf] agent {label!r} failed after {attempts} attempts: {detail}")
+    return _BackendCallResult(
+        result=None, succeeded=False, error_detail=detail, attempts=attempts,
+        tokens=burned_tokens if burned_tokens > 0 else None,
+        model=getattr(last_err, "model", None) or None,
+    )
+
+
+def _rehydrate(rec: dict, model) -> Any:
+    kind = rec.get("kind")
+    if kind == "null":
+        return None
+    val = rec.get("result")
+    if kind == "model" and model is not None:
+        return model.model_validate(val)
+    return val
+
+
+@dataclass
+class _JournalRecordInput:
+    key: str
+    sig: str
+    opts: dict
+    result: Any
+    model: Any
+    raw_text: str | None = None
+    run_id: str | None = None
+    tokens: int | None = None
+    cache_tokens: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+def _make_record(spec: _JournalRecordInput) -> dict:
+    if spec.result is None:
+        kind, payload = "null", None
+    elif spec.model is not None and isinstance(spec.result, spec.model):
+        kind, payload = "model", spec.result.model_dump(mode="json")
+    elif isinstance(spec.result, str):
+        kind, payload = "str", spec.result
+    else:
+        kind, payload = "dict", spec.result  # dict / list
+    return {
+        "key": spec.key,
+        "sig": spec.sig,
+        "run_id": spec.run_id,
+        "tokens": spec.tokens,
+        "cache_tokens": spec.cache_tokens,
+        "token_input": spec.input_tokens,
+        "token_output": spec.output_tokens,
+        "label": spec.opts.get("label"),
+        "phase": spec.opts.get("phase"),
+        "kind": kind,
+        "result": payload,
+        "raw_text": spec.raw_text,
+    }
+
+
+# ─────────────────────────── verify ───────────────────────────
+def _reviewer_call(
+    i: int,
+    reviewer: Reviewer,
+    *,
+    base: str,
+    phase: str | None,  # pylint: disable=huawei-redefined-outer-name
+    options: dict | None,
+    agent_ids: list,
+):
+    """Build the zero-arg thunk that runs one reviewer as a structured ``agent()``.
+
+    A verdict reviewer votes against ``VERDICT_SCHEMA`` (pass/fail + feedback),
+    a score reviewer against ``SCORE_SCHEMA`` (0-1 + feedback). Reviewer-level
+    options override the ``verify()``-level ones. The thunk is meant for
+    :func:`parallel`, which gives each reviewer its own structural journal key.
+
+    On start the thunk records its ``agent()`` call's journal key (the
+    deterministic node id) into the shared ``agent_ids`` list at index ``i``,
+    so ``verify()`` can attach it to the settled votes without exposing the
+    key through the call's public result.
+    """
+    schema = VERDICT_SCHEMA if reviewer.kind == "verdict" else SCORE_SCHEMA
+    rlabel = reviewer.label or f"{base}-{i}"
+    merged = {**(options or {}), **(reviewer.options or {})} or None
+
+    async def _call():
+        # Predict the call key agent() will take, without consuming the ordinal:
+        # this thunk's only structural child is the agent() call, so it takes
+        # the branch's current ordinal. Recorded so the settled vote can carry
+        # the same deterministic id as the reviewer's own agent node.
+        seq = _seq.get()
+        if seq is not None:
+            agent_ids[i] = key_str(_path.get() + (("call", seq["n"]),))
+        return await agent(
+            reviewer.prompt,
+            label=rlabel,
+            phase=phase,
+            schema=schema,
+            options=merged,
+        )
+
+    return _call
+
+
+def _is_default_reviewer_label(label: str | None) -> bool:
+    """True when ``label`` looks like ``build_reviewers``' default ``{type}-{i}``.
+
+    ``verify()`` replaces such labels with a base-prefixed unique form; the
+    exact-shape check (known reviewer type prefix, numeric suffix) keeps a
+    user-chosen label like ``inspector-clone`` from being mistaken for a default.
+    """
+    if not label:
+        return False
+    _, _, tail = label.rpartition("-")
+    return tail.isdigit() and label.rsplit(f"-{tail}", 1)[0] in _DEFAULT_LABEL_TYPES
+
+
+#: Reviewer ``type`` names whose ``{type}-{i}`` form is a generated default label.
+_DEFAULT_LABEL_TYPES = frozenset({"verifier", "inspector", "challenger"})
+
+
+def _normalize_reviewer_labels(reviewers: list[Reviewer], base: str) -> None:
+    """Give every reviewer a label unique across the whole run, prefixed by ``base``.
+
+    A default ``{type}-{i}`` label (re-issued per ``verify()`` round by the
+    business layer) is replaced by ``{base}-{kind}-{i}``; a custom label keeps
+    its readable part and gains the prefix (``{base}-{label}``). The label is a
+    display/join key only — journal identity stays the structural call path —
+    so this changes what the UI shows, not what resume replays (the sig hash
+    does fold ``label`` in, so a resumed pre-upgrade run re-runs its reviewers
+    once; same-version resume is unaffected).
+    """
+    for i, r in enumerate(reviewers):
+        if r.label is None or _is_default_reviewer_label(r.label):
+            r.label = f"{base}-{r.kind}-{i}"
+        elif not r.label.startswith(f"{base}-"):
+            r.label = f"{base}-{r.label}"
+
+
+def _collect(reviewers: Sequence[Reviewer], raws: Sequence) -> tuple[list[VerifyVote], dict]:
+    """Fold each reviewer's raw vote (or ``None`` when it did not vote) into votes + a tally.
+
+    A ``None`` raw (``agent()`` failed / skipped) marks the reviewer as
+    not-voted: it contributes its pool's *total* but not its *voted* count, so
+    ``settle_verify_tally`` yields undecided rather than a silent pass.
+    """
+    votes: list[VerifyVote] = []
+    verdict_total = verdict_voted = verdict_fail = 0
+    score_total = score_voted = 0
+    score_sum = 0.0
+
+    for reviewer, raw in zip(reviewers, raws):
+        if reviewer.kind == "verdict":
+            verdict_total += 1
+            if raw is None:
+                votes.append(VerifyVote(kind="verdict", role=reviewer.role))
+                continue
+            decision = raw.get("decision")
+            fail = decision == "fail"
+            if decision in ("pass", "fail"):
+                verdict_voted += 1
+                if fail:
+                    verdict_fail += 1
+                decision_pass = not fail
+            else:
+                decision_pass = None  # malformed decision: not counted, vote reads undecided
+            votes.append(VerifyVote(
+                kind="verdict", role=reviewer.role,
+                decision=decision_pass, feedback=raw.get("feedback", ""),
+            ))
+        else:
+            score_total += 1
+            if raw is None:
+                votes.append(VerifyVote(kind="score", role=reviewer.role))
+                continue
+            score = raw.get("score")
+            if isinstance(score, (int, float)):
+                score_voted += 1
+                score_sum += float(score)
+            else:
+                score = None  # malformed score: not counted, vote reads undecided
+            votes.append(VerifyVote(
+                kind="score", role=reviewer.role,
+                score=score, feedback=raw.get("feedback", ""),
+            ))
+
+    tally = {
+        "verdict_total": verdict_total,
+        "verdict_voted": verdict_voted,
+        "verdict_fail_count": verdict_fail,
+        "score_count": score_total,
+        "score_voted": score_voted,
+        "score_avg": (score_sum / score_voted) if score_voted else None,
+    }
+    return votes, tally
+
+
+@dataclass
+class _VerifyRoundCtx:
+    """The round-context fields both verify emitters share.
+
+    ``phase_label`` (not ``phase``): the module-level :func:`phase` primitive
+    would otherwise be shadowed by the parameter name.
+    """
+
+    base: str
+    phase_label: str | None
+    threshold: float
+    reviewers: Sequence["Reviewer"]
+    verify_id: str | None = None
+
+
+def _emit_verify_started(rt, ctx: _VerifyRoundCtx) -> None:
+    """Emit ``VERIFY_STARTED``: a review round begins (label roster + threshold).
+
+    The label roster is the fan-out order of the reviewers' labels (already
+    normalized by ``verify()``), so a consumer can build its container and
+    pre-attach child rows before the first reviewer's AGENT_STARTED lands.
+    ``ctx.verify_id`` identifies the round among same-label concurrent calls
+    (the structural branch scope — parallel calls differ, serial rework rounds
+    repeat the label and fold as ×N rounds).
+    """
+    reviewers = ctx.reviewers
+    base = ctx.base
+    rt.progress_sink(
+        WorkflowProgressEvent(
+            kind=ProgressKind.VERIFY_STARTED,
+            phase=ctx.phase_label or _current_phase.get(),
+            label=base,
+            nested_phase=_resolved_nested_phase(None),
+            verify_reviewers=len(reviewers),
+            verify_threshold=ctx.threshold,
+            verify_reviewer_labels=[r.label or f"{base}-{i}" for i, r in enumerate(reviewers)],
+            verify_reviewer_roles=[r.role for r in reviewers],
+            verify_id=ctx.verify_id,
+        )
+    )
+
+
+def _emit_verify_settled(
+    rt,
+    ctx: _VerifyRoundCtx,
+    result: VerifyResult,
+    agent_ids: Sequence[str | None],
+) -> None:
+    """Emit ``VERIFY_COMPLETED`` (``verify_settled`` kept as compat alias).
+
+    Carries the round verdict, per-reviewer votes and the **complete output**
+    as the generic ``outcome`` — ``VerifyResult`` serialised by :func:`_preview`
+    (same JSON-string channel as an agent node's outcome, not hand-built here).
+
+    Each vote dict mirrors :func:`_reviewer_call`'s label rule
+    (``reviewer.label or f"{base}-{i}"``) in ``name`` and carries the
+    reviewer ``agent()`` call's deterministic ``agent_id`` (``None`` when the
+    thunk never started its call), so a consumer can match votes to reviewer
+    agent nodes by either key. ``role`` is display-only.
+    """
+    reviewers = ctx.reviewers
+    base = ctx.base
+    votes = []
+    for i, (reviewer, vote) in enumerate(zip(reviewers, result.votes)):
+        decision = None
+        if vote.kind == "verdict":
+            if vote.decision is True:
+                decision = "pass"
+            elif vote.decision is False:
+                decision = "fail"
+        votes.append(
+            {
+                "name": reviewer.label or f"{base}-{i}",
+                "agent_id": agent_ids[i] if i < len(agent_ids) else None,
+                "kind": vote.kind,
+                "role": vote.role,
+                "decision": decision,
+                "score": vote.score,
+                "feedback": vote.feedback,
+                "voted": vote.decision is not None or vote.score is not None,
+            }
+        )
+    rt.progress_sink(
+        WorkflowProgressEvent(
+            kind=ProgressKind.VERIFY_COMPLETED,
+            phase=ctx.phase_label or _current_phase.get(),
+            label=base,
+            nested_phase=_resolved_nested_phase(None),
+            outcome=_preview(result),
+            verify_reviewers=len(votes),
+            verify_verdict=result.verdict,
+            verify_threshold=ctx.threshold,
+            verify_votes=votes,
+            verify_id=ctx.verify_id,
+        )
+    )
+
+
+def _aggregate_feedback(reviewers: Sequence[Reviewer], votes: Sequence[VerifyVote]) -> str:
+    """Join every reviewer's non-empty feedback into an attributed block for rework.
+
+    Mirrors the scheduled ``format_fail_feedback`` shape (``- reviewer: text``),
+    attributing each line by the reviewer's label (falling back to its kind).
+    """
+    lines = []
+    for reviewer, vote in zip(reviewers, votes):
+        fb = (vote.feedback or "").strip()
+        if not fb:
+            continue
+        name = reviewer.label or reviewer.kind
+        lines.append(f"- {name}: {fb}")
+    return "\n".join(lines)
+
+
+async def verify(
+    reviewers: Sequence[Reviewer],
+    *,
+    threshold: float = 0.85,
+    label: str | None = None,
+    phase: str | None = None,  # pylint: disable=huawei-redefined-outer-name
+    options: dict | None = None,
+) -> VerifyResult:
+    """Run one review round over ``reviewers`` and return a structured verdict.
+
+    Each reviewer is a single structured ``agent()`` call fanned out via
+    :func:`parallel` (each vote gets its own journal key, so resume replays the
+    reviewer calls). Votes are folded by :func:`_collect` and judged by
+    ``settle_verify_tally``.
+
+    This is a **single-shot** round: it does not wait on or drive a rework loop.
+    A reviewer whose ``agent()`` returned ``None`` counts as not-voted, so the
+    round returns ``verdict=None`` (undecided) unless every reviewer of every
+    pool has voted. An empty ``reviewers`` list is rejected.
+
+    Args:
+        reviewers: The reviewers to run. Must be non-empty.
+        threshold: Minimum average score for the score pool to pass.
+        label: Base label for reviewer progress events (fallback name prefix).
+        phase: Phase attributed to every reviewer ``agent()`` call.
+        options: Default ``options`` bag applied to every reviewer (reviewer-level
+            options take precedence).
+
+    Returns:
+        A ``VerifyResult`` with the round verdict, per-reviewer votes and the
+        aggregated review feedback.
+
+    Raises:
+        EngineError: If ``reviewers`` is empty.
+    """
+    rt = _rt.get()
+    reviewers = list(reviewers)
+    if not reviewers:
+        raise EngineError("verify() requires at least one reviewer")
+    base = label or "verify"
+    # Node id — the verify() analog of an agent node's agent_id: the
+    # structural position of this call. PEeks the ordinal its own parallel()
+    # block is about to consume (consuming one would shift every later sibling
+    # key in this scope and invalidate journal cache hits on resume). Parallel
+    # verify() calls live in different branch scopes (distinct paths); sequential
+    # same-scope rounds advance the counter via their own parallel blocks, so
+    # every round gets a distinct, resume-stable id.
+    seq = _seq.get()
+    verify_id = key_str(_path.get() + (("verify", seq["n"] if seq is not None else 0),))
+    # Normalize labels BEFORE fan-out so the STARTED roster, the reviewer agent
+    # nodes' labels, and the SETTLED votes' names all agree (and are unique
+    # across rounds — the business layer's default {type}-{i} restarts at 0
+    # each round).
+    _normalize_reviewer_labels(reviewers, base)
+
+    _emit_log(rt, f"verify: dispatching {len(reviewers)} reviewer(s)")
+    ctx = _VerifyRoundCtx(
+        base=base, phase_label=phase, threshold=threshold,
+        reviewers=reviewers, verify_id=verify_id,
+    )
+    _emit_verify_started(rt, ctx)
+    agent_ids: list = [None] * len(reviewers)
+    raws = await parallel(
+        [
+            _reviewer_call(i, r, base=base, phase=phase, options=options, agent_ids=agent_ids)
+            for i, r in enumerate(reviewers)
+        ]
+    )
+
+    votes, tally = _collect(reviewers, raws)
+    verdict = settle_verify_tally(tally, threshold)
+    result = VerifyResult(
+        verdict=verdict,
+        votes=votes,
+        feedback=_aggregate_feedback(reviewers, votes),
+        passed=verdict == "pass",
+    )
+    _emit_verify_settled(rt, ctx, result, agent_ids)
+    _emit_log(rt, f"verify: verdict={verdict} (threshold={threshold})")
+    return result
+
+
+# ─────────────────────── stateful sessions ───────────────────────
+def _jsonable(result: Any, model) -> Any:
+    """A JSON-able form of a turn result for the history mirror (cf. ``_make_record``)."""
+    if result is None:
+        return None
+    if model is not None and isinstance(result, model):
+        return result.model_dump(mode="json")
+    return result
+
+
+def _warn_concurrent_session(rt) -> None:
+    """Emitted once if a single session object receives overlapping ``send()``s."""
+    if getattr(rt, "warned_concurrent_session", False):
+        return
+    rt.warned_concurrent_session = True
+    rt.log_sink(
+        "[wf] WARNING: a single session received concurrent send()s (e.g. the same "
+        "session used from two parallel() branches). A session is a serial "
+        "conversation — await its turns in order, or use one session per entity."
+    )
+
+
+# One avatar runs one model: the first live turn records its model identity as
+# the session's lock; a later live turn that resolves differently raises. The
+# sentinel marks "no first live turn yet" (a human session never locks).
+_NOT_LOCKED = object()
+
+
+@dataclass(frozen=True)
+class _ModelIdentity:
+    """Comparable model identity of one session turn (see ``_session_model_identity``).
+
+    ``supply`` keeps the external supply paths apart: ``"pool"`` (a pool
+    endpoint via ``model=``), ``"builtin"`` (the CLI's own login via
+    ``builtin_model=``), ``"both"`` (an invalid combo that can never equal a
+    single-supply lock) and ``"none"`` (no hint — the CLI's default).
+    """
+
+    kind: str
+    agent_type: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    supply: str | None = None
+    builtin: str | None = None
+
+
+def _session_model_identity(opts: dict) -> _ModelIdentity:
+    """Comparable model identity of one session turn (one avatar = one model).
+
+    Differs across supply paths so ``model="X"`` (a pool endpoint) never equals
+    ``builtin_model="X"`` (the CLI's own login). Third-party hints are resolved
+    through the backend's planner when the engine has a resolution context; a
+    plain backend has neither a pool nor a CLI catalog, so the planner raises
+    for any hint-bearing turn and the raw supply path below carries the lock —
+    the launch backend rejects invalid combos anyway.
+    """
+    if not opts.get("agent_type"):
+        return _ModelIdentity("native", model=opts.get("model"))
+    agent_type = opts["agent_type"]
+    model_hint = opts.get("model")
+    builtin_hint = opts.get("builtin_model")
+    effort = opts.get("effort")
+    # Imported lazily: backends.external_model pulls in agent_teams.external,
+    # which re-enters this module mid-init through workflow/__init__.
+    from openjiuwen.agent_teams.workflow.backends.external_model import plan_external_model
+
+    try:
+        primary = plan_external_model(
+            cli_agent=agent_type,
+            model_hint=model_hint,
+            builtin_hint=builtin_hint,
+            effort_hint=effort,
+            entry=None,
+            team_backend=None,
+        ).primary
+    except BackendError:
+        primary = None  # planner has no pool/catalog here; lock by raw hints
+    if primary is not None:
+        supply = "pool" if primary.api_base is not None else "builtin"
+        return _ModelIdentity("external", agent_type, primary.model, primary.effort, supply)
+    if model_hint is not None and builtin_hint is not None:
+        # Mutually exclusive to the planner: an invalid combo can never equal a
+        # single-supply lock, so a both-supplied turn reads as a model switch.
+        return _ModelIdentity("external", agent_type, model_hint, effort, "both", builtin=builtin_hint)
+    if model_hint is not None:
+        return _ModelIdentity("external", agent_type, model_hint, None, "pool")
+    if builtin_hint is not None:
+        return _ModelIdentity("external", agent_type, builtin_hint, effort, "builtin")
+    return _ModelIdentity("external", agent_type, None, None, "none")
+
+
+def _locked_model_display(identity: _ModelIdentity, backend: Any = None) -> str:
+    """Human-readable name of a locked identity.
+
+    A no-hint lock names what actually runs: the backend's base-spec model
+    when it exposes ``describe_base_model`` (native path), the CLI's own
+    default for a third-party avatar (opaque to the engine — named honestly
+    by kind), and the generic phrase as the hookless fallback.
+    """
+    if identity.model:
+        return identity.model
+    if identity.kind == "external":
+        return f"the {identity.agent_type} CLI's own default model"
+    describe = getattr(backend, "describe_base_model", None)
+    named = describe() if callable(describe) else None
+    return named or "the base spec model"
+
+
+@dataclass
+class _TurnRequest:
+    """One session turn's request payload, threaded through ``_drive``/``_turn``.
+
+    Bundles the per-turn parameters so the drive/turn helpers take a single
+    request object instead of a long positional list.
+    """
+
+    prompt: str
+    opts: dict
+    json_schema: dict | None
+    model_cls: Any
+    correlation_id: str | None
+
+
+class AgentSession:
+    """A stateful, multi-turn handle over one agent — or one human.
+
+    Created by :func:`agent_session` / :func:`human_session`; scripts never
+    construct it directly. Each :meth:`send` advances the conversation and keeps
+    context across turns. The backend owns the real state (a long-lived avatar
+    harness); this object keeps a light ``(user, assistant)`` history mirror used
+    for the resume signature and lazy-open bookkeeping.
+
+    A human session (``_human=True``) sources each turn's input from a real
+    person (the backend formats it into the requested shape) and does not hold
+    the LLM concurrency permit while waiting; it is otherwise identical to an
+    agent session.
+    """
+
+    __slots__ = (
+        "_label", "_phase", "_instructions", "_options", "_human", "_node_type",
+        "_history", "_sid", "_member_name", "_in_flight", "_fork_data",
+        "_parent_session_id", "_opened_model", "_opened_template", "_completed_turns",
+    )
+
+    def __init__(
+        self,
+        *,
+        label: str | None = None,
+        phase: str | None = None,
+        instructions: str | None = None,
+        options: dict | None = None,
+        _human: bool = False,
+        _node_type: str = "agent_session",
+        _fork_data: dict | None = None,
+        _history: list[dict] | None = None,
+        _parent_session_id: str | None = None,
+    ) -> None:
+        self._label = label
+        self._phase = phase
+        self._instructions = instructions
+        self._options = dict(options or {})
+        self._human = _human
+        self._node_type = _node_type
+        self._history: list[dict] = list(_history) if _history else []
+        self._sid: str | None = None
+        self._member_name: str | None = None
+        self._in_flight = False
+        self._fork_data = _fork_data
+        self._parent_session_id = _parent_session_id
+        # Model lock: the first live turn's identity, or the sentinel while the
+        # avatar has never opened (a human session never locks).
+        self._opened_model = _NOT_LOCKED
+        # Template lock: the expert the first live turn picked (None = none picked).
+        self._opened_template: str | None = None
+        # Live turns completed since the avatar opened. The lock is set before
+        # the first live turn runs, so it only means "used" once a turn landed;
+        # a failed first turn may re-lock (see _ensure_open).
+        self._completed_turns = 0
+
+    @overload
+    async def send(self, prompt: str, *, notify: Literal[True], options: dict | None = ...) -> None:
+        """Overload: ``notify=True`` is a one-way push and returns ``None``."""
+        ...
+
+    @overload
+    async def send(self, prompt: str, *, schema: type[M], options: dict | None = ...) -> "M | None":
+        """Overload: ``schema=<pydantic model>`` narrows the reply to that model."""
+        ...
+
+    @overload
+    async def send(self, prompt: str, *, schema: dict, options: dict | None = ...) -> "dict | None":
+        """Overload: ``schema=<JSON Schema dict>`` returns a plain ``dict``."""
+        ...
+
+    @overload
+    async def send(self, prompt: str, *, schema: None = ..., options: dict | None = ...) -> "str | None":
+        """Overload: no ``schema`` returns the reply's raw text."""
+        ...
+
+    async def send(self, prompt, *, schema=None, notify=False, options=None):
+        """Advance the conversation one turn (or push a one-way ``notify``).
+
+        With ``schema`` the reply is validated/coerced to it (``MyModel | None``
+        for a pydantic model, ``dict | None`` for a JSON-Schema dict); without,
+        the raw text (``str | None``). ``notify=True`` pushes a one-way message
+        (still recorded so context continues, still journaled for resume) and
+        returns ``None``; it is text-only and rejects a ``schema``.
+        """
+        rt = _rt.get()
+        if notify and schema is not None:
+            raise EngineError("send(notify=True) is text-only; don't also pass a schema")
+        # Per-task current phase; fall back to the session's own default.
+        phase_val = _current_phase.get() if _current_phase.get() is not None else self._phase
+        opts = _build_opts(
+            rt,
+            {"label": self._label, "phase": phase_val, "schema": schema},
+            {**self._options, **(options or {})},
+        )
+        _validate_model_hint(rt, opts)
+        json_schema, model_cls = resolve_schema(opts.get("schema"))
+
+        ks = key_str(_path.get() + (("call", _next_ordinal()),))
+        sig = call_signature(prompt, opts, json_schema, history=self._history)
+
+        correlation_id = self._correlation_id(opts)
+
+        if self._in_flight:
+            _warn_concurrent_session(rt)
+        self._in_flight = True
+        try:
+            # Reserve the member identity on the FIRST turn regardless of cache
+            # hit, so a fully-hit resume still knows this session's member name
+            # (fork() needs it to locate the parent's persisted context) and the
+            # AGENT_STARTED event can carry it as the session's stable UI key.
+            # Only runs once — no avatar, no LLM, no spawn/budget slot.
+            if self._member_name is None and not self._human:
+                await self._ensure_member_name(rt, opts)
+
+            _emit_agent_started(
+                rt, opts, prompt,
+                node_type=self._node_type,
+                agent_id=ks,
+                correlation_id=correlation_id,
+                parent_session_id=self._parent_session_id,
+                member_name=self._member_name,
+            )
+
+            cached = rt.journal.get_cached(ks, sig, rt.run_id)
+            if cached is not None:  # resume hit — no backend, no harness, no person
+                rt.log_sink(f"[wf] session {opts.get('label') or 'session'!r} key={ks} CACHE_HIT sig={sig[:12]}")
+                await rt.journal.use(ks, cached)
+                result = _rehydrate(cached, model_cls)
+                self._append_history(prompt, result, model_cls)
+                outcome_text = _outcome_from_result(cached.get("raw_text"), result)
+                cached_tokens = cached.get("tokens")
+                if isinstance(cached_tokens, int) and cached_tokens > 0:
+                    rt.workflow_budget.add(cached_tokens)
+                _emit_agent_completed(
+                    rt, opts, outcome_text, agent_id=ks,
+                    tokens=cached_tokens if isinstance(cached_tokens, int) else None,
+                    cache_tokens=cached.get("cache_tokens"),
+                    token_input=cached.get("token_input"),
+                    token_output=cached.get("token_output"),
+                    budget_snapshot=_budget_snapshot(rt.budget),
+                )
+                return None if notify else result
+
+            rt.log_sink(
+                f"[wf] session {opts.get('label') or 'session'!r} key={ks} CACHE_MISS "
+                f"sig={sig[:12]} (live run, history_len={len(self._history)})"
+            )
+            _check_abort(rt)  # entry gate: a paused run starts no new turn
+            _check_budget(rt)  # entry gate: a run out of tokens starts no new turn
+
+            req = _TurnRequest(
+                prompt=prompt,
+                # Mirror ``_call_backend``'s injection: the session backend
+                # needs the deterministic node key to tag live activity events.
+                # The copy (never the journaled original — ``opts`` below stays
+                # raw for ``_make_record`` / the emits) is what open_session /
+                # send_turn see.
+                opts={**opts, "agent_id": ks},
+                json_schema=json_schema,
+                model_cls=model_cls,
+                correlation_id=correlation_id,
+            )
+            call_result = await self._drive(rt, req)
+            if not call_result.succeeded:
+                who = "human" if self._human else "agent"
+                label = opts.get("label") or who
+                msg = f"{who} session {label!r} failed"
+                if call_result.attempts is not None and call_result.attempts > 1:
+                    msg = f"{msg} after {call_result.attempts} attempts"
+                if call_result.error_detail:
+                    msg = f"{msg}: {call_result.error_detail}"
+                _emit_agent_failed(
+                    rt, opts, msg, agent_id=ks,
+                    tokens=call_result.tokens, budget_snapshot=_budget_snapshot(rt.budget),
+                    model=call_result.model,
+                )
+                return None
+
+            result = call_result.result
+            _check_abort(rt)  # pre-journal guard: an interrupted turn does not persist
+            await rt.journal.use(
+                ks,
+                _make_record(
+                    _JournalRecordInput(
+                        key=ks,
+                        sig=sig,
+                        opts=opts,
+                        result=result,
+                        model=model_cls,
+                        raw_text=call_result.raw_text,
+                        run_id=rt.run_id,
+                        tokens=call_result.tokens,
+                        cache_tokens=call_result.cache_tokens,
+                        input_tokens=call_result.input_tokens,
+                        output_tokens=call_result.output_tokens,
+                    )
+                ),
+            )
+            self._append_history(prompt, result, model_cls)
+            self._completed_turns += 1  # a live turn landed; the model lock is now "used"
+            outcome_text = _outcome_from_result(call_result.raw_text, result)
+            _emit_agent_completed(
+                rt, opts, outcome_text, agent_id=ks,
+                tokens=call_result.tokens, budget_snapshot=_budget_snapshot(rt.budget),
+                cache_tokens=call_result.cache_tokens,
+                token_input=call_result.input_tokens,
+                token_output=call_result.output_tokens,
+                model=call_result.model,
+            )
+            return None if notify else result
+        finally:
+            self._in_flight = False
+
+    async def aclose(self) -> None:
+        """Close the backing session if it was ever opened (idempotent)."""
+        if self._sid is None:
+            return
+        rt = _rt.get()
+        sid, self._sid = self._sid, None
+        await rt.backend.close_session(sid)
+
+    async def fork(
+        self,
+        *,
+        fork_mode: str = "full",
+        keep_rounds: int | None = None,
+        label: str | None = None,
+        phase: str | None = None,  # pylint: disable=huawei-redefined-outer-name
+        instructions: str | None = None,
+        options: dict | None = None,
+    ) -> "AgentSession":
+        """Fork this session into a fresh, independent session (context inherited).
+
+        The five ``fork_mode`` values mirror the team fork modes (``full`` /
+        ``before`` / ``after`` / ``keep_before_compact_after`` /
+        ``keep_after_compact_before``); ``keep_rounds`` is the split point in
+        **rounds** (each prior ``send()`` is one round) for the truncating /
+        compacting modes. Every mode but ``full`` requires ``keep_rounds`` —
+        omitting it raises (there is no truncation without a split point).
+        ``keep_rounds`` beyond the parent's actual round count is not an error;
+        the backend warns and silently falls back to a full-context fork (the
+        team fork's "wrong name → full" guard). External (``agent_type``)
+        sessions are stricter: an unsupported mode or an out-of-range
+        ``keep_rounds`` raises instead of degrading to full.
+        The parent context is captured
+        **eagerly** here (the fork point), so later ``send()``s on this session
+        do not affect the child.
+
+        The child inherits this session's ``_history`` mirror (resume-signature
+        consistency) and, when the backend returns a ``fork_data`` snapshot, a
+        full context including ToolMessage. A fork of a ``human_session`` is
+        rejected. The child is ``_node_type="agent_session_fork"`` when the
+        parent has history (so a fork turn is observable as a branch), else a
+        plain ``agent_session`` (a parent that never sent has nothing to
+        inherit).
+        """
+        if self._human:
+            raise EngineError("fork() is only supported on agent_session")
+        if fork_mode != "full" and keep_rounds is None:
+            raise EngineError(
+                "fork() requires keep_rounds unless fork_mode='full'"
+                f" (fork_mode={fork_mode!r} has no split point without it)"
+            )
+        fork_data = None
+        if self._member_name is not None:
+            rt = _rt.get()
+            fork_data = await rt.backend.capture_fork(
+                self._member_name,
+                keep_rounds=keep_rounds,
+                fork_mode=fork_mode,
+            )
+        return AgentSession(
+            label=label if label is not None else self._label,
+            phase=phase if phase is not None else self._phase,
+            instructions=instructions if instructions is not None else self._instructions,
+            options={**self._options, **(options or {})},
+            _human=False,
+            _node_type="agent_session_fork" if self._history else "agent_session",
+            _history=[dict(m) for m in self._history],
+            _fork_data=fork_data,
+            # The parent's avatar member name (unique per session), not the
+            # label: fork() inherits the parent label by default, so label-keyed
+            # lineage would cross-link chained or same-label forks. None when
+            # the parent never sent (the child is then a plain agent_session).
+            _parent_session_id=self._member_name,
+        )
+
+    async def _drive(self, rt, req: _TurnRequest):
+        """Open the session lazily, then run one turn through the retry helper.
+
+        Agent turns mirror ``agent()`` (spawn-budget gate + LLM permit); human
+        turns skip both — waiting on a person must not hold a concurrency permit.
+        """
+        if self._human:
+            await self._ensure_open(rt, req.opts)
+            return await self._turn(rt, req)
+        if rt.spawn_count >= rt.spawn_limit:
+            detail = f"spawn limit {rt.spawn_limit} reached"
+            rt.log_sink(f"[wf] {detail}; skipping {req.opts.get('label')!r}")
+            return _BackendCallResult(result=None, succeeded=False, error_detail=detail)
+        gate = _resolve_agent_gate(rt)
+        async with gate.acquire():
+            await self._ensure_open(rt, req.opts)
+            return await self._turn(rt, req)
+
+    async def _turn(self, rt, req: _TurnRequest):
+        """Run one ``send_turn`` (the prior history is what the backend may replay)."""
+        hist = list(self._history)
+        sid = self._sid
+        return await _attempt_calls(
+            rt, req.opts, req.json_schema, req.model_cls,
+            lambda feedback=None: rt.backend.send_turn(
+                sid,
+                _with_retry_feedback(req.prompt, feedback),
+                req.opts,
+                req.json_schema,
+                history=hist,
+                correlation_id=req.correlation_id,
+            ),
+            is_human=self._human,
+        )
+
+    def _correlation_id(self, opts: dict) -> str:
+        """Deterministic turn id with optional branch disambig.
+
+        Serial: ``{phase}:{label}:{turn}``. With branch: ``{phase}#{disambig}:{label}:{turn}``.
+        Disambig serial-concats all branch segments (``p{i}``/``i{i}s{s}``, ``.``-joined).
+        Stable across resume; turn = ``len(history) // 2``.
+        """
+        phase = opts.get("phase") or "_"
+        label = opts.get("label") or "human"
+        turn = len(self._history) // 2
+        disambig = _branch_disambig(_path.get())
+        phase_seg = f"{phase}#{disambig}" if disambig else phase
+        return f"{phase_seg}:{label}:{turn}"
+
+    async def _ensure_member_name(self, rt, opts) -> None:
+        """Reserve this session's member identity (once), no avatar built.
+
+        Runs on the first turn regardless of cache hit so a fully-hit resume
+        still knows the member name ``fork()`` needs to locate the parent's
+        persisted context. Pure in-process backend bookkeeping (a counter
+        increment) — no harness, no LLM, no spawn/budget slot.
+        """
+        if self._member_name is not None:
+            return
+        self._member_name = await rt.backend.ensure_member_name(
+            kind="agent",
+            opts=opts,
+        )
+
+    async def _ensure_open(self, rt, opts) -> None:
+        """Open the backend session on the first real turn (one avatar per session)."""
+        # The model lock lives here: only live turns reach _ensure_open (cache
+        # hits return earlier in send), and a still-unopened session has nothing
+        # locked yet — the first live turn records, later live turns compare.
+        identity = _session_model_identity(opts) if not self._human else _NOT_LOCKED
+        if self._sid is not None:
+            template = opts.get("agent_template")
+            if not self._human and template != self._opened_template:
+                if self._completed_turns == 0:
+                    self._opened_template = template
+                else:
+                    locked_text = (
+                        "no agent_template" if self._opened_template is None
+                        else f"agent_template {self._opened_template!r}"
+                    )
+                    raise EngineError(
+                        f"agent session {opts.get('label') or 'agent'!r} is locked to {locked_text} "
+                        f"(set by its first live turn); one avatar runs one expert, "
+                        f"so switching experts needs a new session — fork() it instead"
+                    )
+            if identity is not _NOT_LOCKED and identity != self._opened_model:
+                if self._completed_turns == 0:
+                    # The lock was recorded on the first live turn before it ran;
+                    # that turn never landed, so the lock was never "used" — the
+                    # corrected hint re-locks instead of bricking the session.
+                    self._opened_model = identity
+                    return
+                locked = _locked_model_display(self._opened_model, backend=getattr(rt, "backend", None))
+                raise EngineError(
+                    f"agent session {opts.get('label') or 'agent'!r} is locked to model "
+                    f"{locked!r} (set by its first live "
+                    f"turn); one avatar runs one model, so switching models needs a new "
+                    f"session — fork() it instead"
+                )
+            return
+        if not self._human:
+            rt.spawn_count += 1  # the avatar is this session's one spawned agent
+        # Reuse the identity already reserved on the first turn (cache-hit or
+        # miss) so we never re-mint a name and drift the counter across a resume.
+        if not self._human:
+            await self._ensure_member_name(rt, opts)
+        rt.log_sink(f"[wf] session {opts.get('label') or 'session'!r} opening backend session (avatar (re)created)")
+        self._sid = await rt.backend.open_session(
+            kind="human" if self._human else "agent",
+            instructions=self._instructions,
+            opts=opts,
+            fork_data=self._fork_data,
+            member_name=self._member_name,
+        )
+        # Record the first live turn's identity as the session's lock. A fork
+        # child is a fresh AgentSession (own sentinel), so it locks afresh.
+        self._opened_model = identity
+        self._opened_template = opts.get("agent_template")
+
+    def _append_history(self, prompt: str, result: Any, model_cls) -> None:
+        """Append the ``(user, assistant)`` pair so the next turn carries context."""
+        self._history.append({"role": "user", "content": prompt})
+        self._history.append({"role": "assistant", "content": _jsonable(result, model_cls)})
+
+
+def agent_session(
+    *,
+    label: str | None = None,
+    phase: str | None = None,
+    instructions: str | None = None,
+    options: dict | None = None,
+) -> AgentSession:
+    """Open a stateful, multi-turn agent — ``send()`` it repeatedly; context persists."""
+    return AgentSession(
+        label=label,
+        phase=phase,
+        instructions=instructions,
+        options=options,
+        _node_type="agent_session",
+    )
+
+
+def human_session(
+    *,
+    label: str | None = None,
+    phase: str | None = None,
+    instructions: str | None = None,
+    options: dict | None = None,
+) -> AgentSession:
+    """Open a stateful, multi-turn human participant (each turn's input from a person)."""
+    return AgentSession(
+        label=label,
+        phase=phase,
+        instructions=instructions,
+        options=options,
+        _human=True,
+        _node_type="human_session",
+    )
+
+
+#: Annotation alias: ``human_session()`` returns the same class with ``_human`` set.
+HumanSession = AgentSession
+
+
+@overload
+async def human(
+    prompt: str, *, schema: type[M],
+    label: str | None = ..., phase: str | None = ..., options: dict | None = ...,
+) -> "M | None":
+    """Overload: ``schema=<pydantic model>`` narrows the answer to that model."""
+    ...
+
+
+@overload
+async def human(
+    prompt: str, *, schema: dict,
+    label: str | None = ..., phase: str | None = ..., options: dict | None = ...,
+) -> "dict | None":
+    """Overload: ``schema=<JSON Schema dict>`` returns a plain ``dict``."""
+    ...
+
+
+@overload
+async def human(
+    prompt: str, *, schema: None = ...,
+    label: str | None = ..., phase: str | None = ..., options: dict | None = ...,
+) -> "str | None":
+    """Overload: no ``schema`` returns the person's answer as raw text."""
+    ...
+
+
+async def human(prompt, *, schema=None, label=None, phase=None, options=None):
+    """One-shot human turn: ask a person once, return their (typed) answer.
+
+    Sugar over an ephemeral :func:`human_session` opened, asked once, and closed —
+    use :func:`human_session` when you need multiple turns with memory. ``label`` /
+    ``phase`` mirror :func:`agent` / :func:`human_session`: they name the turn in
+    progress events and the deterministic human correlation id.
+    """
+    s = AgentSession(
+        _human=True,
+        _node_type="human",
+        label=label,
+        phase=phase,
+    )
+    try:
+        return await s.send(prompt, schema=schema, options=options)
+    finally:
+        await s.aclose()
+
+
+# ─────────────────────── parallel (barrier) ───────────────────────
+async def parallel(thunks: Sequence[Callable[[], Awaitable]]) -> list:
+    k = _next_ordinal()  # this block's slot in the parent scope
+    base = _path.get()
+    thunks = list(thunks)
+    if len(thunks) > _MAX_FANOUT:
+        raise EngineError(
+            f"parallel() got {len(thunks)} thunks; the per-call limit is "
+            f"{_MAX_FANOUT}. Split into batches instead of one giant fan-out."
+        )
+
+    async def branch(i: int, th: Callable[[], Awaitable]):
+        # Runs in a Task-copied context; sets are private to this branch.
+        _path.set(base + (("par", k, i),))
+        _seq.set(_fresh_holder())
+        try:
+            r = th()
+            return await r if inspect.isawaitable(r) else r
+        except Exception:
+            # CancelledError is BaseException, not caught here — cancellation
+            # still propagates out of the branch; only real errors map to None.
+            return None
+
+    # Create branch tasks explicitly and re-cancel each one in the except block
+    # below: gather() already forwards cancellation to every child automatically
+    # in the common case, but if the driver's own cancel lands in the narrow
+    # window where its Task._fut_waiter is momentarily unset, CancelledError is
+    # thrown straight into this coroutine without ever touching the gather
+    # future, so gather's child-cancellation never runs. The explicit loop is
+    # the reliable backstop for that gap.
+    branch_tasks = [
+        asyncio.create_task(branch(i, th)) for i, th in enumerate(thunks)
+    ]
+    try:
+        return await asyncio.gather(*branch_tasks)
+    except asyncio.CancelledError:
+        for bt in branch_tasks:
+            bt.cancel()
+        # Drain the branches before unwinding: the engine's teardown closes the
+        # backend sessions (runner.py finally: backend.aclose()), so a branch
+        # still alive here would hit "unknown session" on its next send_turn
+        # (production 09-08: pause landed while a branch was still building its
+        # avatar, and its first turn found the session row already popped).
+        # Bounded wait for the DRIVER only — a branch that ignores its cancel
+        # keeps running past this timeout; it is not force-terminated here.
+        await asyncio.wait(branch_tasks, timeout=_BRANCH_DRAIN_TIMEOUT)
+        raise
+
+
+# ─────────────────────── pipeline (streaming) ───────────────────────
+async def pipeline(items: Sequence, *stages: Callable) -> list:
+    k = _next_ordinal()  # this block's slot in the parent scope
+    base = _path.get()
+    items = list(items)
+    if len(items) > _MAX_FANOUT:
+        raise EngineError(
+            f"pipeline() got {len(items)} items; the per-call limit is "
+            f"{_MAX_FANOUT}. Split into batches instead of one giant fan-out."
+        )
+
+    async def chain(i: int, item: Any):
+        prev = item
+        try:
+            for s, stage in enumerate(stages):
+                _path.set(base + (("pipe", k, i, s),))
+                _seq.set(_fresh_holder())
+                r = stage(prev, item, i)  # stage may be sync (returning awaitable) or async
+                prev = await r if inspect.isawaitable(r) else r
+            return prev
+        except Exception:
+            # CancelledError is BaseException, not caught here — cancellation
+            # still propagates; the first throwing stage drops THIS item only.
+            return None
+
+    return await asyncio.gather(*[chain(i, it) for i, it in enumerate(items)])
+
+
+# ─────────────────────── ergonomic fan-out ───────────────────────
+def _arity(fn: Callable) -> int:
+    try:
+        params = [
+            p
+            for p in inspect.signature(fn).parameters.values()
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+        return len(params)
+    except (TypeError, ValueError):
+        return 1
+
+
+async def map_parallel(items: Sequence, fn: Callable) -> list:
+    """Footgun-free fan-out: ``fn`` is ``async def fn(item)`` or ``fn(item, i)``.
+
+    Binds each item correctly (no late-binding closure trap), then defers to
+    :func:`parallel`.
+    """
+    items = list(items)
+    if _arity(fn) >= 2:
+        thunks = [(lambda it=it, i=i: fn(it, i)) for i, it in enumerate(items)]
+    else:
+        thunks = [(lambda it=it: fn(it)) for it in items]
+    return await parallel(thunks)
+
+
+pmap = map_parallel  # alias
+
+
+# ─────────────────────── phase / log / budget ───────────────────────
+def phase(title: str) -> None:
+    rt = _rt.get()
+    _current_phase.set(title)
+    _parent_phase.set(title)
+    rt.progress_sink(WorkflowProgressEvent(kind=ProgressKind.PHASE, phase=title))
+
+
+def log(message: Any) -> None:
+    _emit_log(_rt.get(), str(message))
+
+
+class _Budget:
+    """Reads the active run's **workflow-level** ledger via the contextvar.
+
+    Importable & run-agnostic: the public ``budget`` name in scripts now reports
+    the per-run budget (``rt.workflow_budget``, sourced from
+    ``META.workflow_token_limit``) — not the session-wide ledger — so a script
+    polling ``budget.remaining()`` sees exactly what "this run" has left before
+    its own ceiling, which is the ceiling the engine enforces for the run.
+
+    Live rather than end-of-call: the ledger is written by the backend as each
+    model call returns, so a script polling ``remaining()`` sees the burn of
+    every agent currently in flight, not just the ones that have returned.
+    """
+
+    @property
+    def total(self) -> int | None:
+        return _rt.get().workflow_budget.total
+
+    @staticmethod
+    def spent() -> int:
+        return _rt.get().workflow_budget.spent
+
+    @staticmethod
+    def remaining() -> int | None:
+        return _rt.get().workflow_budget.remaining()
+
+
+#: Importable singleton: `from swarmflow import budget` then `budget.spent()`.
+budget = _Budget()
+
+
+# ─────────────────────── inline sub-workflow ───────────────────────
+async def workflow(name_or_path: str, args: Any = None) -> Any:
+    """Run a sub-workflow inline, return its ``run()`` result.
+
+    Safe to fan out via ``parallel``/``pipeline`` — depth tracked per Task (ContextVar).
+    Emits child ``PHASE`` (``phase_type="child"``, display name ``▸ {name} #{N}``,
+    ``parent_phase`` from enclosing ``phase()``) so Monitor builds a child card.
+    Sets ``_wf_display_name`` (per-task ContextVar) so ``agent()``/``log()``
+    pick up the display name without touching ``_current_phase``.
+    """
+    rt = _rt.get()
+    parent_phase = _parent_phase.get() or _current_phase.get()
+    depth = _wf_depth.get()
+    if depth >= _MAX_WORKFLOW_DEPTH:
+        _emit_log(
+            rt,
+            f"[wf] nested workflow depth > {_MAX_WORKFLOW_DEPTH} not allowed; skipping",
+        )
+        return None
+    from .loader import load_workflow_source  # lazy: avoid import cycle
+
+    loaded = load_workflow_source(name_or_path)
+    name = loaded.meta.get("name", str(name_or_path)) if isinstance(loaded.meta, dict) else str(name_or_path)
+    # Display name: deepest branch segment i (drop s); pure #N, NOT _branch_disambig.
+    display_name = f"▸ {name}"
+    branch_i = _deepest_branch_i(_path.get())
+    if branch_i is not None:
+        display_name = f"▸ {name} #{branch_i}"
+    k = _next_ordinal()
+    # Emit child PHASE declaration BEFORE pushing the wf segment + resetting seq,
+    # so a progress consumer (Monitor) can open a separate child card. ``phase``
+    # is the script's original phase name; ``nested_phase`` carries the display
+    # name; ``parent_phase`` links back to the enclosing author phase.
+    rt.log_sink(f"[wf] child phase declared: {display_name}, parent: {parent_phase}, name: {name}")
+    rt.progress_sink(WorkflowProgressEvent(
+        kind=ProgressKind.PHASE,
+        phase=name,
+        phase_type="child",
+        nested_phase=display_name,
+        parent_phase=parent_phase,
+    ))
+    tok_d = _wf_depth.set(depth + 1)
+    tok_p = _path.set(_path.get() + (("wf", k, name),))
+    tok_s = _seq.set(_fresh_holder())
+    saved_parent = _parent_phase.set(parent_phase)
+    phase_name = _wf_display_name.set(display_name)
+    try:
+        return await _invoke_loaded(loaded, args)
+    finally:
+        _seq.reset(tok_s)
+        _path.reset(tok_p)
+        _wf_depth.reset(tok_d)
+        _parent_phase.reset(saved_parent)
+        _wf_display_name.reset(phase_name)
+
+
+# ─────────────────────── list helpers (JS idioms) ───────────────────────
+def compact(xs: Sequence) -> list:
+    """``xs.filter(Boolean)`` — drops every falsy element (None, '', 0, [])."""
+    return [x for x in xs if x]
+
+
+def flatten_filter(xs: Sequence) -> list:
+    """``xs.flat().filter(Boolean)`` — one level, None sublists tolerated."""
+    out: list = []
+    for sub in xs:
+        for x in sub or []:
+            if x:
+                out.append(x)
+    return out
+
+
+# ─────────────────────── entrypoint ───────────────────────
+async def _invoke_loaded(loaded, args: Any) -> Any:
+    """Run a loaded workflow's entrypoint.
+
+    A SwarmFlow file is a real Python module exposing ``async def run(args)`` (or
+    ``run()``), loaded via importlib. It imports the primitives it needs; each
+    call resolves the active run via the ``_rt`` contextvar, so concurrent
+    workflows in one loop stay isolated (each runs in its own Task → its own
+    context copy).
+    """
+    run_fn = getattr(loaded.module, "run", None)
+    if not inspect.iscoroutinefunction(run_fn):
+        raise EngineError(f"{loaded.path}: must define `async def run(args)`")
+    return await (run_fn(args) if _arity(run_fn) >= 1 else run_fn())

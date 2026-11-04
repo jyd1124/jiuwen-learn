@@ -1,0 +1,334 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+"""Enhanced PowerShellTool with command semantics, smart truncation, and security."""
+from __future__ import annotations
+
+import os
+import time
+from dataclasses import dataclass
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Optional,
+)
+
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.logging import sys_operation_logger
+from openjiuwen.core.foundation.tool.base import Tool
+from openjiuwen.core.sys_operation import SysOperation
+from openjiuwen.harness.prompts.tools import build_tool_card
+from openjiuwen.harness.tools.base_tool import ToolOutput
+from openjiuwen.harness.tools.shell.powershell._output import (
+    CommandOutput,
+    render_partial_on_failure,
+    render_tool_content,
+)
+from openjiuwen.harness.tools.shell.powershell._permission import (
+    check_permission,
+    PermissionConfig,
+    PermissionMode,
+)
+from openjiuwen.harness.tools.shell.powershell._security import (
+    check_injection,
+    get_destructive_warning,
+)
+from openjiuwen.harness.tools.shell.powershell._semantics import interpret_exit_code
+from openjiuwen.core.session import get_current_session
+from openjiuwen.harness.tools.filesystem import (
+    _detect_and_record_deletions,
+    _parse_ps_remove_targets,
+    _record_rm_targets_before_deletion,
+)
+
+
+@dataclass(frozen=True)
+class _PowerShellInputs:
+    """Parsed and clamped inputs for a PowerShellTool invocation."""
+
+    command: str
+    timeout: int
+    workdir: str
+    background: bool
+    max_output_chars: int
+    description: str
+
+
+class PowerShellTool(Tool):
+    """PowerShell command executor with truncation, permissions, and security checks."""
+
+    def __init__(
+            self,
+            operation: SysOperation,
+            language: str = "cn",
+            permission_mode: str = "auto",
+            deny_patterns: list[str] | None = None,
+            allow_patterns: list[str] | None = None,
+            agent_id: Optional[str] = None,
+            **_kwargs: Any,
+    ) -> None:
+        super().__init__(build_tool_card("powershell", "PowerShellTool", language, agent_id=agent_id))
+        self._operation = operation
+        self._permission = PermissionConfig(
+            mode=PermissionMode(permission_mode),
+            deny_patterns=PermissionConfig.compile_patterns(deny_patterns),
+            allow_patterns=PermissionConfig.compile_patterns(allow_patterns),
+        )
+        self._agent_id = agent_id or "default"
+
+    @staticmethod
+    def _resolve_timeout(raw_value: Any, default: int = 300) -> int:
+        """Parse and validate a timeout value."""
+        try:
+            timeout = int(raw_value)
+        except (TypeError, ValueError):
+            timeout = default
+        try:
+            max_timeout = int(os.getenv("POWER_SHELL_TOOL_MAX_TIMEOUT_SECONDS") or "3600")
+        except ValueError:
+            max_timeout = 3600
+        max_timeout = max(1, max_timeout)
+        return max(1, min(timeout, max_timeout))
+
+    @staticmethod
+    def _resolve_max_output_chars(raw_value: Any, default: int = 20000) -> int:
+        """Parse and validate a max_output_chars value.
+
+        Absent/invalid falls back to ``default`` (20000) so large command output
+        is truncated and persisted to a file by default; an explicit ``0`` means
+        no limit (caller opted out).
+        """
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            value = default
+        if value == 0:
+            return 0
+        try:
+            max_chars = int(os.getenv("POWER_SHELL_TOOL_MAX_OUTPUT_CHARS") or "20000")
+        except ValueError:
+            max_chars = 20000
+        max_chars = max(200, max_chars)
+        return max(200, min(value, max_chars))
+
+    @staticmethod
+    def _parse_inputs(inputs: Dict[str, Any]) -> _PowerShellInputs:
+        """Parse and clamp tool inputs."""
+        return _PowerShellInputs(
+            command=(inputs.get("command") or "").strip(),
+            timeout=PowerShellTool._resolve_timeout(inputs.get("timeout", 300)),
+            workdir=inputs.get("workdir", ""),
+            background=bool(inputs.get("background", False)),
+            max_output_chars=PowerShellTool._resolve_max_output_chars(inputs.get("max_output_chars", 20000)),
+            description=inputs.get("description", ""),
+        )
+
+    def _build_history_path(self, session: Any) -> str:
+        from openjiuwen.core.sys_operation.cwd import get_agent_history_root
+        base_dir = get_agent_history_root()
+        return os.path.join(
+            base_dir, ".agent_history",
+            f"file_ops_{self._agent_id}_{session.get_session_id()}.json",
+        )
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        from openjiuwen.core.sys_operation.cwd import get_cwd
+
+        p = self._parse_inputs(inputs)
+
+        if not p.command:
+            return ToolOutput(success=False, error="command cannot be empty")
+
+        current_cwd = get_cwd()
+        resolved_cwd = p.workdir or current_cwd
+
+        if os.getenv("OPENJIUWEN_BASH_STRICT") == "1":
+            guard = self._guard(p)
+            if guard is not None:
+                return guard
+
+        warning = get_destructive_warning(p.command)
+
+        if p.description:
+            sys_operation_logger.debug("PowerShellTool: %s - %s", p.description, p.command)
+
+        if p.background:
+            res = await self._operation.shell().execute_cmd_background(
+                p.command,
+                cwd=resolved_cwd,
+                shell_type="powershell",
+            )
+            if res.code != StatusCode.SUCCESS.code:
+                return ToolOutput(success=False, error=res.message)
+            return ToolOutput(success=True, data={"pid": res.data.pid, "status": "started"})
+
+        # ── pre-execution: record explicit Remove-Item targets ────
+        _session = get_current_session()
+        _history_path: Optional[str] = None
+        if _session is not None:
+            _history_path = self._build_history_path(_session)
+            ps_targets = _parse_ps_remove_targets(p.command)
+            if ps_targets:
+                await _record_rm_targets_before_deletion(_history_path, ps_targets, self._operation)
+
+        res = await self._operation.shell().execute_cmd(
+            p.command,
+            cwd=resolved_cwd,
+            timeout=p.timeout,
+            shell_type="powershell",
+        )
+        if res.code != StatusCode.SUCCESS.code:
+            # A post-launch failure (e.g. timeout) still carries output collected
+            # before the kill in res.data; surface it instead of dropping it.
+            partial = None
+            if res.data is not None:
+                partial = render_partial_on_failure(
+                    CommandOutput(
+                        command=p.command,
+                        stdout=res.data.stdout or "",
+                        stderr=res.data.stderr or "",
+                        exit_code=res.data.exit_code if res.data.exit_code is not None else -1,
+                        warning=warning,
+                        max_output_chars=p.max_output_chars,
+                    ),
+                    res.message,
+                )
+            if partial is not None:
+                return ToolOutput(success=False, data={"content": partial}, error=partial)
+            return ToolOutput(success=False, error=res.message)
+
+        exit_code = res.data.exit_code if res.data else -1
+        stdout = (res.data.stdout or "") if res.data else ""
+        stderr = (res.data.stderr or "") if res.data else ""
+
+        meaning = interpret_exit_code(p.command, exit_code, stdout, stderr)
+
+        # ── post-execution: cross-reference history for missed deletions ──
+        if _history_path is not None and not meaning.is_error:
+            await _detect_and_record_deletions(_history_path)
+
+        content, is_error = render_tool_content(
+            CommandOutput(
+                command=p.command,
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=exit_code,
+                warning=warning,
+                max_output_chars=p.max_output_chars,
+            ),
+            meaning.is_error,
+        )
+        return ToolOutput(
+            success=not is_error,
+            data={"content": content},
+            error=content if is_error else None,
+        )
+
+    def render_for_llm(self, output: ToolOutput) -> str:
+        """A background launch carries only its pid; describe it in words."""
+        if output.success and "pid" in output.data:
+            return f"Command started in background (pid {output.data['pid']})."
+        return super().render_for_llm(output)
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[ToolOutput]:
+        from openjiuwen.core.sys_operation.cwd import get_cwd
+
+        p = self._parse_inputs(inputs)
+
+        if not p.command:
+            yield ToolOutput(success=False, error="command cannot be empty")
+            return
+
+        current_cwd = get_cwd()
+        resolved_cwd = p.workdir or current_cwd
+
+        if os.getenv("OPENJIUWEN_BASH_STRICT") == "1":
+            guard = self._guard(p)
+            if guard is not None:
+                yield guard
+                return
+
+        warning = get_destructive_warning(p.command)
+
+        if p.description:
+            sys_operation_logger.debug("PowerShellTool(stream): %s - %s", p.description, p.command)
+
+        # ── pre-execution: record explicit Remove-Item targets ────
+        _session = get_current_session()
+        _history_path: Optional[str] = None
+        if _session is not None:
+            _history_path = self._build_history_path(_session)
+            ps_targets = _parse_ps_remove_targets(p.command)
+            if ps_targets:
+                await _record_rm_targets_before_deletion(_history_path, ps_targets, self._operation)
+
+        start = time.monotonic()
+        accumulated_stdout = ""
+        accumulated_stderr = ""
+        final_exit_code = -1
+
+        async for chunk in self._operation.shell().execute_cmd_stream(
+                p.command,
+                cwd=resolved_cwd,
+                timeout=p.timeout,
+                shell_type="powershell",
+        ):
+            if chunk.code != StatusCode.SUCCESS.code:
+                yield ToolOutput(success=False, error=chunk.message)
+                return
+
+            data = chunk.data
+            elapsed = round(time.monotonic() - start, 2)
+
+            if data.exit_code is not None:
+                final_exit_code = data.exit_code
+
+            text = data.text or ""
+            stream_type = data.type or "stdout"
+            if stream_type == "stderr":
+                accumulated_stderr += text
+            else:
+                accumulated_stdout += text
+
+            yield ToolOutput(
+                success=True,
+                data={
+                    "text": text,
+                    "type": stream_type,
+                    "chunk_index": data.chunk_index,
+                    "exit_code": data.exit_code,
+                    "elapsed_time_seconds": elapsed,
+                },
+            )
+
+        # ── post-execution: cross-reference history for missed deletions ──
+        meaning = interpret_exit_code(p.command, final_exit_code, accumulated_stdout, accumulated_stderr)
+        if _history_path is not None and not meaning.is_error:
+            await _detect_and_record_deletions(_history_path)
+
+        content, is_error = render_tool_content(
+            CommandOutput(
+                command=p.command,
+                stdout=accumulated_stdout,
+                stderr=accumulated_stderr,
+                exit_code=final_exit_code,
+                warning=warning,
+                max_output_chars=p.max_output_chars,
+            ),
+            meaning.is_error,
+        )
+        yield ToolOutput(
+            success=not is_error,
+            data={"content": content},
+            error=content if is_error else None,
+        )
+
+    def _guard(self, p: _PowerShellInputs):
+        sec = check_injection(p.command)
+        if sec.blocked:
+            return ToolOutput(success=False, error=sec.reason)
+
+        perm = check_permission(p.command, self._permission)
+        if not perm.allowed:
+            return ToolOutput(success=False, error=perm.reason)
+        return None

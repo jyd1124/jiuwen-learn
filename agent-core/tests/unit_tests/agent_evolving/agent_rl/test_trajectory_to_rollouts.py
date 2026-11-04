@@ -1,0 +1,181 @@
+# -*- coding: utf-8 -*-
+"""Tests for canonical trajectory_to_rollouts normalization."""
+
+import json
+
+from openjiuwen.agent_evolving.agent_rl.schemas import trajectory_to_rollouts
+from openjiuwen.agent_evolving.trajectory.model import Trajectory
+from openjiuwen.agent_evolving.trajectory.spans import (
+    attributes_from_map,
+    write_llm_exchange,
+)
+from openjiuwen.extensions.observability import semconv
+
+
+def test_trajectory_to_rollouts_converts_assistant_message_response():
+    traj = _trajectory(
+        "e1",
+        {
+            f"{semconv.GEN_AI_REQUEST_MODEL}": "test-model",
+            **write_llm_exchange(
+                [{"role": "user", "content": "hi"}],
+                [{"role": "assistant", "content": "hello"}],
+            ),
+        },
+    )
+    rollouts = trajectory_to_rollouts(traj)
+    assert len(rollouts) == 1
+    assert rollouts[0].output_response is not None
+    assert rollouts[0].output_response["role"] == "assistant"
+    assert rollouts[0].output_response["content"] == "hello"
+    assert isinstance(rollouts[0].input_prompt["message"], list)
+    assert rollouts[0].input_prompt["message"][0]["role"] == "user"
+    assert rollouts[0].input_prompt["message"][0]["content"] == "hi"
+
+
+def test_trajectory_to_rollouts_keeps_dict_response():
+    traj = _trajectory(
+        "e2",
+        {
+            f"{semconv.GEN_AI_REQUEST_MODEL}": "m",
+            **write_llm_exchange([], [{"role": "assistant", "content": "ok"}]),
+        },
+    )
+    rollouts = trajectory_to_rollouts(traj)
+    assert rollouts[0].output_response == {"role": "assistant", "content": "ok"}
+
+
+def test_reasoning_is_its_own_field_of_the_response():
+    traj = _trajectory(
+        "e-reasoning",
+        {
+            semconv.GEN_AI_OUTPUT_MESSAGES: json.dumps(
+                [
+                    {
+                        "role": "assistant",
+                        "parts": [
+                            {"type": "reasoning", "content": "think first"},
+                            {"type": "text", "content": "answer"},
+                        ],
+                    }
+                ]
+            ),
+        },
+    )
+
+    rollouts = trajectory_to_rollouts(traj)
+
+    assert rollouts[0].output_response == {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_content": "think first",
+    }
+
+
+def test_compaction_requests_are_not_rollouts():
+    traj = _trajectory(
+        "e-compaction",
+        {
+            semconv.OJ_REQUEST_PURPOSE: "compaction",
+            **write_llm_exchange(
+                [{"role": "user", "content": "summarize the conversation"}],
+                [{"role": "assistant", "content": "summary"}],
+            ),
+        },
+    )
+
+    assert trajectory_to_rollouts(traj) == []
+
+
+def test_trajectory_to_rollouts_projects_otlp_token_tools_and_meta_fields():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    response = {
+        "role": "assistant",
+        "content": "calling lookup",
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": '{"q": "hi"}'},
+            }
+        ],
+    }
+    traj = _trajectory(
+        "e3",
+        {
+            f"{semconv.GEN_AI_REQUEST_MODEL}": "test-model",
+            **write_llm_exchange(
+                [
+                    {"role": "system", "content": "be concise"},
+                    {"role": "user", "content": "hi"},
+                ],
+                [{"role": "assistant", "content": "calling lookup", "tool_calls": response["tool_calls"]}],
+            ),
+            semconv.GEN_AI_TOOL_DEFINITIONS: json.dumps(tools),
+            "evolution.rl.prompt_token_ids": [101, 102, 103],
+            "evolution.rl.completion_token_ids": [201, 202],
+            "llm_config": {"temperature": 0.2},
+        },
+    )
+
+    rollouts = trajectory_to_rollouts(traj)
+
+    assert len(rollouts) == 1
+    rollout = rollouts[0]
+    assert rollout.turn_id == 0
+    assert rollout.input_prompt == {
+        "message": [
+            {"role": "system", "content": "be concise"},
+            {"role": "user", "content": "hi"},
+        ],
+        "tools": tools,
+    }
+    # Standard GenAI output messages carry a tool call as a flat part.
+    assert rollout.output_response == {
+        "role": "assistant",
+        "content": "calling lookup",
+        "tool_calls": [{"id": "call-1", "name": "lookup", "arguments": '{"q": "hi"}'}],
+    }
+    assert rollout.input_prompt_ids == [101, 102, 103]
+    assert rollout.output_response_ids == [201, 202]
+    assert rollout.llm_config == {"temperature": 0.2}
+
+
+def _trajectory(execution_id: str, span_attributes: dict) -> Trajectory:
+    return Trajectory.from_otlp(
+        {
+            "resourceSpans": [
+                {
+                    "resource": {
+                        "attributes": attributes_from_map(
+                            {
+                                "openjiuwen.trajectory_id": execution_id,
+                                semconv.GEN_AI_CONVERSATION_ID: "session-1",
+                                "openjiuwen.trajectory.source": "rl_offline",
+                            }
+                        )
+                    },
+                    "scopeSpans": [
+                        {
+                            "spans": [
+                                {
+                                    "traceId": "trace-1",
+                                    "spanId": "llm-1",
+                                    "name": "llm.call",
+                                    "attributes": attributes_from_map(span_attributes),
+                                }
+                            ]
+                        }
+                    ],
+                }
+            ]
+        }
+    )

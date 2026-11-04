@@ -1,0 +1,306 @@
+# -*- coding: UTF-8 -*-
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+import asyncio
+from abc import ABC
+from typing import AsyncIterator, Optional, TypeVar
+
+from openjiuwen.core.common.exception.errors import build_error
+from openjiuwen.core.common.logging import LogEventType, workflow_logger as logger
+from openjiuwen.core.graph.base import Graph
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.context_engine import ModelContext
+from openjiuwen.core.graph.executable import Executable
+from openjiuwen.core.session import with_session_for_class
+from openjiuwen.core.session.session import BaseSession
+from openjiuwen.core.session.internal.workflow import NodeSession
+from openjiuwen.core.session.node import Session
+
+Input = TypeVar("Input", contravariant=True)
+Output = TypeVar("Output", contravariant=True)
+
+
+def _apply_callback_framework_to_executable(cls: type) -> None:
+    """Wrap on_invoke/on_stream/on_collect/on_transform with callback framework for trigger support (once per class)."""
+    try:
+        from openjiuwen.core.runner.callback.utils import lazy_callback_framework
+        from openjiuwen.core.runner.callback.events import WorkflowEvents
+        _fw = lazy_callback_framework
+
+        if "on_invoke" in cls.__dict__:
+            fn = cls.__dict__["on_invoke"]
+            fn = _fw.emit_before(WorkflowEvents.COMPONENT_BATCH_INPUT)(fn)
+            fn = _fw.transform_io(
+                input_event=WorkflowEvents.COMPONENT_BATCH_INPUT,
+                output_event=WorkflowEvents.COMPONENT_BATCH_OUTPUT,
+            )(fn)
+            fn = _fw.emit_after(WorkflowEvents.COMPONENT_BATCH_OUTPUT)(fn)
+            setattr(cls, "on_invoke", fn)
+
+        if "on_stream" in cls.__dict__:
+            fn = cls.__dict__["on_stream"]
+            fn = _fw.emit_before(WorkflowEvents.COMPONENT_BATCH_INPUT)(fn)
+            fn = _fw.transform_io(
+                input_event=WorkflowEvents.COMPONENT_BATCH_INPUT,
+                output_event=WorkflowEvents.COMPONENT_STREAM_OUTPUT,
+            )(fn)
+            fn = _fw.emit_after(WorkflowEvents.COMPONENT_STREAM_OUTPUT)(fn)
+            setattr(cls, "on_stream", fn)
+
+        if "on_collect" in cls.__dict__:
+            fn = cls.__dict__["on_collect"]
+            fn = _fw.emit_before(WorkflowEvents.COMPONENT_STREAM_INPUT)(fn)
+            fn = _fw.transform_io(
+                input_event=WorkflowEvents.COMPONENT_STREAM_INPUT,
+                output_event=WorkflowEvents.COMPONENT_BATCH_OUTPUT,
+            )(fn)
+            fn = _fw.emit_after(WorkflowEvents.COMPONENT_BATCH_OUTPUT)(fn)
+            setattr(cls, "on_collect", fn)
+
+        if "on_transform" in cls.__dict__:
+            fn = cls.__dict__["on_transform"]
+            fn = _fw.emit_before(WorkflowEvents.COMPONENT_STREAM_INPUT)(fn)
+            fn = _fw.transform_io(
+                input_event=WorkflowEvents.COMPONENT_STREAM_INPUT,
+                output_event=WorkflowEvents.COMPONENT_STREAM_OUTPUT,
+            )(fn)
+            fn = _fw.emit_after(WorkflowEvents.COMPONENT_STREAM_OUTPUT)(fn)
+            setattr(cls, "on_transform", fn)
+    except Exception as e:
+        logger.debug(
+            "Callback framework registration skipped",
+            event_type=LogEventType.WORKFLOW_COMPONENT_ERROR,
+            metadata={"error": str(e)}
+        )
+
+
+@with_session_for_class
+class ComponentExecutable(Executable):
+    """
+    Interface for executable components in a workflow.
+
+    Defines the four fundamental execution patterns for components:
+    1. Invoke - Synchronous batch processing
+    2. Stream - Streaming output from batch input
+    3. Collect - Batch output from streaming input
+    4. Transform - Streaming to streaming transformation
+
+    This interface allows components to support different I/O patterns
+    based on their capabilities and use cases.
+    """
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        _apply_callback_framework_to_executable(cls)
+
+    async def on_invoke(self, inputs: Input, session: BaseSession, **kwargs) -> Output:
+        if not isinstance(session, NodeSession):
+            raise build_error(StatusCode.WORKFLOW_INNER_ORCHESTRATION_ERROR,
+                              reason="session type must be NodeSession when on_invoke")
+        return await self.invoke(inputs, Session(session, False), kwargs.get("context"))
+
+    async def on_stream(self, inputs: Input, session: BaseSession, **kwargs) -> AsyncIterator[Output]:
+        if not isinstance(session, NodeSession):
+            raise build_error(StatusCode.WORKFLOW_INNER_ORCHESTRATION_ERROR,
+                              reason="session type must be NodeSession when on_stream")
+
+        async for value in self.stream(inputs, Session(session, False), kwargs.get("context")):
+            yield value
+
+    async def on_collect(self, inputs: Input, session: BaseSession, **kwargs) -> Output:
+        if not isinstance(session, NodeSession):
+            raise build_error(StatusCode.WORKFLOW_INNER_ORCHESTRATION_ERROR,
+                              reason="session type must be NodeSession when on_collect")
+
+        return await self.collect(inputs, Session(session, True), kwargs.get("context"))
+
+    async def on_transform(self, inputs: Input, session: BaseSession, **kwargs) -> AsyncIterator[Output]:
+        if not isinstance(session, NodeSession):
+            raise build_error(StatusCode.WORKFLOW_INNER_ORCHESTRATION_ERROR,
+                              reason="session is not NodeSession when on_transform")
+
+        async for value in self.transform(inputs, Session(session, True), kwargs.get("context")):
+            yield value
+
+    def trace_metadata(self) -> Optional[dict]:
+        """Static facts this component wants on its workflow trace span.
+
+        Called once per execution when the component span opens; the returned
+        mapping is merged into the component metadata passed to tracer
+        extension handlers.  Values must be primitives or lists of primitives
+        (they become OTel span attributes).  ``None`` (default) adds nothing.
+
+        Retrieval components override this to export top_k / data source ids /
+        the agentic model id; see KnowledgeRetrievalExecutable.
+        """
+        return None
+
+    async def invoke(self, inputs: Input, session: Session, context: ModelContext) -> Output:
+        """
+        Execute component synchronously with batch input and output.
+
+        Args:
+            inputs: Batch input data
+            session: Current execution session
+            context: Context engine
+
+        Returns:
+            Output: Batch output data
+
+        Note:
+            This is the most common execution pattern for simple operations.
+        """
+        class_name = type(self).__name__
+        method_name = "stream"
+
+        raise NotImplementedError(
+            f"Component '{class_name}' is missing required method: {method_name}()\n"
+            f"  → Expected signature: async def {method_name}(self, inputs: Input, session: Session, "
+            f"context: ModelContext) -> AsyncIterator[Output]"
+        )
+
+    async def stream(self, inputs: Input, session: Session, context: ModelContext) -> AsyncIterator[Output]:
+        """
+        Execute component with batch input but streaming output.
+
+        Args:
+            inputs: Batch input data
+            session: Current execution session
+            context:  Context engine
+
+        Returns:
+            AsyncIterator[Output]: Async iterator that yields output chunks
+
+        Note:
+            Useful for long-running operations or real-time data generation.
+        """
+        class_name = type(self).__name__
+        method_name = "stream"
+
+        raise NotImplementedError(
+            f"Component '{class_name}' is missing required method: {method_name}()\n"
+            f"  → Expected signature: async def {method_name}(self, inputs: Input, session: Session, "
+            f"context: ModelContext) -> AsyncIterator[Output]"
+        )
+
+    async def collect(self, inputs: Input, session: Session, context: ModelContext) -> Output:
+        """
+        Execute component with streaming input but batch output.
+
+        Args:
+            inputs: Streaming input data (async iterator)
+            session: Current execution session
+            context: Context engine
+
+        Returns:
+            Output: Batch output collected from all input chunks
+
+        Note:
+            Useful for aggregating streaming data into a single result.
+        """
+        class_name = type(self).__name__
+        method_name = "collect"
+
+        raise NotImplementedError(
+            f"Component '{class_name}' is missing required method: {method_name}()\n"
+            f"  → Expected signature: async def {method_name}(self, inputs: Input, session: Session, "
+            f"context: ModelContext) -> Output"
+        )
+
+    async def transform(self, inputs: Input, session: Session, context: ModelContext) -> AsyncIterator[Output]:
+        """ Execute component with streaming input and streaming output.
+
+         Args:
+             inputs: Streaming input data (async iterator)
+             session: Current execution session
+             context: Context engine
+
+         Returns:
+             AsyncIterator[Output]: Async iterator that yields transformed output chunks
+
+         Note:
+             This is the most general pattern for real-time data processing pipelines.
+         """
+        class_name = type(self).__name__
+        method_name = "transform"
+
+        raise NotImplementedError(
+            f"Component '{class_name}' is missing required method: {method_name}()\n"
+            f"  → Expected signature: async def {method_name}(self, inputs: Input, session: Session, "
+            f"context: ModelContext) -> AsyncIterator[Output]"
+        )
+
+
+_apply_callback_framework_to_executable(ComponentExecutable)
+
+
+class ComponentComposable(ABC):
+    """
+    Abstract base class for workflow graph construction.
+
+    This class is responsible for defining how a component integrates
+    into a workflow graph. It separates the construction logic from
+    the execution logic defined in ComponentExecutable.
+
+    Components implementing this interface can describe their
+    graph structure independently of their runtime behavior.
+    """
+
+    def add_component(self, graph: Graph, node_id: str, wait_for_all: bool = False) -> None:
+        """
+        Add this component to a workflow graph.
+
+        Args:
+            graph: The workflow graph to add this component to
+            node_id: Unique identifier for this component node
+            wait_for_all: If True, wait for all predecessor outputs before execution
+
+        Note:
+            This method defines the component's position and connections
+            within the larger workflow graph.
+        """
+        graph.add_node(node_id, self.to_executable(), wait_for_all=wait_for_all)
+
+    def to_executable(self) -> Executable:
+        """
+        Convert this workflow component to an executable instance.
+
+        Returns:
+            ComponentExecutable: An executable instance of this component
+
+        Note:
+            This method creates the runtime representation of the component
+            that can actually execute the business logic.
+        """
+        if isinstance(self, Executable):
+            return self
+        class_name = type(self).__name__
+        method_name = "to_executable"
+
+        raise NotImplementedError(
+            f"Component '{class_name}' is missing required method: {method_name}()\n"
+            f"  → Expected signature: def {method_name}(self) -> Executable"
+        )
+
+
+class WorkflowComponent(ComponentExecutable, ComponentComposable):
+    """
+    Standard implementation combining both execution and graph construction.
+
+    This class provides a complete component implementation that:
+    1. Can be executed (implements ComponentExecutable)
+    2. Can be added to workflow graphs (implements ComponentComposable)
+
+    This is the most common base class for user-defined components
+    that need both construction-time and runtime capabilities.
+
+    Example:
+        class MyComponent(WorkflowComponent):
+            async def invoke(self, inputs, runtime, context):
+                # Implementation here
+                pass
+
+            def add_component(self, graph, node_id, wait_for_all=False):
+                # Add to graph logic here
+                pass
+    """
+    ...

@@ -1,0 +1,1415 @@
+# -*- coding: UTF-8 -*-
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+"""
+IntelliRouter Model Client — wraps intelli_router.ReliableRouter.
+"""
+import atexit
+import asyncio
+import hashlib
+import inspect
+import json
+import time
+from dataclasses import dataclass, field, fields
+from threading import Lock
+from typing import List, Optional, AsyncIterator, Union, Dict, Any
+
+from openjiuwen.core.foundation.llm.model_clients.base_model_client import BaseModelClient
+from openjiuwen.core.foundation.llm.routing.intelli_router_errors import (
+    ROUTER_ERROR_TYPES,
+    ROUTING_RECORD_EVENTS,
+    record_routing_event,
+    to_model_error,
+    cooldown_remaining,
+    pinned_route_tag,
+    routing_candidates,
+)
+from openjiuwen.core.foundation.llm.schema.message import (
+    BaseMessage, AssistantMessage, UserMessage, UsageMetadata
+)
+from openjiuwen.core.foundation.llm.schema.tool_call import ToolCall
+from openjiuwen.core.foundation.llm.schema.message_chunk import AssistantMessageChunk
+from openjiuwen.core.foundation.llm.schema.config import ModelRequestConfig, ModelClientConfig
+from openjiuwen.core.foundation.tool import ToolInfo
+from openjiuwen.core.foundation.llm.output_parsers.output_parser import BaseOutputParser
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import build_error, ModelError, ValidationError
+from openjiuwen.core.common.logging import llm_logger, logger
+from openjiuwen.core.runner.callback import trigger
+from openjiuwen.core.runner.callback.events import LLMCallEvents
+from openjiuwen.core.foundation.llm.schema.generation_response import (
+    ImageGenerationResponse,
+    AudioGenerationResponse,
+    VideoGenerationResponse,
+)
+
+try:
+    from intelli_router import ReliableRouter, Deployment
+except ImportError:
+    ReliableRouter = None
+    Deployment = None
+
+
+ROUTED_MODEL_PLACEHOLDER = "<routed-model/>"
+"""Prompt text a model-group router replaces with the model it routed to.
+
+A model group picks its deployment inside each call, after the prompt is
+built, so a prompt cannot name that model up front. A prompt writes this
+placeholder instead; right before sending each attempt the router replaces it
+with :func:`routed_model_label` of the deployment that attempt goes to. A
+failover attempt therefore names its own model, never the failed one.
+"""
+
+
+def routed_model_label(deployment: Any) -> str:
+    """Name a deployment the way model-group members see it.
+
+    The deployment's ``fallback_tag`` is the model name configured for the
+    group (the names offered as selectable models); ``model_name`` is the
+    provider-facing name, used when no tag is configured.
+    """
+    return str(getattr(deployment, "fallback_tag", None) or getattr(deployment, "model_name", None) or "").strip()
+
+
+def has_routed_model_placeholder(text: str) -> bool:
+    """Whether ``text`` carries the routed-model placeholder."""
+    return ROUTED_MODEL_PLACEHOLDER in text
+
+
+def fill_routed_model(text: str, label: str) -> str:
+    """Replace every routed-model placeholder in ``text`` with ``label``."""
+    return text.replace(ROUTED_MODEL_PLACEHOLDER, label)
+
+
+def _fill_routed_model(messages: list[dict[str, Any]], label: str) -> list[dict[str, Any]]:
+    """Return ``messages`` with every placeholder replaced by ``label``.
+
+    Only messages that carry the placeholder are copied; ``messages`` itself
+    is never mutated, since the router reuses it for every attempt.
+    """
+    filled: list[dict[str, Any]] = []
+    changed = False
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str) and has_routed_model_placeholder(content):
+            message = {**message, "content": fill_routed_model(content, label)}
+            changed = True
+        elif isinstance(content, list) and any(
+            isinstance(part, dict) and has_routed_model_placeholder(str(part.get("text") or "")) for part in content
+        ):
+            parts = [
+                {**part, "text": fill_routed_model(part["text"], label)}
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+                else part
+                for part in content
+            ]
+            message = {**message, "content": parts}
+            changed = True
+        filled.append(message)
+    return filled if changed else messages
+
+
+class _RoutedModelAdapter:
+    """Provider adapter that fills the routed-model placeholder of a request."""
+
+    def __init__(self, adapter: Any) -> None:
+        self._adapter = adapter
+
+    def transform_request(self, model: str, messages: list[dict[str, Any]], deployment: Any, **kwargs: Any) -> Any:
+        # The label is never empty for a routed deployment (it falls back to
+        # the deployment's model name); the ``or`` guard is the boundary of
+        # the placeholder contract: even a malformed deployment must not send
+        # the literal ``<routed-model/>`` to a provider.
+        label = routed_model_label(deployment) or str(getattr(deployment, "model_name", "") or "unknown")
+        messages = _fill_routed_model(messages, label)
+        return self._adapter.transform_request(model=model, messages=messages, deployment=deployment, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._adapter, name)
+
+
+class _RoutedModelRouterMixin:
+    """Makes a ReliableRouter name the routed model in the request it sends.
+
+    Every attempt -- the first one and each failover -- builds its request
+    through ``_get_adapter(deployment).transform_request``, after the
+    deployment is chosen and before anything is sent: the one point where the
+    prompt can name exactly the model that will read it. Route events carry
+    the same name as ``routed_model``.
+
+    Each attempt is also announced as ``LLM_ROUTE_ATTEMPT`` when it is sent,
+    before any response: a request that fails before answering still names
+    the model it went to (``LLM_ROUTE`` only fires once a route answers).
+    """
+
+    def _get_adapter(self, deployment: Any) -> Any:
+        # The explicit two-argument super keeps ``self`` visible: the call is
+        # identical to bare ``super()`` but passes the instance checks that
+        # flag a method that never names its instance.
+        return _RoutedModelAdapter(super(_RoutedModelRouterMixin, self)._get_adapter(deployment))
+
+    def _route_metadata(self, deployment: Any, **extra: Any) -> dict[str, Any]:
+        metadata = super(_RoutedModelRouterMixin, self)._route_metadata(deployment, **extra)
+        label = routed_model_label(deployment)
+        if label:
+            metadata["routed_model"] = label
+        return metadata
+
+    async def _announce_route_attempt(self, deployment: Any) -> None:
+        try:
+            metadata = self._route_metadata(deployment)
+            if not metadata.get("model_group_id"):
+                return
+            metadata["status"] = "sending"
+            # Log first, then announce: an observer failing must not cost the
+            # log line. LLM_ROUTE_ATTEMPT has a subscriber whenever the
+            # observability extension is active (it maps onto the same
+            # handler as LLM_ROUTE); without one the trigger is a no-op and
+            # this log is the only record of the attempt.
+            self._log_route_selection(deployment, metadata)
+            await trigger(LLMCallEvents.LLM_ROUTE_ATTEMPT, route_metadata=metadata)
+        except Exception as exc:  # noqa: BLE001 - announcing must never fail the request
+            llm_logger.debug("model group route attempt announce failed: %s", exc)
+
+    def _log_route_selection(self, deployment: Any, metadata: dict[str, Any]) -> None:
+        """Log every model-group attempt, traced or not.
+
+        A group call made outside any trace context (background warmups,
+        session bootstrap) leaves no span and no event record; without this
+        line its only footprint -- the cooldown a failure of it sets -- is
+        invisible, and the next call skipping a position looks unexplained.
+        """
+        now = time.time()
+        selected = str(getattr(deployment, "id", ""))
+        skipped = []
+        for candidate in routing_candidates(self, pinned_route_tag(self), None):
+            candidate_id = str(getattr(candidate, "id", ""))
+            if candidate_id == selected:
+                continue
+            remaining = cooldown_remaining(self, candidate_id, now)
+            if remaining is not None:
+                skipped.append(f"{routed_model_label(candidate)}({remaining:.0f}s)")
+        llm_logger.info(
+            "model group route: group=%s model=%s route=%s%s",
+            metadata.get("model_group_id"),
+            metadata.get("routed_model") or metadata.get("model_name"),
+            metadata.get("route_id"),
+            f" cooldown_skipped={skipped}" if skipped else "",
+        )
+
+    async def _make_request(self, deployment: Any, request_body: Any) -> Any:
+        await self._announce_route_attempt(deployment)
+        return await super()._make_request(deployment, request_body)
+
+    async def acompletion_stream(self, model: str, messages: Any, deployment: Any = None, **kwargs: Any):
+        if deployment is not None:
+            await self._announce_route_attempt(deployment)
+        async for chunk in super().acompletion_stream(model=model, messages=messages, deployment=deployment, **kwargs):
+            yield chunk
+
+
+# ReliableRouter class -> its routed-model subclass (built on first use, so a
+# substituted ReliableRouter is subclassed too).
+_routed_model_router_classes: dict[type, type] = {}
+
+
+def _routed_model_router_class(base: type) -> type:
+    """Return ``base`` extended with :class:`_RoutedModelRouterMixin`."""
+    if base not in _routed_model_router_classes:
+        _routed_model_router_classes[base] = type(base.__name__, (_RoutedModelRouterMixin, base), {})
+    return _routed_model_router_classes[base]
+
+
+@dataclass
+class IntelliRouterClientConfig:
+    """Typed config extracted from ModelClientConfig"""
+    model_group_id: Optional[str] = None
+    deployments: list[dict[str, Any]] = field(default_factory=list)
+    strategy: str = "simple-shuffle"
+    num_retries: int = 3
+    timeout: float = 30.0
+    strategy_kwargs: dict[str, Any] = field(default_factory=dict)
+    enable_health_check: bool = False
+    health_check_interval: float = 300.0
+    verify_ssl: bool = True
+    enable_observability: bool = False
+    web_dashboard_port: int = 0
+    router_scope: Optional[str] = None
+
+    @classmethod
+    def from_model_client_config(cls, config: ModelClientConfig) -> "IntelliRouterClientConfig":
+        """Extract IntelliRouter config from ModelClientConfig."""
+        if config.intelli_router is not None:
+            router_config = config.intelli_router
+            return cls(
+                model_group_id=router_config.model_group_id,
+                deployments=[
+                    deployment.model_dump(exclude_none=True)
+                    for deployment in router_config.deployments
+                ],
+                strategy=router_config.strategy,
+                num_retries=(
+                    router_config.num_retries
+                    if router_config.num_retries is not None
+                    else max(len(router_config.deployments) - 1, 0)
+                ),
+                timeout=router_config.timeout,
+                strategy_kwargs=router_config.strategy_kwargs,
+                enable_health_check=router_config.enable_health_check,
+                health_check_interval=router_config.health_check_interval,
+                verify_ssl=config.verify_ssl,
+                enable_observability=router_config.enable_observability,
+                web_dashboard_port=router_config.web_dashboard_port,
+                router_scope=getattr(router_config, "router_scope", None),
+            )
+
+        extra = config.__pydantic_extra__ or {}
+        return cls(
+            model_group_id=extra.get("intelli_router_model_group_id"),
+            deployments=extra.get("intelli_router_deployments", []),
+            strategy=extra.get("intelli_router_strategy", "simple-shuffle"),
+            num_retries=extra.get("intelli_router_num_retries", 3),
+            timeout=extra.get("intelli_router_timeout", 30.0),
+            strategy_kwargs=extra.get("intelli_router_strategy_kwargs", {}),
+            enable_health_check=extra.get("intelli_router_enable_health_check", False),
+            health_check_interval=extra.get("intelli_router_health_check_interval", 300.0),
+            verify_ssl=config.verify_ssl,
+            enable_observability=extra.get("intelli_router_enable_observability", False),
+            web_dashboard_port=extra.get("intelli_router_web_dashboard_port", 0),
+        )
+
+
+@dataclass
+class _RouterCacheEntry:
+    """A cached router plus the event loop its httpx pool is bound to.
+
+    ReliableRouter creates its httpx.AsyncClient lazily on first request, so
+    pooled connections bind to the loop that first invoked it; reusing that
+    router on another loop reuses dead connections ("Event loop is closed").
+    ``loop`` stays None until first use; a mismatch with the running loop
+    then triggers a rebuild (see _ensure_router_for_current_loop).
+    """
+
+    router: "ReliableRouter"
+    loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+# Module-level router cache: same config -> same ReliableRouter instance
+_router_cache: dict[str, "_RouterCacheEntry"] = {}
+_router_cache_lock: Lock = Lock()
+
+# Track web servers for lifecycle management (keyed by router cache key)
+_web_servers: dict[str, Any] = {}
+
+
+def _shutdown_web_servers():
+    """Stop all active MetricsWebServer instances on process exit."""
+    for server in _web_servers.values():
+        try:
+            server.stop()
+        except Exception as e:
+            logger.error(f"shutdown web server failed: {e}")
+    _web_servers.clear()
+
+
+def _stop_web_server(cache_key: str) -> None:
+    """Stop the dashboard web server tied to an evicted router cache entry.
+
+    A rebuild re-runs _create_router for the same cache key; stopping the old
+    server first lets the replacement bind the dashboard port again and keeps
+    _web_servers free of orphans the atexit hook can no longer reach.
+    """
+    server = _web_servers.pop(cache_key, None)
+    if server is None:
+        return
+    try:
+        server.stop()
+    except (OSError, RuntimeError) as e:
+        logger.error(f"stop web server failed: {e}")
+
+
+atexit.register(_shutdown_web_servers)
+
+# Map each provider to the generation APIs it supports
+_GENERATION_SUPPORT: Dict[str, set] = {
+    "dashscope": {"image", "speech", "video"},
+}
+
+
+class _CoreRoutingEventBridge:
+    """Bridge intelli_router routing events into openJiuwen callbacks."""
+
+    _SELECTED_EVENTS = {"request_succeeded", "stream_route_selected"}
+    _FAILED_EVENTS = {"all_deployments_exhausted"}
+    _ROUTE_METADATA_FIELDS = {
+        "model_group_id",
+        "route_id",
+        "model_id",
+        "model_name",
+        "routed_model",
+        "provider",
+        "attempt",
+        "fallback_reason",
+        "ttft",
+    }
+
+    @property
+    def name(self) -> str:
+        return self.__class__.__name__
+
+    async def handle_event(self, event: Any) -> None:
+        event_type = self._event_type_value(event)
+        if event_type == "request_retried":
+            self._log_route_failover(event)
+        if event_type in ROUTING_RECORD_EVENTS:
+            # The router keeps no failure reasons; record them for error messages.
+            record_routing_event(event)
+        payload = self._payload_from_event(event)
+        if payload is None:
+            return
+        await trigger(
+            LLMCallEvents.LLM_ROUTE,
+            route_metadata=payload,
+            routing_event=event,
+        )
+
+    @staticmethod
+    def _event_type_value(event: Any) -> str:
+        event_type = getattr(getattr(event, "event_type", None), "value", None)
+        if event_type is None:
+            event_type = str(getattr(event, "event_type", "") or "")
+        return event_type
+
+    @classmethod
+    def _log_route_failover(cls, event: Any) -> None:
+        """Record the route that failed before the router tries the next one."""
+        extra = getattr(event, "extra", None)
+        if not isinstance(extra, dict):
+            extra = {}
+        route_id = extra.get("route_id") or getattr(event, "deployment_id", None)
+        provider = extra.get("provider") or getattr(event, "provider", None)
+        error_type = getattr(event, "error_type", None) or extra.get("fallback_reason")
+        llm_logger.warning(
+            "model group route failed, trying the next candidate: "
+            "model_group_id=%s route_id=%s model_name=%s provider=%s "
+            "attempt=%s/%s error_type=%s error_message=%s",
+            extra.get("model_group_id"),
+            route_id,
+            extra.get("model_name"),
+            provider,
+            getattr(event, "attempt", None),
+            getattr(event, "total_attempts", None),
+            error_type,
+            getattr(event, "error_message", None),
+        )
+
+    @classmethod
+    def _payload_from_event(cls, event: Any) -> dict[str, Any] | None:
+        event_type = cls._event_type_value(event)
+
+        if event_type in cls._SELECTED_EVENTS:
+            status = "selected"
+        elif event_type in cls._FAILED_EVENTS:
+            status = "failed"
+        else:
+            return None
+
+        extra = getattr(event, "extra", None)
+        if not isinstance(extra, dict) or not extra.get("model_group_id"):
+            return None
+
+        payload = {
+            key: extra[key]
+            for key in cls._ROUTE_METADATA_FIELDS
+            if extra.get(key) is not None
+        }
+        payload["status"] = status
+        for key in ("attempt", "total_attempts", "error_type", "error_message", "chunk_count"):
+            value = getattr(event, key, None)
+            if value:
+                payload.setdefault(key, value)
+        payload.setdefault("result_type", "error" if status == "failed" else "answer")
+        return payload
+
+
+class IntelliRouterModelClient(BaseModelClient):
+    """
+    IntelliRouter Model Client — wraps intelli_router.ReliableRouter.
+
+    Provides API pooling, smart routing, auto retry, streaming support,
+    and multimodal generation (image/speech/video).
+    """
+    __client_name__ = "intelli_router"
+
+    def __init__(
+        self,
+        model_config: ModelRequestConfig,
+        model_client_config: ModelClientConfig,
+        router: Optional["ReliableRouter"] = None,
+    ):
+        super().__init__(model_config, model_client_config)
+        if router is not None:
+            self._router = router
+            self._router_config = None
+            self._router_key = None
+        else:
+            self._router_config = IntelliRouterClientConfig.from_model_client_config(model_client_config)
+            self._router = self._get_or_create_router(self._router_config)
+            self._router_key = self._make_router_key(self._router_config)
+
+    @staticmethod
+    def _make_router_key(config: IntelliRouterClientConfig) -> str:
+        """Generate a deterministic cache key from router config."""
+        deployments_json = json.dumps(config.deployments, sort_keys=True)
+        kwargs_json = json.dumps(config.strategy_kwargs, sort_keys=True)
+        raw = (
+            f"{config.model_group_id}|{deployments_json}|{config.strategy}|{kwargs_json}|"
+            f"{config.num_retries}|{config.timeout}|"
+            f"{config.enable_health_check}|{config.health_check_interval}|"
+            f"{config.verify_ssl}|{config.enable_observability}|"
+            f"{config.web_dashboard_port}|{config.router_scope}"
+        )
+        return hashlib.md5(raw.encode()).hexdigest()
+
+    @classmethod
+    def _get_or_create_router(cls, config: IntelliRouterClientConfig) -> "ReliableRouter":
+        """Get a ReliableRouter from cache or create & cache a new one."""
+        key = cls._make_router_key(config)
+        entry = _router_cache.get(key)
+        if entry is None:
+            with _router_cache_lock:
+                # Capture the entry under the lock and return it directly:
+                # another thread's eviction must not turn an unlocked
+                # ``_router_cache[key]`` read below into a KeyError.
+                entry = _router_cache.get(key)
+                if entry is None:
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None  # built from sync context; claimed on first use
+                    entry = _RouterCacheEntry(
+                        router=cls._create_router(config, cache_key=key),
+                        loop=loop,
+                    )
+                    _router_cache[key] = entry
+        return entry.router
+
+    @classmethod
+    def _create_router(cls, config: IntelliRouterClientConfig, cache_key: str = ""):
+        """Create a ReliableRouter from IntelliRouterClientConfig."""
+        if ReliableRouter is None or Deployment is None:
+            raise build_error(
+                StatusCode.MODEL_RUNTIME_UNAVAILABLE,
+                error_msg="intelli_router package is not installed. Please install it with: pip install intelli-router"
+            )
+
+        deployments = []
+        deployment_fields = {item.name for item in fields(Deployment)}
+        required_new_fields = {
+            "request_defaults",
+            "endpoint_profile",
+            "custom_headers",
+            "model_id",
+            "fallback_tag",
+            "model_description",
+        }
+        for dep_cfg in config.deployments:
+            unsupported_fields = sorted(
+                key for key in required_new_fields
+                if key in dep_cfg and key not in deployment_fields
+            )
+            if unsupported_fields:
+                raise build_error(
+                    StatusCode.MODEL_RUNTIME_UNAVAILABLE,
+                    error_msg=(
+                        "installed intelli_router package does not support deployment fields: "
+                        f"{unsupported_fields}. Please upgrade intelli-router."
+                    )
+                )
+            dep_kwargs = {
+                "id": dep_cfg.get("route_id") or dep_cfg.get("id"),
+                "model_id": dep_cfg.get("model_id"),
+                "model_name": dep_cfg.get("model_name"),
+                "api_key": dep_cfg.get("api_key"),
+                "api_base": dep_cfg.get("api_base"),
+                "provider": dep_cfg.get("provider", "openai"),
+                "tpm": dep_cfg.get("tpm"),
+                "rpm": dep_cfg.get("rpm"),
+                "tags": dep_cfg.get("tags", []),
+                "timeout": dep_cfg.get("timeout"),
+                "verify_ssl": dep_cfg.get("verify_ssl", config.verify_ssl),
+                "request_defaults": dep_cfg.get("request_defaults", {}),
+                "endpoint_profile": dep_cfg.get("endpoint_profile"),
+                "custom_headers": dep_cfg.get("custom_headers"),
+                "fallback_tag": dep_cfg.get("fallback_tag"),
+                "model_description": dep_cfg.get("model_description"),
+            }
+            dep = Deployment(**{
+                key: value for key, value in dep_kwargs.items()
+                if key in deployment_fields
+            })
+            deployments.append(dep)
+
+        event_bus = cls._create_event_bus_with_core_bridge()
+        metrics_collector = None
+        if config.enable_observability:
+            try:
+                from intelli_router import EventBus, LoggingHook, MetricsCollector
+                if event_bus is None:
+                    event_bus = EventBus()
+                    event_bus.register(_CoreRoutingEventBridge())
+                event_bus.register(LoggingHook(format="text"))
+                metrics_collector = MetricsCollector()
+                event_bus.register(metrics_collector)
+            except ImportError:
+                logger.warning("intelli_router observability modules not available, skipping")
+                if config.web_dashboard_port > 0:
+                    logger.warning("web dashboard will also be skipped due to missing observability modules")
+
+        if config.web_dashboard_port > 0 and not config.enable_observability:
+            logger.warning(
+                "intelli_router_web_dashboard_port is set but enable_observability is False, "
+                "web dashboard requires observability enabled"
+            )
+
+        router = _routed_model_router_class(ReliableRouter)(
+            deployments=deployments,
+            strategy=config.strategy,
+            num_retries=config.num_retries,
+            timeout=config.timeout,
+            **cls._router_metadata_kwargs(config),
+            enable_health_check=config.enable_health_check,
+            health_check_interval=config.health_check_interval,
+            event_bus=event_bus,
+            **config.strategy_kwargs,
+        )
+
+        if config.web_dashboard_port > 0 and metrics_collector is not None:
+            try:
+                from intelli_router import MetricsWebServer
+                web_server = MetricsWebServer(metrics=metrics_collector, port=config.web_dashboard_port)
+                web_server.start()
+                if cache_key:
+                    _web_servers[cache_key] = web_server
+                logger.info("IntelliRouter web dashboard started at %s", web_server.url)
+            except ImportError:
+                logger.warning("intelli_router MetricsWebServer not available, skipping web dashboard")
+            except OSError as e:
+                logger.warning("Failed to start web dashboard on port %d: %s", config.web_dashboard_port, e)
+
+        return router
+
+    @staticmethod
+    def _create_event_bus_with_core_bridge() -> Any:
+        try:
+            from intelli_router import EventBus
+        except ImportError:
+            return None
+
+        event_bus = EventBus()
+        event_bus.register(_CoreRoutingEventBridge())
+        return event_bus
+
+    @staticmethod
+    def _router_metadata_kwargs(config: IntelliRouterClientConfig) -> dict[str, Any]:
+        if ReliableRouter is None:
+            return {}
+        init_params = inspect.signature(ReliableRouter).parameters
+        accepts_var_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in init_params.values()
+        )
+        metadata = {
+            "model_group_id": config.model_group_id,
+        }
+        unsupported = [
+            key for key, value in metadata.items()
+            if value is not None and key not in init_params and not accepts_var_kwargs
+        ]
+        if unsupported:
+            raise build_error(
+                StatusCode.MODEL_RUNTIME_UNAVAILABLE,
+                error_msg=(
+                    "installed intelli_router package does not support router fields: "
+                    f"{unsupported}. Please upgrade intelli-router."
+                )
+            )
+        return {
+            key: value for key, value in metadata.items()
+            if value is not None and (key in init_params or accepts_var_kwargs)
+        }
+
+    def _validate_config(self):
+        """Override — intelli_router does not require api_key or api_base at top level."""
+        pass
+
+    def _build_call_params(
+        self,
+        *,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        stop: Union[Optional[str], None] = None,
+    ) -> dict[str, Any]:
+        params = {
+            "temperature": temperature if temperature is not None else self.model_config.temperature,
+            "top_p": top_p if top_p is not None else self.model_config.top_p,
+            "max_tokens": max_tokens if max_tokens is not None else self.model_config.max_tokens,
+            "stop": stop if stop is not None else self.model_config.stop,
+        }
+        return {key: value for key, value in params.items() if value is not None}
+
+    async def _ensure_router_for_current_loop(self) -> None:
+        """Rebuild the cached router when the running event loop changed.
+
+        The cached router's httpx connection pool is bound to the loop that
+        first used it; loop-per-test runners (pytest-asyncio) carry dead
+        connections into a fresh loop, failing the first LLM call without a
+        real HTTP request. Concurrent use from multiple live loops is
+        unsupported (same as AsyncOpenAI); sequential reuse across retired
+        loops is the pattern guarded here.
+        """
+        router_config = self._router_config
+        if router_config is None or self._router_key is None:
+            return  # externally injected router: lifecycle owned by the caller
+        loop = asyncio.get_running_loop()
+        with _router_cache_lock:
+            entry = _router_cache.get(self._router_key)
+            if entry is not None:
+                if entry.loop is None:
+                    entry.loop = loop  # first real use: pool not bound to any loop yet
+                    self._router = entry.router
+                    return
+                if entry.loop is loop:
+                    self._router = entry.router  # follow a newer instance if replaced
+                    return
+                # Evict exactly the entry observed above; a replacement that
+                # another consumer installed after our read stays in the cache.
+                del _router_cache[self._router_key]
+        if entry is not None:  # evicted on loop mismatch (or cache cleared: rebuild only)
+            _stop_web_server(self._router_key)  # dashboard follows its router
+            try:
+                await entry.router.close()  # outside the lock, best-effort
+            except (RuntimeError, OSError) as e:
+                # Closing on a retired loop raises "Event loop is closed"; the
+                # pooled connections die with that loop either way.
+                logger.warning(f"Closing stale ReliableRouter failed: {e}")
+        self._router = self._get_or_create_router(router_config)
+
+    # ------------------------------------------------------------------
+    # Chat completion
+    # ------------------------------------------------------------------
+
+    async def invoke(
+        self,
+        messages: Union[str, List[BaseMessage], List[dict]],
+        *,
+        tools: Union[List[ToolInfo], List[dict], None] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        stop: Union[Optional[str], None] = None,
+        model: str = None,
+        output_parser: Optional[BaseOutputParser] = None,
+        timeout: float = None,
+        **kwargs
+    ) -> AssistantMessage:
+        await self._ensure_router_for_current_loop()
+        converted_messages = self._convert_messages_to_dict(messages)
+        model_name = model or self.model_config.model_name or "*"
+        params = self._build_call_params(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            stop=stop,
+        )
+
+        try:
+            result = await self._router.invoke(
+                messages=converted_messages,
+                tools=self._convert_tools_to_dict(tools),
+                model=model_name,
+                **params,
+                **kwargs
+            )
+        except ROUTER_ERROR_TYPES as exc:
+            # Fire the terminal error event before converting, like the other
+            # clients: without it the open trace span is force-closed later
+            # with no error recorded, reading like a normal call that
+            # answered nothing. Guarded: the trigger framework re-raises
+            # AbortError, and an observer aborting here must not replace the
+            # model error this block is about to report.
+            try:
+                await trigger(
+                    LLMCallEvents.LLM_CALL_ERROR,
+                    model_name=model_name,
+                    model_provider=self.model_client_config.client_provider,
+                    is_stream=False,
+                    error=exc,
+                    error_message=str(exc) or None,
+                )
+            except Exception:  # noqa: BLE001 - the model error outranks the observer
+                llm_logger.debug("llm call error announce failed", exc_info=True)
+            raise to_model_error(
+                exc, router=self._router, model_name=model_name, output_emitted=False,
+            ) from exc
+
+        # Map intelli_router types -> openjiuwen types
+        return await self._to_ow_assistant_message(result, output_parser)
+
+    async def stream(
+        self,
+        messages: Union[str, List[BaseMessage], List[dict]],
+        *,
+        tools: Union[List[ToolInfo], List[dict], None] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        stop: Union[Optional[str], None] = None,
+        model: str = None,
+        output_parser: Optional[BaseOutputParser] = None,
+        timeout: float = None,
+        **kwargs
+    ) -> AsyncIterator[AssistantMessageChunk]:
+        await self._ensure_router_for_current_loop()
+        converted_messages = self._convert_messages_to_dict(messages)
+        model_name = model or self.model_config.model_name or "*"
+        accumulated_for_parser = ""
+        params = self._build_call_params(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            stop=stop,
+        )
+
+        output_emitted = False
+        try:
+            async for chunk in self._router.stream(
+                messages=converted_messages,
+                tools=self._convert_tools_to_dict(tools),
+                model=model_name,
+                **params,
+                **kwargs
+            ):
+                converted = self._to_ow_chunk(chunk)
+                if converted.carries_output_token():
+                    output_emitted = True
+                if output_parser and converted.content:
+                    accumulated_for_parser += str(converted.content)
+                    try:
+                        parsed = await output_parser.parse(accumulated_for_parser)
+                        if parsed is not None:
+                            converted = converted.model_copy(
+                                update={"parser_content": parsed}
+                            )
+                            accumulated_for_parser = ""
+                    except Exception as exc:
+                        logger.debug(f"stream parser attempt failed: {exc}")
+                yield converted
+        except ROUTER_ERROR_TYPES as exc:
+            # Same as invoke: name the error on the open trace span before
+            # converting, so a failed stream is marked as one. Guarded the
+            # same way: the model error outranks a failing observer.
+            try:
+                await trigger(
+                    LLMCallEvents.LLM_CALL_ERROR,
+                    model_name=model_name,
+                    model_provider=self.model_client_config.client_provider,
+                    is_stream=True,
+                    error=exc,
+                    error_message=str(exc) or None,
+                )
+            except Exception:  # noqa: BLE001 - the model error outranks the observer
+                llm_logger.debug("llm call error announce failed", exc_info=True)
+            raise to_model_error(
+                exc, router=self._router, model_name=model_name, output_emitted=output_emitted,
+            ) from exc
+
+    async def generate_image(
+        self,
+        messages: List[UserMessage],
+        *,
+        model: Optional[str] = None,
+        size: Optional[str] = "1664*928",
+        negative_prompt: Optional[str] = None,
+        n: Optional[int] = 1,
+        prompt_extend: bool = True,
+        watermark: bool = False,
+        seed: int = 0,
+        **kwargs
+    ) -> ImageGenerationResponse:
+        provider = self._resolve_generation_provider(model)
+        if "image" not in _GENERATION_SUPPORT.get(provider, set()):
+            raise NotImplementedError(
+                f"Provider '{provider}' does not support image generation. "
+                f"Supported: {_GENERATION_SUPPORT}"
+            )
+        return await self._generate_image_dashscope(
+            messages, model=model, size=size,
+            negative_prompt=negative_prompt, n=n,
+            prompt_extend=prompt_extend, watermark=watermark,
+            seed=seed, **kwargs,
+        )
+
+    async def generate_speech(
+        self,
+        messages: List[UserMessage],
+        *,
+        model: Optional[str] = None,
+        voice: Optional[str] = "Cherry",
+        language_type: Optional[str] = "Auto",
+        **kwargs
+    ) -> AudioGenerationResponse:
+        provider = self._resolve_generation_provider(model)
+        if "speech" not in _GENERATION_SUPPORT.get(provider, set()):
+            raise NotImplementedError(
+                f"Provider '{provider}' does not support speech generation."
+                f"Supported: {_GENERATION_SUPPORT}"
+            )
+        return await self._generate_speech_dashscope(
+            messages, model=model, voice=voice,
+            language_type=language_type, **kwargs,
+        )
+
+    async def generate_video(
+        self,
+        messages: List[UserMessage],
+        *,
+        img_url: Optional[str] = None,
+        audio_url: Optional[str] = None,
+        model: Optional[str] = None,
+        size: Optional[str] = None,
+        resolution: Optional[str] = None,
+        duration: Optional[int] = 5,
+        prompt_extend: bool = True,
+        watermark: bool = False,
+        negative_prompt: Optional[str] = None,
+        seed: Optional[int] = None,
+        **kwargs
+    ) -> VideoGenerationResponse:
+        provider = self._resolve_generation_provider(model)
+        if "video" not in _GENERATION_SUPPORT.get(provider, set()):
+            raise NotImplementedError(
+                f"Provider '{provider}' does not support video generation."
+                f"Supported: {_GENERATION_SUPPORT}"
+            )
+        return await self._generate_video_dashscope(
+            messages, img_url=img_url, audio_url=audio_url,
+            model=model, size=size, resolution=resolution,
+            duration=duration, prompt_extend=prompt_extend,
+            watermark=watermark, negative_prompt=negative_prompt,
+            seed=seed, **kwargs,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal: type conversion helpers
+    # ------------------------------------------------------------------
+
+    async def _to_ow_assistant_message(
+        self,
+        msg: Any,
+        output_parser: Optional[BaseOutputParser] = None,
+    ) -> AssistantMessage:
+        """Convert intelli_router AssistantMessage -> openjiuwen AssistantMessage."""
+        original_content = msg.content or ""
+        content = original_content
+        parser_content = getattr(msg, "parser_content", None)
+
+        # Apply output parser (openjiuwen's parser)
+        if output_parser and content:
+            try:
+                parsed = await output_parser.parse(content)
+                if parsed is not None:
+                    parser_content = parsed
+                if isinstance(parsed, str):
+                    content = parsed
+                elif parsed is not None:
+                    content = str(parsed)
+            except Exception as e:
+                logger.error(f"parse content failed: {e}")
+
+        # Convert tool_calls
+        tool_calls = None
+        if msg.tool_calls:
+            tool_calls = [
+                ToolCall(id=tc.id, type=tc.type, name=tc.name, arguments=tc.arguments, index=tc.index)
+                for tc in msg.tool_calls
+            ]
+
+        usage_metadata = self._to_ow_usage_metadata(getattr(msg, "usage_metadata", None))
+
+        return AssistantMessage(
+            content=content,
+            tool_calls=tool_calls,
+            usage_metadata=usage_metadata,
+            finish_reason=msg.finish_reason or "stop",
+            reasoning_content=msg.reasoning_content,
+            parser_content=parser_content,
+            prompt_token_ids=getattr(msg, "prompt_token_ids", None),
+            completion_token_ids=getattr(msg, "completion_token_ids", None),
+            logprobs=getattr(msg, "logprobs", None),
+            response_id=str(getattr(msg, "response_id", "") or "") or None,
+            response_model=str(getattr(msg, "response_model", "") or "") or None,
+            provider_metadata=self._provider_metadata(msg),
+            provider_content=(
+                getattr(msg, "provider_content", None)
+                if getattr(msg, "provider_content", None) is not None
+                else original_content
+                if output_parser is not None and original_content != content
+                else getattr(msg, "provider_content", None)
+            ),
+        )
+
+    @staticmethod
+    def _to_ow_chunk(chunk: Any) -> AssistantMessageChunk:
+        """Convert intelli_router AssistantMessageChunk -> openjiuwen AssistantMessageChunk."""
+        tool_calls = None
+        if chunk.tool_calls:
+            tool_calls = [
+                ToolCall(id=tc.id, type=tc.type, name=tc.name, arguments=tc.arguments, index=tc.index)
+                for tc in chunk.tool_calls
+            ]
+        return AssistantMessageChunk(
+            content=chunk.content or "",
+            tool_calls=tool_calls,
+            finish_reason=chunk.finish_reason or "null",
+            reasoning_content=chunk.reasoning_content,
+            usage_metadata=IntelliRouterModelClient._to_ow_usage_metadata(
+                getattr(chunk, "usage_metadata", None)
+            ),
+            parser_content=getattr(chunk, "parser_content", None),
+            prompt_token_ids=getattr(chunk, "prompt_token_ids", None),
+            completion_token_ids=getattr(chunk, "completion_token_ids", None),
+            logprobs=getattr(chunk, "logprobs", None),
+            response_id=str(getattr(chunk, "response_id", "") or "") or None,
+            response_model=str(getattr(chunk, "response_model", "") or "") or None,
+            provider_metadata=IntelliRouterModelClient._provider_metadata(chunk),
+            provider_content=getattr(chunk, "provider_content", None),
+        )
+
+    @staticmethod
+    def _to_ow_usage_metadata(source_usage: Any) -> UsageMetadata | None:
+        """Convert intelli_router usage metadata into openJiuwen UsageMetadata."""
+        if source_usage is None:
+            return None
+
+        def _get(name: str, default: Any = None) -> Any:
+            if isinstance(source_usage, dict):
+                return source_usage.get(name, default)
+            return getattr(source_usage, name, default)
+
+        def _int_value(name: str) -> int:
+            value = _get(name, 0)
+            if value is None or isinstance(value, bool):
+                return 0
+            try:
+                return max(int(float(value)), 0)
+            except (TypeError, ValueError):
+                return 0
+
+        def _optional_int(name: str) -> int | None:
+            value = _get(name)
+            if value is None or isinstance(value, bool):
+                return None
+            try:
+                return max(int(float(value)), 0)
+            except (TypeError, ValueError):
+                return None
+
+        def _float_value(name: str) -> float:
+            value = _get(name, 0)
+            if value is None or isinstance(value, bool):
+                return 0.0
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        cache_status = _get("cache_status")
+        cache_source = _get("cache_source")
+        cache_authoritative = _get("cache_authoritative", False)
+        model_name = _get("model_name", "")
+        return UsageMetadata(
+            input_tokens=_int_value("input_tokens"),
+            output_tokens=_int_value("output_tokens"),
+            total_tokens=_int_value("total_tokens"),
+            cache_tokens=_int_value("cache_tokens"),
+            cache_read_tokens=_optional_int("cache_read_tokens"),
+            cache_miss_tokens=_optional_int("cache_miss_tokens"),
+            cache_write_tokens=_optional_int("cache_write_tokens"),
+            cache_status=cache_status if isinstance(cache_status, str) else None,
+            cache_source=cache_source if isinstance(cache_source, str) else None,
+            cache_authoritative=cache_authoritative if isinstance(cache_authoritative, bool) else False,
+            cache_creation_input_tokens=_optional_int("cache_creation_input_tokens"),
+            reasoning_tokens=IntelliRouterModelClient._extract_reasoning_tokens(source_usage),
+            model_name=model_name if isinstance(model_name, str) else "",
+            input_cost=_float_value("input_cost"),
+            output_cost=_float_value("output_cost"),
+            total_cost=_float_value("total_cost"),
+        )
+
+    @staticmethod
+    def _provider_metadata(message: Any) -> dict[str, Any]:
+        source = getattr(message, "provider_metadata", None)
+        if not isinstance(source, dict):
+            return {}
+        allowed = (
+            "system_fingerprint",
+            "service_tier",
+            "status",
+            "stop_reason",
+            "stop_sequence",
+            "incomplete_details",
+        )
+        return {key: source[key] for key in allowed if key in source}
+
+    # ------------------------------------------------------------------
+    # Internal: generation helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_generation_provider(self, model: Optional[str] = None) -> str:
+        """Resolve the provider name used for generation APIs."""
+        for dep in self._router.deployments:
+            if model and dep.model_name != model:
+                continue
+            return dep.provider
+        return "unknown"
+
+    def _get_api_key_for_provider(self, provider: str) -> Optional[str]:
+        """Return the api_key of the first deployment matching the provider."""
+        for dep in self._router.deployments:
+            if dep.provider == provider:
+                return dep.api_key
+        return None
+
+    def _get_api_base_for_provider(self, provider: str) -> Optional[str]:
+        """Return the api_base of the first deployment matching the provider."""
+        for dep in self._router.deployments:
+            if dep.provider == provider:
+                return dep.api_base
+        return None
+
+    # ------------------------------------------------------------------
+    # DashScope generation implementations
+    # ------------------------------------------------------------------
+
+    async def _generate_image_dashscope(
+        self,
+        messages: list,
+        *,
+        model: Optional[str] = None,
+        size: Optional[str] = "1664*928",
+        negative_prompt: Optional[str] = None,
+        n: Optional[int] = 1,
+        prompt_extend: bool = True,
+        watermark: bool = False,
+        seed: int = 0,
+        **kwargs,
+    ) -> ImageGenerationResponse:
+        try:
+            import dashscope
+            from dashscope import MultiModalConversation
+        except ImportError as e:
+            raise ImportError(
+                "dashscope package is required for image generation. "
+                "Install it with: pip install dashscope"
+            ) from e
+
+        if not messages or len(messages) != 1:
+            raise ValidationError(
+                StatusCode.MODEL_INVOKE_PARAM_ERROR,
+                msg=f"Image generation requires exactly one message, but got {len(messages) if messages else 0}."
+            )
+
+        api_base = self._get_api_base_for_provider("dashscope")
+        api_key = self._get_api_key_for_provider("dashscope")
+
+        if api_base:
+            dashscope.base_http_api_url = api_base
+
+        if model is None:
+            model = "qwen-image-max"
+
+        # Convert messages to DashScope format
+        msg = messages[0]
+        content_list = []
+
+        if isinstance(msg, UserMessage):
+            if isinstance(msg.content, str):
+                content_list.append({"text": msg.content})
+            elif isinstance(msg.content, list):
+                for item in msg.content:
+                    if isinstance(item, str):
+                        content_list.append({"text": item})
+                    elif isinstance(item, dict):
+                        if "text" in item:
+                            content_list.append({"text": item["text"]})
+                        elif "image" in item:
+                            content_list.append({"image": item["image"]})
+        elif isinstance(msg, dict):
+            if "text" in msg:
+                content_list.append({"text": msg["text"]})
+            elif "image" in msg:
+                content_list.append({"image": msg["image"]})
+            elif "content" in msg:
+                content_list.append({"text": msg["content"]})
+
+        if not content_list:
+            raise ValidationError(
+                StatusCode.MODEL_INVOKE_PARAM_ERROR,
+                msg="Image generation requires non-empty content."
+            )
+
+        dashscope_messages = [{"role": "user", "content": content_list}]
+
+        api_params = {
+            "api_key": api_key,
+            "model": model,
+            "messages": dashscope_messages,
+            "result_format": "message",
+            "stream": False,
+            "watermark": watermark,
+            "prompt_extend": prompt_extend,
+            "size": size,
+            "n": n,
+        }
+        if negative_prompt:
+            api_params["negative_prompt"] = negative_prompt
+        if seed:
+            api_params["seed"] = seed
+        api_params.update(kwargs)
+
+        logger.info(f"Calling DashScope image generation API with model: {model}, size: {size}")
+
+        response = MultiModalConversation.call(**api_params)
+
+        if response.status_code != 200:
+            error_msg = (
+                f"DashScope image generation failed: {response.message} "
+                f"(code={response.code}, status={response.status_code})"
+            )
+            logger.error(error_msg)
+            raise ModelError(StatusCode.MODEL_CALL_FAILED, msg=error_msg)
+
+        # Extract image URLs
+        image_urls = []
+        if response.output and response.output.get("choices"):
+            for choice in response.output["choices"]:
+                if choice.get("message") and choice["message"].get("content"):
+                    for content_item in choice["message"]["content"]:
+                        if isinstance(content_item, dict) and "image" in content_item:
+                            image_urls.append(content_item["image"])
+
+        if not image_urls:
+            raise ModelError(StatusCode.MODEL_CALL_FAILED, msg="No images returned from DashScope API.")
+
+        logger.info(f"DashScope image generation succeeded. Generated {len(image_urls)} image(s).")
+        return ImageGenerationResponse(model=model, images=image_urls)
+
+    async def _generate_speech_dashscope(
+        self,
+        messages: list,
+        *,
+        model: Optional[str] = None,
+        voice: Optional[str] = "Cherry",
+        language_type: Optional[str] = "Auto",
+        **kwargs,
+    ) -> AudioGenerationResponse:
+        try:
+            import dashscope
+            from dashscope import MultiModalConversation
+        except ImportError as e:
+            raise ImportError(
+                "dashscope package is required for speech generation."
+            ) from e
+
+        if not messages or len(messages) != 1:
+            raise ValidationError(
+                StatusCode.MODEL_INVOKE_PARAM_ERROR,
+                msg=f"Speech generation requires exactly one message, but got {len(messages) if messages else 0}."
+            )
+
+        api_base = self._get_api_base_for_provider("dashscope")
+        api_key = self._get_api_key_for_provider("dashscope")
+
+        if api_base:
+            dashscope.base_http_api_url = api_base
+
+        if model is None:
+            model = "cosyvoice-v1"
+
+        # Extract text from message
+        msg = messages[0]
+        text = ""
+        if isinstance(msg, UserMessage):
+            text = msg.content if isinstance(msg.content, str) else ""
+        elif isinstance(msg, dict):
+            text = msg.get("content", msg.get("text", ""))
+
+        if not text or not text.strip():
+            raise ValidationError(
+                StatusCode.MODEL_INVOKE_PARAM_ERROR,
+                msg="Speech generation requires non-empty text content."
+            )
+
+        api_params = {
+            "api_key": api_key,
+            "model": model,
+            "text": text,
+            "voice": voice,
+            "language_type": language_type,
+        }
+        api_params.update(kwargs)
+
+        logger.info(f"Calling DashScope speech generation API with model: {model}, voice: {voice}")
+
+        response = MultiModalConversation.call(**api_params)
+
+        if response.status_code != 200:
+            error_msg = (
+                f"DashScope speech generation failed: {response.message} "
+                f"(code={response.code}, status={response.status_code})"
+            )
+            logger.error(error_msg)
+            raise ModelError(StatusCode.MODEL_CALL_FAILED, msg=error_msg)
+
+        # Extract audio info
+        audio_url = None
+        audio_data = None
+        audio_format = None
+
+        if response.output and response.output.get("audio"):
+            audio_info = response.output["audio"]
+            audio_url = audio_info.get("url")
+            data_str = audio_info.get("data")
+            if data_str:
+                audio_data = data_str.encode("utf-8") if isinstance(data_str, str) else data_str
+            if audio_url:
+                if audio_url.endswith(".wav"):
+                    audio_format = "wav"
+                elif audio_url.endswith(".mp3"):
+                    audio_format = "mp3"
+                elif audio_url.endswith(".pcm"):
+                    audio_format = "pcm"
+
+        if not audio_url and not audio_data:
+            raise ModelError(StatusCode.MODEL_CALL_FAILED, msg="No audio returned from DashScope API.")
+
+        logger.info(f"DashScope speech generation succeeded. Format: {audio_format or 'unknown'}")
+        return AudioGenerationResponse(
+            model=model,
+            audio_url=audio_url,
+            audio_data=audio_data,
+            format=audio_format,
+        )
+
+    async def _generate_video_dashscope(
+        self,
+        messages: list,
+        *,
+        img_url: Optional[str] = None,
+        audio_url: Optional[str] = None,
+        model: Optional[str] = None,
+        size: Optional[str] = None,
+        resolution: Optional[str] = None,
+        duration: Optional[int] = 5,
+        prompt_extend: bool = True,
+        watermark: bool = False,
+        negative_prompt: Optional[str] = None,
+        seed: Optional[int] = None,
+        **kwargs,
+    ) -> VideoGenerationResponse:
+        try:
+            import dashscope
+            from dashscope import VideoSynthesis
+        except ImportError as e:
+            raise ImportError(
+                "dashscope package is required for video generation"
+            ) from e
+
+        if not messages or len(messages) != 1:
+            raise ValidationError(
+                StatusCode.MODEL_INVOKE_PARAM_ERROR,
+                msg=f"Video generation requires exactly one message, but got {len(messages) if messages else 0}."
+            )
+
+        api_base = self._get_api_base_for_provider("dashscope")
+        api_key = self._get_api_key_for_provider("dashscope")
+
+        if api_base:
+            dashscope.base_http_api_url = api_base
+
+        if model is None:
+            model = "wan2.6-t2v"
+
+        # Extract prompt from message
+        msg = messages[0]
+        prompt = ""
+        if isinstance(msg, UserMessage):
+            prompt = msg.content if isinstance(msg.content, str) else ""
+        elif isinstance(msg, dict):
+            prompt = msg.get("content", msg.get("text", ""))
+
+        if not prompt or not prompt.strip():
+            raise ValidationError(
+                StatusCode.MODEL_INVOKE_PARAM_ERROR,
+                msg="Video generation requires non-empty text content."
+            )
+
+        api_params = {
+            "api_key": api_key,
+            "model": model,
+            "prompt": prompt,
+            "prompt_extend": prompt_extend,
+            "watermark": watermark,
+        }
+        if duration is not None:
+            api_params["duration"] = duration
+        if negative_prompt:
+            api_params["negative_prompt"] = negative_prompt
+        if seed is not None:
+            api_params["seed"] = seed
+        if audio_url:
+            api_params["audio_url"] = audio_url
+        if img_url:
+            api_params["img_url"] = img_url
+            if resolution:
+                api_params["resolution"] = resolution
+        else:
+            if size:
+                api_params["size"] = size
+        api_params.update(kwargs)
+
+        logger.info(f"Calling DashScope video generation API with model: {model}, duration: {duration}")
+
+        response = VideoSynthesis.call(**api_params)
+
+        if response.status_code != 200:
+            error_msg = (
+                f"DashScope video generation failed: {response.message} "
+                f"(code={response.code}, status={response.status_code})"
+            )
+            logger.error(error_msg)
+            raise ModelError(StatusCode.MODEL_CALL_FAILED, msg=error_msg)
+
+        video_url = None
+        video_duration = None
+        video_resolution = None
+
+        if response.output:
+            video_url = getattr(response.output, "video_url", None)
+
+        if response.usage:
+            video_duration = response.usage.get('duration') or response.usage.get('output_video_duration')
+            video_resolution = response.usage.get('size')
+
+        if not video_url:
+            raise ModelError(StatusCode.MODEL_CALL_FAILED, msg="No video URL returned from DashScope API.")
+
+        logger.info(f"DashScope video generation succeeded. Video URL: {video_url[:100]}...")
+        return VideoGenerationResponse(
+            model=model,
+            video_url=video_url,
+            duration=video_duration,
+            resolution=video_resolution,
+            format="mp4",
+        )

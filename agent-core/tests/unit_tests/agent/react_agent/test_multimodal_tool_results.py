@@ -1,0 +1,210 @@
+# coding: utf-8
+
+from unittest.mock import MagicMock
+
+from openjiuwen.core.foundation.tool.base import render_tool_output
+from openjiuwen.core.single_agent.agents.react_agent import ReActAgent
+from openjiuwen.harness.tools.base_tool import ToolOutput
+
+
+def test_tool_message_content_omits_multimodal_payload() -> None:
+    result = ToolOutput(
+        success=True,
+        data={
+            "content": "Image file read: /tmp/a.png",
+            "multimodal": [
+                {
+                    "type": "image",
+                    "data_url": "data:image/png;base64,abc",
+                }
+            ],
+        },
+    )
+
+    assert render_tool_output(result) == "Image file read: /tmp/a.png"
+
+
+def test_react_agent_builds_multimodal_user_message_from_tool_result() -> None:
+    result = ToolOutput(
+        success=True,
+        data={
+            "content": "Image file read: /tmp/a.png",
+            "multimodal": [
+                {
+                    "type": "image",
+                    "source_path": "/tmp/a.png",
+                    "data_url": "data:image/png;base64,abc",
+                }
+            ],
+        },
+    )
+
+    messages = ReActAgent._build_multimodal_tool_result_messages(result)
+
+    assert len(messages) == 1
+    assert messages[0].role == "user"
+    assert messages[0].content[0] == {
+        "type": "text",
+        "text": "Image loaded from tool: /tmp/a.png",
+    }
+    assert messages[0].content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,abc"},
+    }
+
+
+def test_react_agent_batches_multiple_multimodal_tool_results_into_one_user_message() -> None:
+    first = ToolOutput(
+        success=True,
+        data={
+            "content": "Image file read: /tmp/a.png",
+            "multimodal": [
+                {
+                    "type": "image",
+                    "source_path": "/tmp/a.png",
+                    "data_url": "data:image/png;base64,aaa",
+                }
+            ],
+        },
+    )
+    second = ToolOutput(
+        success=True,
+        data={
+            "content": "Image file read: /tmp/b.jpg",
+            "multimodal": [
+                {
+                    "type": "image",
+                    "source_path": "/tmp/b.jpg",
+                    "data_url": "data:image/jpeg;base64,bbb",
+                }
+            ],
+        },
+    )
+
+    message = ReActAgent._build_multimodal_tool_results_message([first, second])
+
+    assert message is not None
+    assert message.role == "user"
+    assert len(message.content) == 5
+    assert message.content[0]["type"] == "text"
+    assert "/tmp/a.png" in message.content[0]["text"]
+    assert "/tmp/b.jpg" in message.content[0]["text"]
+    assert message.content[2] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,aaa"},
+    }
+    assert message.content[4] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/jpeg;base64,bbb"},
+    }
+
+
+def test_react_agent_labels_mcp_sourced_images() -> None:
+    from openjiuwen.core.foundation.tool import McpToolResult
+
+    result = McpToolResult(
+        data={
+            "content": "tree summary\n\n1 image(s) attached as multimodal input.",
+            "multimodal": [
+                {
+                    "type": "image",
+                    "source": "mcp",
+                    "source_path": "get_window_state",
+                    "mime_type": "image/png",
+                    "data_url": "data:image/png;base64,abc",
+                }
+            ],
+        },
+    )
+
+    messages = ReActAgent._build_multimodal_tool_result_messages(result)
+
+    assert len(messages) == 1
+    assert messages[0].content[0] == {
+        "type": "text",
+        "text": "Image loaded from mcp: get_window_state",
+    }
+    assert messages[0].content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,abc"},
+    }
+
+
+def test_tool_message_content_uses_mcp_tool_result_content() -> None:
+    from openjiuwen.core.foundation.tool import MCPTool, McpToolCard, McpToolResult
+
+    result = McpToolResult(
+        data={
+            "content": "tree summary",
+            "multimodal": [{"type": "image", "data_url": "data:image/png;base64,abc"}],
+        },
+    )
+
+    tool = MCPTool(MagicMock(), McpToolCard(id="srv.get_window_state", name="get_window_state", server_name="srv"))
+    assert tool.render_for_llm(result) == "tree summary"
+
+
+def test_react_agent_detects_image_input_in_messages() -> None:
+    result = ToolOutput(
+        success=True,
+        data={
+            "content": "Image file read: /tmp/a.png",
+            "multimodal": [
+                {
+                    "type": "image",
+                    "source_path": "/tmp/a.png",
+                    "data_url": "data:image/png;base64,abc",
+                }
+            ],
+        },
+    )
+    messages = ReActAgent._build_multimodal_tool_result_messages(result)
+
+    assert ReActAgent._messages_contain_image_input(messages) is True
+
+
+def test_react_agent_detects_nested_image_input_in_messages() -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,abc"},
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+
+    assert ReActAgent._messages_contain_image_input(messages) is True
+
+
+def test_react_agent_detects_image_input_unsupported_errors() -> None:
+    exc = RuntimeError(
+        "NotFoundError: Error code: 404 - No endpoints found that support image input"
+    )
+
+    assert ReActAgent._is_image_input_unsupported_error(exc) is True
+
+
+def test_react_agent_detects_structured_image_input_unsupported_errors() -> None:
+    class ProviderError(Exception):
+        body = {
+            "error": {
+                "code": "image_input_unsupported",
+                "message": "The selected model cannot consume the supplied media.",
+            }
+        }
+
+    assert ReActAgent._is_image_input_unsupported_error(ProviderError()) is True
+
+
+def test_react_agent_does_not_treat_audio_error_as_image_unsupported() -> None:
+    exc = RuntimeError("Error code: 400 - Only text and image_url are supported.")
+
+    assert ReActAgent._is_image_input_unsupported_error(exc) is False

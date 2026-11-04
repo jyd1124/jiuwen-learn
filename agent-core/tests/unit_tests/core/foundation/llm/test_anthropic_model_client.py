@@ -1,0 +1,1046 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Unit tests for AnthropicModelClient pure converters and helpers.
+
+Scope: schema converters, cache-control breakpoint placement, base_url
+normalization, and usage extraction. Network/SDK paths (invoke/stream)
+are covered separately and require the optional ``anthropic`` SDK.
+"""
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import BaseError
+from openjiuwen.core.foundation.llm import (
+    AssistantMessage,
+    AssistantMessageChunk,
+    ModelClientConfig,
+    ModelRequestConfig,
+    ProviderType,
+)
+from openjiuwen.core.foundation.llm.schema.config import LLMAuthMode
+from openjiuwen.core.foundation.llm.model_clients.anthropic_model_client import (
+    _ANTHROPIC_CONTENT_BLOCKS_METADATA_KEY,
+    AnthropicModelClient,
+    default_max_tokens,
+    _apply_messages_cache_breakpoint,
+    _apply_static_cache_breakpoints,
+    _content_to_blocks,
+    _convert_message_schemas,
+    _convert_tool_schemas,
+    _last_input_is_transient,
+    _mark_cache_control,
+    _supports_mid_conversation_system,
+)
+
+
+# ---------------------------------------------------------------------------
+# A. Pure converters: _content_to_blocks
+# ---------------------------------------------------------------------------
+
+
+class TestContentToBlocks:
+    def test_string_content_wraps_into_text_block(self):
+        blocks = _content_to_blocks("hello")
+        assert blocks == [{"type": "text", "text": "hello"}]
+
+    def test_empty_string_returns_empty_list(self):
+        assert _content_to_blocks("") == []
+
+    def test_none_returns_empty_list(self):
+        assert _content_to_blocks(None) == []
+
+    def test_list_of_strings_each_becomes_block(self):
+        blocks = _content_to_blocks(["a", "b"])
+        assert blocks == [
+            {"type": "text", "text": "a"},
+            {"type": "text", "text": "b"},
+        ]
+
+    def test_list_of_dicts_deep_copied(self):
+        src = [{"type": "text", "text": "x"}]
+        blocks = _content_to_blocks(src)
+        assert blocks == src
+        # Verify it's a copy, not the same object
+        assert blocks[0] is not src[0]
+
+    def test_list_with_empty_strings_skipped(self):
+        blocks = _content_to_blocks(["a", "", "b"])
+        assert blocks == [
+            {"type": "text", "text": "a"},
+            {"type": "text", "text": "b"},
+        ]
+
+    def test_non_string_non_list_coerced_to_text(self):
+        blocks = _content_to_blocks(42)
+        assert blocks == [{"type": "text", "text": "42"}]
+
+
+# ---------------------------------------------------------------------------
+# A. Pure converters: _convert_message_schemas
+# ---------------------------------------------------------------------------
+
+
+class TestConvertMessageSchemas:
+    def test_system_extracted_to_top_level(self):
+        system_blocks, messages = _convert_message_schemas([
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": "hi"},
+        ])
+        assert system_blocks == [{"type": "text", "text": "you are helpful"}]
+        assert len(messages) == 1
+        assert messages[0]["role"] == "user"
+
+    def test_no_system_returns_none_blocks(self):
+        system_blocks, messages = _convert_message_schemas([
+            {"role": "user", "content": "hi"},
+        ])
+        assert system_blocks is None
+        assert len(messages) == 1
+
+    def test_mid_conversation_system_stays_in_place_when_supported(self):
+        """Hoisting it would rewrite the prefix ahead of the whole history."""
+        system_blocks, messages = _convert_message_schemas(
+            [
+                {"role": "system", "content": "FIXED"},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "DELTA"},
+            ],
+            allow_mid_conversation_system=True,
+        )
+        assert system_blocks == [{"type": "text", "text": "FIXED"}]
+        assert [message["role"] for message in messages] == ["user", "system"]
+        assert messages[1]["content"] == "DELTA"
+
+    def test_mid_conversation_system_is_hoisted_when_unsupported(self):
+        """Models without the capability answer 400, so keep the old shape."""
+        system_blocks, messages = _convert_message_schemas(
+            [
+                {"role": "system", "content": "FIXED"},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "DELTA"},
+            ],
+            allow_mid_conversation_system=False,
+        )
+        assert system_blocks == [
+            {"type": "text", "text": "FIXED"},
+            {"type": "text", "text": "DELTA"},
+        ]
+        assert [message["role"] for message in messages] == ["user"]
+
+    def test_mid_conversation_system_after_a_tool_result_stays_in_place(self):
+        """Tool results become a user turn, which is a position the API allows."""
+        system_blocks, messages = _convert_message_schemas(
+            [
+                {"role": "system", "content": "FIXED"},
+                {"role": "user", "content": "do it"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "t1", "type": "function",
+                     "function": {"name": "bash", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "t1", "content": "ok"},
+                {"role": "system", "content": "DELTA"},
+            ],
+            allow_mid_conversation_system=True,
+        )
+        assert system_blocks == [{"type": "text", "text": "FIXED"}]
+        assert [message["role"] for message in messages] == [
+            "user",
+            "assistant",
+            "user",
+            "system",
+        ]
+
+    def test_a_system_turn_followed_by_a_user_turn_is_hoisted(self):
+        """The API needs it last or before an assistant turn; this is neither."""
+        system_blocks, messages = _convert_message_schemas(
+            [
+                {"role": "system", "content": "FIXED"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "sure"},
+                {"role": "system", "content": "DELTA"},
+                {"role": "user", "content": "again"},
+            ],
+            allow_mid_conversation_system=True,
+        )
+        assert system_blocks == [
+            {"type": "text", "text": "FIXED"},
+            {"type": "text", "text": "DELTA"},
+        ]
+        assert [message["role"] for message in messages] == [
+            "user",
+            "assistant",
+            "user",
+        ]
+
+    def test_adjacent_system_turns_both_fall_back(self):
+        """Neither may assume the other gets moved away, so both are hoisted."""
+        system_blocks, messages = _convert_message_schemas(
+            [
+                {"role": "system", "content": "FIXED"},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "D1"},
+                {"role": "system", "content": "D2"},
+            ],
+            allow_mid_conversation_system=True,
+        )
+        assert system_blocks == [
+            {"type": "text", "text": "FIXED"},
+            {"type": "text", "text": "D1"},
+            {"type": "text", "text": "D2"},
+        ]
+        assert [message["role"] for message in messages] == ["user"]
+
+    def test_a_leading_system_turn_is_never_left_in_messages(self):
+        """``messages[0]`` can never be a system turn, capability or not."""
+        system_blocks, messages = _convert_message_schemas(
+            [{"role": "system", "content": "FIXED"}, {"role": "user", "content": "hi"}],
+            allow_mid_conversation_system=True,
+        )
+        assert system_blocks == [{"type": "text", "text": "FIXED"}]
+        assert [message["role"] for message in messages] == ["user"]
+
+
+class TestMidConversationSystemSupport:
+    @pytest.mark.parametrize("model", [
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "anthropic/claude-opus-5",
+        "us.anthropic.claude-opus-4-8-v1:0",
+        "claude-fable-5",
+        "claude-mythos-5",
+    ])
+    def test_supported_models(self, model):
+        assert _supports_mid_conversation_system(model) is True
+
+    @pytest.mark.parametrize("model", [
+        "claude-sonnet-5",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-haiku-4-5",
+        "deepseek-v4-flash",
+        "",
+        None,
+    ])
+    def test_unsupported_models_keep_the_hoisting_behavior(self, model):
+        assert _supports_mid_conversation_system(model) is False
+
+    def test_consecutive_tool_results_merged_into_one_user(self):
+        _, messages = _convert_message_schemas([
+            {"role": "user", "content": "do it"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "t1", "type": "function",
+                 "function": {"name": "fn", "arguments": "{}"}},
+                {"id": "t2", "type": "function",
+                 "function": {"name": "fn2", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "t1", "content": "result1"},
+            {"role": "tool", "tool_call_id": "t2", "content": "result2"},
+        ])
+        # tool messages should merge into a single user message with two
+        # tool_result blocks (Anthropic alternation requirement).
+        assert len(messages) == 3
+        assert messages[0]["role"] == "user"
+        assert messages[1]["role"] == "assistant"
+        assert messages[2]["role"] == "user"
+        tool_results = messages[2]["content"]
+        assert len(tool_results) == 2
+        assert all(b["type"] == "tool_result" for b in tool_results)
+        assert tool_results[0]["tool_use_id"] == "t1"
+        assert tool_results[1]["tool_use_id"] == "t2"
+
+    def test_assistant_tool_calls_become_tool_use_blocks(self):
+        _, messages = _convert_message_schemas([
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "thinking", "tool_calls": [
+                {"id": "abc", "type": "function",
+                 "function": {"name": "search",
+                              "arguments": '{"q": "x"}'}},
+            ]},
+        ])
+        assistant = messages[1]
+        assert assistant["role"] == "assistant"
+        tool_use = [b for b in assistant["content"] if b["type"] == "tool_use"]
+        assert len(tool_use) == 1
+        assert tool_use[0]["id"] == "abc"
+        assert tool_use[0]["name"] == "search"
+        # arguments JSON string should be parsed into a dict object
+        assert tool_use[0]["input"] == {"q": "x"}
+
+    def test_assistant_with_invalid_json_arguments_falls_back_to_raw(self):
+        _, messages = _convert_message_schemas([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "id1", "type": "function",
+                 "function": {"name": "fn", "arguments": "not json"}},
+            ]},
+        ])
+        tool_use = [b for b in messages[0]["content"] if b["type"] == "tool_use"]
+        assert tool_use[0]["input"] == {"_raw_arguments": "not json"}
+
+    def test_signed_thinking_blocks_are_replayed_unchanged(self):
+        thinking = {
+            "type": "thinking",
+            "thinking": "inspect the inputs",
+            "signature": "opaque-signature",
+        }
+        tool_use = {
+            "type": "tool_use",
+            "id": "tool-1",
+            "name": "search",
+            "input": {"q": "x"},
+        }
+        _, messages = _convert_message_schemas([{
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "display copy only",
+            "tool_calls": [{
+                "id": "tool-1",
+                "type": "function",
+                "function": {"name": "search", "arguments": '{"q":"x"}'},
+            }],
+            "metadata": {
+                _ANTHROPIC_CONTENT_BLOCKS_METADATA_KEY: [thinking, tool_use],
+            },
+        }])
+
+        assert messages == [{
+            "role": "assistant",
+            "content": [thinking, tool_use],
+        }]
+        assert "reasoning_content" not in messages[0]
+
+    def test_openai_base64_image_is_converted_to_anthropic_source(self):
+        _, messages = _convert_message_schemas([{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,abc", "detail": "low"},
+            }],
+        }])
+
+        assert messages[0]["content"] == [{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "abc",
+            },
+        }]
+
+    def test_openai_remote_image_is_converted_to_anthropic_source(self):
+        _, messages = _convert_message_schemas([{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/image.webp"},
+            }],
+        }])
+
+        assert messages[0]["content"] == [{
+            "type": "image",
+            "source": {
+                "type": "url",
+                "url": "https://example.com/image.webp",
+            },
+        }]
+
+    def test_unsupported_image_data_url_fails_before_request(self):
+        with pytest.raises(ValueError, match="JPEG, PNG, GIF, or WebP"):
+            _convert_message_schemas([{
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/svg+xml;base64,abc"},
+                }],
+            }])
+
+    @pytest.mark.parametrize("image_value", [{}, {"url": ""}, {"url": None}, None])
+    def test_empty_openai_image_url_fails_before_request(self, image_value):
+        with pytest.raises(ValueError, match="non-empty image URL"):
+            _convert_message_schemas([{
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": image_value,
+                }],
+            }])
+
+    def test_tool_result_empty_content_padded(self):
+        _, messages = _convert_message_schemas([
+            {"role": "tool", "tool_call_id": "t1", "content": ""},
+        ])
+        tool_result = messages[0]["content"][0]
+        # Anthropic requires non-empty content for tool_result; should be padded
+        assert tool_result["content"] == [{"type": "text", "text": ""}]
+
+    def test_unknown_role_treated_as_user(self):
+        _, messages = _convert_message_schemas([
+            {"role": "developer", "content": "note"},
+        ])
+        assert messages[0]["role"] == "user"
+
+    def test_strict_alternation_with_pending_tool_results_flush(self):
+        # When a user message lands between tool responses and the next message,
+        # the pending tool_results must flush first.
+        _, messages = _convert_message_schemas([
+            {"role": "tool", "tool_call_id": "t1", "content": "r1"},
+            {"role": "user", "content": "another"},
+        ])
+        assert len(messages) == 2
+        assert messages[0]["role"] == "user"
+        assert messages[0]["content"][0]["type"] == "tool_result"
+        assert messages[1]["role"] == "user"
+        assert messages[1]["content"][0]["type"] == "text"
+
+
+# ---------------------------------------------------------------------------
+# A. Pure converters: _convert_tool_schemas
+# ---------------------------------------------------------------------------
+
+
+class TestConvertToolSchemas:
+    def test_openai_function_schema_converted(self):
+        tools = _convert_tool_schemas([
+            {"type": "function", "function": {
+                "name": "search",
+                "description": "search the web",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+            }},
+        ])
+        assert tools == [{
+            "name": "search",
+            "description": "search the web",
+            "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+        }]
+
+    def test_missing_parameters_defaults_to_empty_object(self):
+        tools = _convert_tool_schemas([
+            {"type": "function", "function": {"name": "fn", "description": "d"}},
+        ])
+        assert tools[0]["input_schema"] == {"type": "object", "properties": {}}
+
+    def test_none_input_returns_none(self):
+        assert _convert_tool_schemas(None) is None
+
+    def test_empty_list_returns_none(self):
+        assert _convert_tool_schemas([]) is None
+
+    def test_non_dict_tool_skipped(self):
+        tools = _convert_tool_schemas([
+            "not a dict",
+            {"type": "function", "function": {"name": "ok"}},
+        ])
+        assert len(tools) == 1
+        assert tools[0]["name"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# B. Cache-control breakpoint placement
+# ---------------------------------------------------------------------------
+
+
+def _is_5m_ephemeral(marker: dict) -> bool:
+    """5m TTL is Anthropic's default; both ``{type: ephemeral}`` and
+    ``{type: ephemeral, ttl: '5m'}`` are valid wire forms."""
+    if marker.get("type") != "ephemeral":
+        return False
+    ttl = marker.get("ttl")
+    return ttl is None or ttl == "5m"
+
+
+class TestCacheControlPlacement:
+    def test_mark_cache_control_targets_last_block_with_1h_ttl(self):
+        blocks = [
+            {"type": "text", "text": "a"},
+            {"type": "text", "text": "b"},
+        ]
+        _mark_cache_control(blocks, "1h")
+        assert "cache_control" not in blocks[0]
+        assert blocks[1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+    def test_mark_cache_control_default_5m_accepts_omitted_or_explicit_ttl(self):
+        blocks = [{"type": "text", "text": "a"}]
+        _mark_cache_control(blocks, "5m")
+        assert _is_5m_ephemeral(blocks[0]["cache_control"])
+
+    def test_mark_cache_control_noop_on_empty(self):
+        # Should not raise on empty list
+        _mark_cache_control([], "1h")
+
+    def test_mark_cache_control_skips_signed_thinking_block(self):
+        blocks = [
+            {"type": "text", "text": "answer"},
+            {"type": "thinking", "thinking": "hidden", "signature": "sig"},
+        ]
+        _mark_cache_control(blocks, "5m")
+        assert "cache_control" not in blocks[1]
+        assert _is_5m_ephemeral(blocks[0]["cache_control"])
+
+    def test_apply_static_breakpoints_marks_last_tool_and_last_system(self):
+        tools = [{"name": "a"}, {"name": "b"}]
+        system_blocks = [{"type": "text", "text": "s"}]
+        _apply_static_cache_breakpoints(system_blocks, tools)
+        assert "cache_control" not in tools[0]
+        assert _is_5m_ephemeral(tools[1]["cache_control"])
+        assert _is_5m_ephemeral(system_blocks[0]["cache_control"])
+
+    def test_apply_static_breakpoints_handles_no_tools(self):
+        system_blocks = [{"type": "text", "text": "s"}]
+        _apply_static_cache_breakpoints(system_blocks, None)
+        assert _is_5m_ephemeral(system_blocks[0]["cache_control"])
+
+    def test_apply_static_breakpoints_handles_no_system(self):
+        tools = [{"name": "only"}]
+        _apply_static_cache_breakpoints(None, tools)
+        assert _is_5m_ephemeral(tools[0]["cache_control"])
+
+    def test_apply_static_breakpoints_handles_both_none(self):
+        # Must not raise
+        _apply_static_cache_breakpoints(None, None)
+
+
+# ---------------------------------------------------------------------------
+# B2. Transient-tail detection: _last_input_is_transient
+# ---------------------------------------------------------------------------
+
+
+class TestLastInputIsTransient:
+    def test_dict_message_with_transient_metadata(self):
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "user", "content": "budget", "metadata": {"transient": True}},
+        ]
+        assert _last_input_is_transient(messages) is True
+
+    def test_dict_message_without_transient_metadata(self):
+        messages = [{"role": "user", "content": "hi", "metadata": {"transient": False}}]
+        assert _last_input_is_transient(messages) is False
+
+    def test_dict_message_missing_metadata(self):
+        assert _last_input_is_transient([{"role": "user", "content": "hi"}]) is False
+
+    def test_object_message_with_transient_metadata(self):
+        last = MagicMock()
+        last.metadata = {"transient": True}
+        assert _last_input_is_transient([last]) is True
+
+    def test_object_message_without_metadata_attr(self):
+        last = MagicMock(spec=["role", "content"])
+        assert _last_input_is_transient([last]) is False
+
+    def test_only_last_message_inspected(self):
+        messages = [
+            {"role": "user", "content": "x", "metadata": {"transient": True}},
+            {"role": "user", "content": "y"},
+        ]
+        assert _last_input_is_transient(messages) is False
+
+    def test_empty_list_returns_false(self):
+        assert _last_input_is_transient([]) is False
+
+    def test_non_list_returns_false(self):
+        assert _last_input_is_transient(None) is False
+        assert _last_input_is_transient("not a list") is False
+
+
+# ---------------------------------------------------------------------------
+# B3. Conversation breakpoint placement: _apply_messages_cache_breakpoint
+# ---------------------------------------------------------------------------
+
+
+class TestApplyMessagesCacheBreakpoint:
+    def _msg(self, text: str) -> dict:
+        return {"role": "user", "content": [{"type": "text", "text": text}]}
+
+    def test_anchors_last_message_when_tail_stable(self):
+        messages = [self._msg("a"), self._msg("b")]
+        _apply_messages_cache_breakpoint(messages, exclude_tail=False)
+        assert "cache_control" not in messages[0]["content"][0]
+        assert _is_5m_ephemeral(messages[1]["content"][0]["cache_control"])
+
+    def test_anchors_penultimate_when_tail_transient(self):
+        messages = [self._msg("a"), self._msg("b"), self._msg("transient")]
+        _apply_messages_cache_breakpoint(messages, exclude_tail=True)
+        # The transient tail stays uncached; anchor on the stable message before.
+        assert _is_5m_ephemeral(messages[1]["content"][0]["cache_control"])
+        assert "cache_control" not in messages[2]["content"][0]
+
+    def test_single_message_transient_tail_still_anchors_itself(self):
+        # idx >= 1 guard: with only one message there is nothing before it,
+        # so it anchors on the lone message rather than going out of range.
+        messages = [self._msg("only")]
+        _apply_messages_cache_breakpoint(messages, exclude_tail=True)
+        assert _is_5m_ephemeral(messages[0]["content"][0]["cache_control"])
+
+    def test_empty_messages_noop(self):
+        # Must not raise.
+        _apply_messages_cache_breakpoint([], exclude_tail=False)
+
+    def test_non_list_content_skipped(self):
+        # String content (not a block list) is left untouched without error.
+        messages = [{"role": "user", "content": "plain string"}]
+        _apply_messages_cache_breakpoint(messages, exclude_tail=False)
+        assert messages[0]["content"] == "plain string"
+
+    def test_a_system_tail_anchors_on_the_message_before_it(self):
+        # A mid-conversation system turn is plain text with no block to mark;
+        # walking back keeps the breakpoint instead of dropping it.
+        messages = [self._msg("a"), {"role": "system", "content": "DELTA"}]
+        _apply_messages_cache_breakpoint(messages, exclude_tail=False)
+        assert _is_5m_ephemeral(messages[0]["content"][0]["cache_control"])
+        assert messages[1]["content"] == "DELTA"
+
+    def test_only_unmarkable_messages_noop(self):
+        # Nothing to anchor on; must not raise or wrap around to the end.
+        messages = [{"role": "system", "content": "DELTA"}]
+        _apply_messages_cache_breakpoint(messages, exclude_tail=False)
+        assert messages[0]["content"] == "DELTA"
+
+
+# ---------------------------------------------------------------------------
+# C. _normalize_base_url
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeBaseUrl:
+    def test_strips_trailing_v1(self):
+        assert (
+            AnthropicModelClient._normalize_base_url("https://openrouter.ai/api/v1")
+            == "https://openrouter.ai/api"
+        )
+
+    def test_strips_trailing_slash_then_v1(self):
+        assert (
+            AnthropicModelClient._normalize_base_url("https://openrouter.ai/api/v1/")
+            == "https://openrouter.ai/api"
+        )
+
+    def test_passthrough_when_no_v1_suffix(self):
+        assert (
+            AnthropicModelClient._normalize_base_url("https://api.anthropic.com")
+            == "https://api.anthropic.com"
+        )
+
+    def test_strips_full_messages_endpoint(self):
+        assert (
+            AnthropicModelClient._normalize_base_url("https://proxy.example/anthropic/v1/messages")
+            == "https://proxy.example/anthropic"
+        )
+
+    def test_empty_string_returns_none(self):
+        assert AnthropicModelClient._normalize_base_url("") is None
+
+    def test_none_returns_none(self):
+        assert AnthropicModelClient._normalize_base_url(None) is None
+
+
+# ---------------------------------------------------------------------------
+# D. _usage_from_anthropic
+# ---------------------------------------------------------------------------
+
+
+def _make_client() -> AnthropicModelClient:
+    client_config = ModelClientConfig(
+        client_provider="Anthropic",
+        api_key="mock-key",
+        api_base="https://api.anthropic.com",
+        verify_ssl=False,
+    )
+    request_config = ModelRequestConfig(model_name="claude-opus-4")
+    return AnthropicModelClient(request_config, client_config)
+
+
+@pytest.mark.asyncio
+async def test_stream_output_parser_keeps_raw_deltas_and_emits_parser_fact() -> None:
+    class _ResponseStream:
+        def __init__(self):
+            self._events = iter((object(), object()))
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._events)
+            except StopIteration as exc:
+                raise StopAsyncIteration from exc
+
+    class _StreamContext:
+        async def __aenter__(self):
+            return _ResponseStream()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    fake_client = MagicMock()
+    fake_client.messages.stream.return_value = _StreamContext()
+    fake_client.close = AsyncMock()
+    client = _make_client()
+    client._create_async_anthropic_client = MagicMock(return_value=fake_client)
+    client._use_shared_client = MagicMock(return_value=False)
+    client._event_to_chunk = MagicMock(side_effect=[
+        AssistantMessageChunk(content='{"value":'),
+        AssistantMessageChunk(content="1}", finish_reason="stop"),
+    ])
+
+    class _Parser:
+        async def parse(self, content):
+            if content == '{"value":1}':
+                return {"value": 1}
+            raise ValueError("incomplete")
+
+    chunks = [
+        chunk
+        async for chunk in client.stream(
+            [{"role": "user", "content": "parse"}],
+            output_parser=_Parser(),
+        )
+    ]
+
+    assert [chunk.content for chunk in chunks] == ['{"value":', "1}"]
+    assert chunks[0].parser_content is None
+    assert chunks[1].parser_content == {"value": 1}
+    fake_client.close.assert_awaited_once()
+
+
+class TestUsageFromAnthropic:
+    def test_input_tokens_sums_uncached_read_and_write(self):
+        usage = MagicMock()
+        usage.model_dump.return_value = {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 30,
+            "cache_creation_input_tokens": 20,
+        }
+        client = _make_client()
+        meta = client._usage_from_anthropic(usage)
+        assert meta is not None
+        assert meta.input_tokens == 150  # 100 + 30 + 20
+        assert meta.output_tokens == 50
+        assert meta.total_tokens == 200
+        assert meta.cache_tokens == 30  # cache_read only
+        assert meta.cache_miss_tokens == 120  # uncached + cache_write overlap
+        assert meta.cache_creation_input_tokens == 20
+        assert meta.model_name == "claude-opus-4"
+
+    def test_zero_cache_fields_handled(self):
+        usage = MagicMock()
+        usage.model_dump.return_value = {
+            "input_tokens": 10,
+            "output_tokens": 5,
+        }
+        meta = _make_client()._usage_from_anthropic(usage)
+        assert meta.input_tokens == 10
+        assert meta.cache_tokens == 0
+        assert meta.cache_creation_input_tokens is None
+
+    def test_none_usage_returns_none(self):
+        assert _make_client()._usage_from_anthropic(None) is None
+
+
+# ---------------------------------------------------------------------------
+# E. Client registration / identity
+# ---------------------------------------------------------------------------
+
+
+class TestClientIdentity:
+    def test_client_name_is_anthropic(self):
+        assert AnthropicModelClient.__client_name__ == [ProviderType.Anthropic.value]
+
+    def test_get_client_name(self):
+        assert _make_client()._get_client_name() == "Anthropic client"
+
+    def test_anthropic_client_requires_api_key_even_when_auth_mode_is_not_api_key(self):
+        client_config = ModelClientConfig(
+            client_provider=ProviderType.Anthropic,
+            api_base="https://api.anthropic.com",
+            auth_mode=LLMAuthMode.NoneAuth,
+            verify_ssl=False,
+        )
+
+        with pytest.raises(BaseError) as error:
+            AnthropicModelClient(ModelRequestConfig(model="claude-opus-4"), client_config)
+
+        assert error.value.code == StatusCode.MODEL_SERVICE_CONFIG_ERROR.code
+        assert "api_key is required for Anthropic client" in str(error.value)
+
+
+class TestResponseReasoning:
+    @staticmethod
+    def _block(**values):
+        block = MagicMock()
+        for key, value in values.items():
+            setattr(block, key, value)
+        block.model_dump.return_value = dict(values)
+        return block
+
+    @pytest.mark.asyncio
+    async def test_non_stream_response_normalizes_and_preserves_thinking(self):
+        response = MagicMock()
+        response.content = [
+            self._block(type="thinking", thinking="plan", signature="sig"),
+            self._block(type="tool_use", id="t1", name="lookup", input={"x": 1}),
+        ]
+        response.usage = None
+        response.stop_reason = "tool_use"
+        response.stop_sequence = None
+        response.id = "msg-1"
+        response.model = "claude-returned"
+
+        message = await _make_client()._parse_response(response)
+
+        assert message.reasoning_content == "plan"
+        assert message.tool_calls and message.tool_calls[0].id == "t1"
+        assert message.response_id == "msg-1"
+        assert message.response_model == "claude-returned"
+        assert message.provider_metadata == {"stop_reason": "tool_use"}
+        assert message.metadata[_ANTHROPIC_CONTENT_BLOCKS_METADATA_KEY] == [
+            {"type": "thinking", "thinking": "plan", "signature": "sig"},
+            {"type": "tool_use", "id": "t1", "name": "lookup", "input": {"x": 1}},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_gateway_top_level_reasoning_is_display_only(self):
+        response = MagicMock()
+        response.content = [self._block(type="text", text="answer")]
+        response.reasoning_content = "gateway plan"
+        response.usage = None
+        response.stop_reason = "end_turn"
+
+        message = await _make_client()._parse_response(response)
+
+        assert message.reasoning_content == "gateway plan"
+        assert message.metadata[_ANTHROPIC_CONTENT_BLOCKS_METADATA_KEY] == [
+            {"type": "text", "text": "answer"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_redacted_thinking_is_preserved_but_not_exposed(self):
+        response = MagicMock()
+        response.content = [
+            self._block(type="redacted_thinking", data="opaque-data"),
+            self._block(type="text", text="answer"),
+        ]
+        response.reasoning_content = None
+        response.usage = None
+        response.stop_reason = "end_turn"
+
+        message = await _make_client()._parse_response(response)
+
+        assert message.reasoning_content is None
+        assert message.metadata[_ANTHROPIC_CONTENT_BLOCKS_METADATA_KEY][0] == {
+            "type": "redacted_thinking",
+            "data": "opaque-data",
+        }
+
+    def test_stream_thinking_and_signature_are_preserved(self):
+        client = _make_client()
+        state = {}
+
+        start = MagicMock(type="content_block_start", index=0)
+        start.content_block = MagicMock(type="thinking", thinking="", signature="")
+        assert client._event_to_chunk(start, state) is None
+
+        thinking_event = MagicMock(type="content_block_delta", index=0)
+        thinking_event.delta = MagicMock(type="thinking_delta", thinking="plan")
+        thinking_chunk = client._event_to_chunk(thinking_event, state)
+        assert thinking_chunk.reasoning_content == "plan"
+
+        signature_event = MagicMock(type="content_block_delta", index=0)
+        signature_event.delta = MagicMock(type="signature_delta", signature="sig")
+        signature_chunk = client._event_to_chunk(signature_event, state)
+        assert signature_chunk.metadata[_ANTHROPIC_CONTENT_BLOCKS_METADATA_KEY] == [{
+            "type": "thinking",
+            "thinking": "plan",
+            "signature": "sig",
+        }]
+
+
+# ---------------------------------------------------------------------------
+# F. Sampling params: Anthropic forbids temperature + top_p together
+# ---------------------------------------------------------------------------
+
+
+class TestSamplingParams:
+    def _params(self, client: AnthropicModelClient, **overrides) -> dict:
+        kwargs = dict(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            temperature=None,
+            top_p=None,
+            model="claude-opus-4",
+            stop=None,
+            max_tokens=None,
+            stream=False,
+        )
+        kwargs.update(overrides)
+        return client._build_anthropic_params(**kwargs)
+
+    def test_temperature_wins_when_both_set(self):
+        params = self._params(_make_client(), temperature=0.6, top_p=0.8)
+        extra = params.get("extra_body") or {}
+        assert extra.get("temperature") == 0.6
+        assert "temperature" not in params
+        assert "top_p" not in params
+        assert "top_p" not in extra
+
+    def test_config_defaults_do_not_override_anthropic_sampling(self):
+        # Common config defaults are OpenAI-oriented. Omitting both lets the
+        # Anthropic model choose its protocol default and avoids Claude 4.7+ 400s.
+        params = self._params(_make_client())
+        extra = params.get("extra_body") or {}
+        assert "temperature" not in params
+        assert "top_p" not in params
+        assert "temperature" not in extra
+        assert "top_p" not in extra
+
+    def test_top_p_forwarded_when_temperature_absent(self):
+        # temperature can only be absent if the config itself has no default.
+        client = _make_client()
+        client.model_config.temperature = None
+        params = self._params(client, top_p=0.8)
+        extra = params.get("extra_body") or {}
+        assert extra.get("top_p") == 0.8
+        assert "top_p" not in params
+        assert "temperature" not in params
+        assert "temperature" not in extra
+
+    def test_default_top_p_dropped_when_temperature_absent(self):
+        # top_p=1.0 is the default (no nucleus truncation); skip it entirely.
+        client = _make_client()
+        client.model_config.temperature = None
+        params = self._params(client, top_p=1.0)
+        extra = params.get("extra_body") or {}
+        assert "top_p" not in params
+        assert "temperature" not in params
+        assert "top_p" not in extra
+        assert "temperature" not in extra
+
+    def test_anthropic_native_reasoning_controls_are_forwarded(self):
+        client = _make_client()
+        client.model_config = ModelRequestConfig(
+            model="claude-opus-4-6",
+            thinking={"type": "adaptive"},
+            output_config={"effort": "high"},
+        )
+        params = self._params(client, model="claude-opus-4-6")
+        extra = params.get("extra_body") or {}
+        assert params["thinking"] == {"type": "adaptive"}
+        assert params["output_config"] == {"effort": "high"}
+        assert "temperature" not in params
+        assert "top_p" not in params
+        assert "temperature" not in extra
+        assert "top_p" not in extra
+
+    def test_compatible_endpoint_reasoning_effort_is_forwarded(self):
+        client = _make_client()
+        client.model_config = ModelRequestConfig(model="glm-5", reasoning_effort="high")
+        params = self._params(client, model="glm-5")
+        assert "reasoning_effort" not in params
+        assert params["extra_body"]["reasoning_effort"] == "high"
+
+    def test_compatible_endpoint_extensions_merge_with_extra_body(self):
+        client = _make_client()
+        client.model_config = ModelRequestConfig(
+            model="glm-5",
+            reasoning_effort="high",
+            extra_body={"vendor_flag": True},
+        )
+        params = self._params(client, model="glm-5")
+        assert params["extra_body"] == {
+            "vendor_flag": True,
+            "reasoning_effort": "high",
+        }
+
+    def test_sampling_merges_into_existing_extra_body(self):
+        client = _make_client()
+        client.model_config.temperature = None
+        client.model_config = ModelRequestConfig(
+            model="glm-5",
+            extra_body={"vendor_flag": True},
+        )
+        params = self._params(client, model="glm-5", temperature=0.4)
+        extra = params["extra_body"]
+        assert extra["vendor_flag"] is True
+        assert extra["temperature"] == 0.4
+        assert "temperature" not in params
+
+    def test_top_k_goes_to_extra_body(self):
+        client = _make_client()
+        client.model_config.temperature = None
+        params = self._params(client, top_k=5)
+        extra = params.get("extra_body") or {}
+        assert extra.get("top_k") == 5
+        assert "top_k" not in params
+
+    def test_current_claude_model_drops_explicit_custom_sampling(self):
+        params = self._params(
+            _make_client(),
+            model="claude-opus-4-8",
+            temperature=0.6,
+            top_p=0.8,
+        )
+        extra = params.get("extra_body") or {}
+        assert "temperature" not in params
+        assert "top_p" not in params
+        assert "temperature" not in extra
+        assert "top_p" not in extra
+
+    def test_base_message_metadata_survives_common_conversion(self):
+        client = _make_client()
+        thinking = {"type": "thinking", "thinking": "plan", "signature": "sig"}
+        tool_use = {"type": "tool_use", "id": "t1", "name": "lookup", "input": {}}
+        message = AssistantMessage(
+            content="",
+            tool_calls=[{"id": "t1", "type": "function", "name": "lookup", "arguments": "{}"}],
+            metadata={_ANTHROPIC_CONTENT_BLOCKS_METADATA_KEY: [thinking, tool_use]},
+        )
+        params = self._params(client, messages=[message])
+        replayed = params["messages"][0]["content"]
+        assert replayed[0] == thinking
+        assert {key: replayed[1][key] for key in tool_use} == tool_use
+
+
+# ---------------------------------------------------------------------------
+# G. max_tokens fallback stays inside older Claude output caps
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultMaxTokens:
+    @pytest.mark.parametrize(
+        "model_name, expected",
+        [
+            ("claude-3-opus-20240229", 4096),
+            ("claude-3-sonnet-20240229", 4096),
+            ("claude-3-haiku-20240307", 4096),
+            ("anthropic.claude-3-haiku-20240307-v1:0", 4096),
+            ("claude-3-5-sonnet-20241022", 8192),
+            ("claude-3-5-haiku-20241022", 8192),
+            ("anthropic/claude-3.5-sonnet", 8192),
+            ("anthropic/claude-3.5-haiku", 8192),
+            ("claude-3-7-sonnet-20250219", 32768),
+            ("claude-sonnet-4-5", 32768),
+            ("claude-opus-4", 32768),
+            ("test-model", 32768),
+        ],
+    )
+    def test_unset_max_tokens_follows_model_output_cap(self, model_name, expected):
+        params = TestSamplingParams()._params(_make_client(), model=model_name, max_tokens=None)
+        assert params["max_tokens"] == expected
+
+    def test_missing_model_name_keeps_high_default(self):
+        assert default_max_tokens(None) == 32768
+        assert default_max_tokens("") == 32768
+        assert default_max_tokens("  ") == 32768
+
+    def test_explicit_max_tokens_overrides_old_model_cap(self):
+        client = _make_client()
+        client.model_config.max_tokens = 1024
+        params = TestSamplingParams()._params(client, model="claude-3-opus-20240229", max_tokens=None)
+        assert params["max_tokens"] == 1024
+
+        params = TestSamplingParams()._params(client, model="claude-3-5-sonnet-20241022", max_tokens=2048)
+        assert params["max_tokens"] == 2048

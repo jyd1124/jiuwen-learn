@@ -1,0 +1,192 @@
+OPEN SOURCE SOFTWARE NOTICE
+
+1. INTRODUCTION
+This open source software notice ("Notice") applies to openJiuwen Agent Runtime ("Product").
+The Product includes and/or is distributed with third-party software components licensed under open source licenses.
+All rights in such third-party components remain with their respective copyright holders.
+
+2. LICENSE PRIORITY
+For each third-party component, the applicable open source license terms govern the use, reproduction, modification,
+and distribution of that component. If any term in Product-level agreements conflicts with an applicable open source
+license for a specific component, the open source license controls for that component to the extent of the conflict.
+
+3. NO WARRANTY FOR OPEN SOURCE COMPONENTS
+THE OPEN SOURCE COMPONENTS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT.
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, COPYRIGHT HOLDERS AND CONTRIBUTORS OF OPEN SOURCE COMPONENTS
+SHALL NOT BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES.
+
+4. SCOPE AND VERSIONING
+- Product: openJiuwen Agent Runtime
+- Repository: agent-runtime
+- Notice Version: 2.0 (Legal-Strict Draft)
+- Last Updated: 2026-04-10
+
+5. COMPLIANCE DELIVERY MODEL
+This Notice provides a consolidated attribution list and license references for representative direct dependencies declared
+in this repository (including module-level pyproject.toml files). Depending on deployment method, platform, and installation
+time, the final runtime image may include additional transitive dependencies.
+
+Where required by applicable licenses, corresponding notices and full license texts are provided through one or more of:
+- This repository and distributed source archives;
+- Installed package metadata (for example, *.dist-info directories);
+- Official upstream repositories of the listed components.
+
+6. THIRD-PARTY COMPONENT LIST (SPDX-STYLE, REPRESENTATIVE)
+The table below is provided for compliance and attribution convenience. It is not a limitation of rights granted by each
+license and should be read together with upstream license files.
+
+6.1 Runtime / Core Dependencies
+
+- Name: Python
+  Package: python
+  Version: 3.11.x
+  SPDX-License-Identifier: Python-2.0
+  License URL: https://docs.python.org/3/license.html
+
+- Name: FastAPI
+  Package: fastapi
+  Version: 0.115.11
+  SPDX-License-Identifier: MIT
+  License URL: https://github.com/fastapi/fastapi/blob/master/LICENSE
+
+- Name: Uvicorn
+  Package: uvicorn
+  Version: 0.42.0
+  SPDX-License-Identifier: BSD-3-Clause
+  License URL: https://github.com/encode/uvicorn/blob/master/LICENSE.md
+
+- Name: Pydantic
+  Package: pydantic
+  Version: 2.11.7
+  SPDX-License-Identifier: MIT
+  License URL: https://github.com/pydantic/pydantic/blob/main/LICENSE
+
+- Name: Pydantic Settings
+  Package: pydantic-settings
+  Version: 2.5.2
+  SPDX-License-Identifier: MIT
+  License URL: https://github.com/pydantic/pydantic-settings/blob/main/LICENSE
+
+- Name: SQLAlchemy
+  Package: sqlalchemy
+  Version: 2.0.48
+  SPDX-License-Identifier: MIT
+  License URL: https://github.com/sqlalchemy/sqlalchemy/blob/main/LICENSE
+
+- Name: PyMySQL
+  Package: pymysql
+  Version: 1.1.1
+  SPDX-License-Identifier: MIT
+  License URL: https://github.com/PyMySQL/PyMySQL/blob/main/LICENSE
+
+- Name: cryptography
+  Package: cryptography
+  Version: >=42.0.0
+  SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
+  License URL: https://github.com/pyca/cryptography/blob/main/LICENSE
+
+- Name: aiomysql
+  Package: aiomysql
+  Version: 0.2.0
+  SPDX-License-Identifier: MIT
+  License URL: https://github.com/aio-libs/aiomysql/blob/master/LICENSE
+
+- Name: aiosqlite
+  Package: aiosqlite
+  Version: 0.21.0
+  SPDX-License-Identifier: MIT
+  License URL: https://github.com/omnilib/aiosqlite/blob/main/LICENSE
+
+- Name: redis-py
+  Package: redis
+  Version: 7.1.0
+  SPDX-License-Identifier: MIT
+  License URL: https://github.com/redis/redis-py/blob/master/LICENSE
+
+- Name: aiohttp
+  Package: aiohttp
+  Version: >=3.9.0
+  SPDX-License-Identifier: Apache-2.0
+  License URL: https://github.com/aio-libs/aiohttp/blob/master/LICENSE.txt
+
+- Name: PyYAML
+  Package: pyyaml
+  Version: >=6.0
+  SPDX-License-Identifier: MIT
+  License URL: https://github.com/yaml/pyyaml/blob/main/LICENSE
+
+- Name: Click
+  Package: click
+  Version: >=8.0.0
+  SPDX-License-Identifier: BSD-3-Clause
+  License URL: https://github.com/pallets/click/blob/main/LICENSE.txt
+
+- Name: python-dotenv
+  Package: python-dotenv
+  Version: >=1.0.0
+  SPDX-License-Identifier: BSD-3-Clause
+  License URL: https://github.com/theskumar/python-dotenv/blob/main/LICENSE
+
+- Name: python-multipart
+  Package: python-multipart
+  Version: >=0.0.6
+  SPDX-License-Identifier: Apache-2.0
+  License URL: https://github.com/Kludex/python-multipart/blob/master/LICENSE.txt
+
+- Name: greenlet
+  Package: greenlet
+  Version: >=3.0.0
+  SPDX-License-Identifier: MIT
+  License URL: https://github.com/python-greenlet/greenlet/blob/master/LICENSE
+
+6.2 Build / QA / Tooling Dependencies
+
+- Name: build
+  Package: build
+  Version: >=1.0.0
+  SPDX-License-Identifier: MIT
+  License URL: https://github.com/pypa/build/blob/main/LICENSE
+
+- Name: ruff
+  Package: ruff
+  Version: 0.9.10
+  SPDX-License-Identifier: MIT
+  License URL: https://github.com/astral-sh/ruff/blob/main/LICENSE
+
+- Name: pytest
+  Package: pytest
+  Version: 8.3.5
+  SPDX-License-Identifier: MIT
+  License URL: https://github.com/pytest-dev/pytest/blob/main/LICENSE
+
+- Name: coverage.py
+  Package: coverage
+  Version: 7.8.0
+  SPDX-License-Identifier: Apache-2.0
+  License URL: https://github.com/nedbat/coveragepy/blob/master/LICENSE.txt
+
+- Name: pytest-asyncio
+  Package: pytest-asyncio
+  Version: 1.2.0
+  SPDX-License-Identifier: Apache-2.0
+  License URL: https://github.com/pytest-dev/pytest-asyncio/blob/main/LICENSE
+
+- Name: pytest-mock
+  Package: pytest-mock
+  Version: 3.14.0
+  SPDX-License-Identifier: MIT
+  License URL: https://github.com/pytest-dev/pytest-mock/blob/main/LICENSE
+
+7. LICENSE TEXT AND ATTRIBUTION REQUESTS
+If any applicable attribution, notice, or license text is considered missing or incomplete, please contact project maintainers
+to request correction in a subsequent notice update.
+
+8. TRADEMARK NOTICE
+Names, logos, and marks of third-party projects are the property of their respective owners.
+This Notice does not grant trademark rights for any third-party project.
+
+9. RESERVATION
+This Notice is provided for compliance convenience and informational purposes. It does not modify or replace any rights or
+obligations under the original open source licenses.
+

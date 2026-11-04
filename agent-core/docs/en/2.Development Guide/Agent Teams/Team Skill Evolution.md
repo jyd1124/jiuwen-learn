@@ -1,0 +1,303 @@
+# Team Skill Evolution
+
+Team Skill Evolution is a multi-agent collaboration skill auto-creation and online evolution feature in agent-core, extracting reusable collaboration patterns from execution trajectories.
+
+## Core Concepts
+
+### Swarm Skill
+
+A Swarm Skill is the current agent-facing type for reusable multi-agent collaboration. It uses the following file
+structure:
+
+```
+skills/<skill-name>/
+├── SKILL.md          # Entry file (YAML frontmatter + Markdown body)
+│                      # frontmatter must include kind: swarm-skill
+├── roles/
+│   ├── <role-id>.md  # Detailed definition for each role
+│   └── ...
+├── workflow.md       # Workflow description (task dependencies, parallel/sequential)
+├── bind.md           # Constraints (round limits, timeouts, quality gates)
+└── evolutions.json   # Evolution records
+```
+
+Unlike regular Skills, Swarm Skills:
+
+- `kind: swarm-skill` identifies the current type. Legacy `kind: team-skill` definitions are still detected and
+  normalized to `swarm-skill` by agent-facing evolution schemas.
+- `roles` list defines roles and their skills/tools configuration
+- Suitable for multi-agent collaboration scenarios
+
+### Evolution Mechanism
+
+| Module | Function |
+|--------|----------|
+| `TeamSkillCreateRail` | Auto-detect collaboration patterns, suggest team skill creation |
+| `TeamSkillEvolutionRail` | Public rail for online evolution. |
+| `SkillExperienceOptimizer` | Shared optimizer used by the optional passive signal path with `profile="team"`. |
+| `evolution_reviewer` | Dedicated subagent used by Agent-decided active review through the rail-owned `evolve_review_task`. |
+| `ExperienceScorer` | Experience scoring and simplify maintenance |
+| `TrajectorySpanProcessor` | Shared in-process projection of completed observability spans into canonical trajectory evidence |
+
+---
+
+## Auto Creation
+
+### Principle
+
+`TeamSkillCreateRail` waits until the team task is completed, then checks whether the run spawned enough team members and did not already use an existing Team/Swarm Skill. When these gates pass, it injects a short follow_up to wake up the next round and injects system prompt text that guides the Agent to decide whether the collaboration pattern is reusable. If so, the Agent asks for confirmation in normal reply text. It must not use popup-style interaction tools for this confirmation.
+
+### Configuration Example
+
+```python
+from openjiuwen.harness.rails import TeamSkillCreateRail
+from openjiuwen.harness import create_deep_agent
+from openjiuwen.agent_teams.observability import (
+    ObservabilityConfig,
+    acquire_observability,
+    maybe_observability_rails,
+)
+from openjiuwen.extensions.observability.demand import get_trajectory_span_processor
+
+acquire_observability(ObservabilityConfig(exporter="console"))
+runtime_processor = get_trajectory_span_processor()
+
+create_rail = TeamSkillCreateRail(
+    skills_dir="/path/to/skills",
+    language="en",
+    trajectory_span_processor=runtime_processor,
+    min_team_members_for_create=2,  # trigger when spawn_member >= 2
+)
+
+agent = create_deep_agent(
+    model=model_client,
+    system_prompt="You are a team leader...",
+    tools=team_tools,
+    rails=[create_rail, *maybe_observability_rails()],
+    enable_task_loop=True,
+    workspace="/path/to/workspace",
+)
+```
+
+### Creation Flow
+
+1. Agent executes collaboration flow (calls `build_team`, `spawn_member`, `create_task`)
+2. Team completion callback marks the run as eligible for creation review
+3. Rail detects `spawn_member` call count reaches threshold and no existing Team/Swarm Skill was used
+4. Rail injects a short follow_up via `TaskLoopController.enqueue_follow_up()` and injects a system self-check prompt before the next model call
+5. Agent asks in normal reply text whether to create a Team/Swarm Skill when it finds reusable value
+6. User confirms or provides custom instructions
+7. Agent invokes `swarmskill-creator` or a compatible team skill creator skill
+8. Skill generates Team/Swarm Skill files based on the current team context
+
+---
+
+## Online Evolution
+
+`TeamSkillRail` remains available as a compatibility alias for `TeamSkillEvolutionRail`; new code should use
+`TeamSkillEvolutionRail`.
+
+### TeamSkillEvolutionRail Configuration
+
+```python
+from openjiuwen.harness import create_deep_agent
+from openjiuwen.harness.rails import (
+    EvolutionInterruptRail,
+    TeamSkillEvolutionRail,
+)
+from openjiuwen.harness.rails.evolution import EvolutionReviewRuntime, build_evolve_review_command_prompt
+from openjiuwen.agent_teams.observability import maybe_observability_rails
+
+review_runtime = EvolutionReviewRuntime()
+
+team_rail = TeamSkillEvolutionRail(
+    skills_dir="/path/to/skills",
+    llm=model_client,
+    model="gpt-4",
+    language="en",
+    trajectory_span_processor=runtime_processor,
+    team_id="research-team",
+    review_runtime=review_runtime,
+    signal_trigger=False,      # opt in to passive signal generation if needed
+    review_trigger=True,       # Agent decides after team completion
+    auto_save=False,           # generated records require user approval
+    async_evolution=True,      # Execute evolution asynchronously
+    evolution_total_timeout_secs=600.0,
+)
+interrupt_rail = EvolutionInterruptRail(
+    review_runtime=review_runtime,
+    submission_service=team_rail.approval_submission_service,
+)
+
+agent = create_deep_agent(
+    model=model_client,
+    tools=team_tools,
+    rails=[interrupt_rail, team_rail, *maybe_observability_rails()],
+    skills=["research-team"],  # Load existing team skill
+)
+```
+
+`runtime_processor` is the process-wide `TrajectorySpanProcessor` returned by
+`get_trajectory_span_processor()` after Team observability is acquired. The demand coordinator registers this object
+with the active OpenTelemetry provider. `TeamSkillEvolutionRail` uses Team root-trace routing to build its canonical
+clean window directly from completed observability spans; all evolution/create Rails in the same runtime must reuse
+that processor. Team agents mount the Agent/Team observability Rail pair returned by
+`maybe_observability_rails()` and release the Team observability demand only after their roots are finalized.
+The active Team root span supplies the authoritative team identity and must remain recording across the execution
+invoke and the subsequent `/evolve` review invoke when they share one Agent Session.
+
+This clean window is online evolution evidence, not a full Team runtime archive. The current API does not use a
+member snapshot source/sink registry.
+
+### Trigger Timing
+
+| Trigger Method | Trigger Condition |
+|----------------|-------------------|
+| Passive signal trigger | `signal_trigger=True` and team completion is observed |
+| Completion review trigger | `review_trigger=True` and team completion is observed |
+| User-requested review | Host resolves the subject, builds a command prompt, and runs it as the next query in the same Agent Session |
+
+Both switches default to `False`. If both are enabled, completion review takes precedence and passive signal generation is skipped for that completion.
+
+### Evolution Paths
+
+#### 1. Passive Signal Evolution
+
+When `signal_trigger=True`, the rail aggregates team execution evidence and detects:
+
+- **Role coordination issues**: Collaboration breaks, data not passed
+- **Constraint violations**: Timeout, output format issues
+- **Workflow inefficiency**: Redundant calls, extra steps
+- **Role capability gaps**: Repeated failures, poor output quality
+
+When issues are detected, the rail calls the shared `SkillExperienceOptimizer(profile="team")` to generate experience records. This path stages records directly and uses the record approval flow below.
+
+#### 2. Agent-Decided Active Review
+
+When `review_trigger=True`, team completion schedules a short self-check follow_up. The main Agent decides whether a used team skill needs evolution. If it does, it calls `prepare_skill_evolution(user_confirmed=true)` and passes the returned `evolution_review_ref` to the rail-owned `evolve_review_task`. That tool runs only the dedicated `evolution_reviewer`, which inspects the bounded review materials and submits proposed evolution through the shared review runtime.
+
+The active path does not need a global `SubagentRail` or general-purpose `task_tool`.
+
+#### 3. User Request Evolution
+
+When a user issues `/evolve`, the host follows the command-dispatch path used by JiuwenClaw: it resolves the actual
+Skill kind, builds the restricted review prompt, and replaces the command input with that prompt for the next Agent
+run in the same Session.
+
+```python
+from openjiuwen.harness.rails.evolution import build_evolve_review_command_prompt
+
+subject = team_rail.store.resolve_subject_payload("research-team")
+followup_prompt = build_evolve_review_command_prompt(
+    subject=subject,
+    user_intent="Add reviewer role, limit research time to 10 minutes",
+)
+result = await Runner.run_agent(agent, {"query": followup_prompt}, session=session)
+```
+
+The prompt requires `prepare_skill_evolution` → `evolve_review_task` → `evolve_skill_experiences`. Current Rail or
+aggregated Team trajectory is the default evidence window, while `user_intent` supplies review direction.
+`request_user_evolution()` remains available only as a compatibility wrapper for older hosts.
+
+### Passive Record Approval Flow
+
+1. Rail generates experience records and stages them
+2. The approval event from `drain_pending_host_events()` can be shown by the host UI
+3. User selects "Accept" or "Reject"
+4. On approval, call `approve_record(request_id)` to write to `evolutions.json`
+
+```python
+for event in await team_rail.drain_pending_host_events(wait=True):
+    meta = event.payload.get("evolution_meta", {})
+    if meta.get("event_kind") == "approval":
+        await team_rail.approve_record(event.payload["request_id"])
+```
+
+Active-review proposals use the `EvolutionInterruptRail` and review tools instead of this passive `approval_event` path.
+
+---
+
+## Experience Management
+
+### Scoring System
+
+ExperienceScorer uses three-dimension weighted scoring:
+
+| Dimension | Formula | Weight |
+|-----------|---------|--------|
+| E (Effectiveness) | Beta(1,1) Bayesian smoothing | 0.5 |
+| U (Utilization) | `times_used / times_presented` | 0.3 |
+| F (Freshness) | Time decay + version expiry penalty | 0.2 |
+
+**Composite score**: `score = 0.5 * E + 0.3 * U + 0.2 * F`
+
+### Simplify Operations
+
+```python
+simplify_result = await team_rail.request_simplify(
+    skill_name="research-team",
+    user_intent="Clean up outdated experiences",
+)
+
+if simplify_result.approval_event:
+    await team_rail.on_approve_simplify(simplify_result.request_id)
+
+# The scorer-generated cleanup actions are applied after approval.
+```
+
+| Operation | Description |
+|-----------|-------------|
+| DELETE | Remove low-quality experiences (score < threshold) |
+| MERGE | Combine similar experiences |
+| REFINE | Optimize verbose content |
+| KEEP | Retain high-quality experiences |
+
+### Rebuild Flow
+
+```python
+prompt = await team_rail.request_rebuild(
+    skill_name="research-team",
+    user_intent="Comprehensive optimization based on historical experiences",
+    min_score=0.5,  # Only keep experiences with score >= 0.5
+)
+
+# prompt is rebuild instruction text, needs injection into Agent execution
+```
+
+Rebuild process:
+
+1. Archive current `SKILL.md` and `evolutions.json` to `archive/`
+2. Filter high-quality evolution experiences (score >= min_score)
+3. Build rebuild prompt, invoke `teamskill-creator` skill to generate new version
+4. Clear `evolutions.json`
+
+---
+
+## Best Practices
+
+### When to Use
+
+- Multi-agent collaboration scenarios (`spawn_member >= 2`)
+- Need to capture collaboration experience, form reusable patterns
+- Team skills require continuous improvement and optimization
+
+### Configuration Recommendations
+
+| Setting | Recommendation |
+|---------|----------------|
+| `min_team_members_for_create` | Adjust based on team size, suggest 2-3 |
+| `auto_save` | For important evolution suggest `False`, ensure approval |
+| `async_evolution` | For long tasks suggest `True`, avoid blocking |
+| `evolution_total_timeout_secs` | Adjust based on task complexity, suggest 300-900 |
+
+### Regular Maintenance
+
+1. Execute `request_simplify()` weekly and approve the generated cleanup actions to clean low-quality experiences
+2. Evaluate monthly whether `request_rebuild()` is needed
+3. Set `auto_save=False` before important evolution to ensure user approval
+
+### Notes
+
+- `TeamSkillCreateRail` and `TeamSkillEvolutionRail` can be used together
+- Rails depend on DeepAgent with `enable_task_loop=True`
+- Evolution-generated content requires user approval to take effect

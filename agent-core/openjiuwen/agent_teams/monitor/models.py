@@ -1,0 +1,299 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Monitor output models decoupled from internal SQLModel and event schemas.
+
+These Pydantic models form the public contract of the monitor module.
+Upper-layer services consume these types without depending on database
+models or internal event message classes.
+"""
+
+from __future__ import annotations
+
+import time
+from enum import Enum
+
+from pydantic import BaseModel, Field
+
+from openjiuwen.agent_teams.message_template import parse_meta
+
+
+class TeamInfo(BaseModel):
+    """Team basic information."""
+
+    team_name: str
+    display_name: str
+    leader_member_name: str
+    desc: str | None = None
+    created: int = Field(description="Creation timestamp in milliseconds")
+
+    @classmethod
+    def from_internal(cls, team) -> TeamInfo:
+        """Build from internal ``Team`` SQLModel instance.
+
+        Args:
+            team: A ``Team`` database row object.
+        """
+        return cls(
+            team_name=team.team_name,
+            display_name=team.display_name,
+            leader_member_name=team.leader_member_name,
+            desc=team.desc,
+            created=team.created,
+        )
+
+
+class MemberInfo(BaseModel):
+    """Team member information."""
+
+    member_name: str
+    team_name: str
+    display_name: str
+    desc: str | None = None
+    status: str = Field(description="MemberStatus value")
+    execution_status: str | None = Field(default=None, description="ExecutionStatus value")
+    mode: str = Field(description="MemberMode value")
+    role: str = Field(description="TeamRole value (leader/teammate/human_agent/passive_human)")
+    cli_agent: str | None = Field(
+        default=None,
+        description=(
+            "External CLI backend name ('claude' / 'codex' / ...) for members "
+            "spawned on an external CLI (spawn_teammate with cli_agent, an external-runtime "
+            "expert, or an inline task member); None for ordinary members. Such a "
+            "member's role is plain TEAMMATE, so this is the only field that "
+            "identifies it as CLI-backed."
+        ),
+    )
+
+    @classmethod
+    def from_internal(cls, member) -> MemberInfo:
+        """Build from internal ``TeamMember`` SQLModel instance.
+
+        Args:
+            member: A ``TeamMember`` database row object.
+        """
+        from openjiuwen.agent_teams.tools.member_options import load_member_options
+
+        return cls(
+            member_name=member.member_name,
+            team_name=member.team_name,
+            display_name=member.display_name,
+            desc=member.desc,
+            status=member.status,
+            execution_status=member.execution_status,
+            mode=member.mode,
+            role=member.role,
+            cli_agent=load_member_options(getattr(member, "options", None)).cli_agent,
+        )
+
+
+class TaskInfo(BaseModel):
+    """Task information.
+
+    ``updated_at`` is the millisecond wall-clock timestamp of the most
+    recent status transition on this task. Its semantic meaning is tied
+    to the current ``status``.
+    """
+
+    task_id: str
+    team_name: str
+    title: str
+    content: str
+    status: str = Field(description="TaskStatus value")
+    assignee: str | None = None
+    updated_at: int | None = None
+
+    @classmethod
+    def from_internal(cls, task) -> TaskInfo:
+        """Build from internal ``TeamTaskBase`` SQLModel instance.
+
+        Args:
+            task: A ``TeamTaskBase`` database row object.
+        """
+        return cls(
+            task_id=task.task_id,
+            team_name=task.team_name,
+            title=task.title,
+            content=task.content,
+            status=task.status,
+            assignee=task.assignee,
+            updated_at=task.updated_at,
+        )
+
+
+class MessageInfo(BaseModel):
+    """Mailbox message information."""
+
+    message_id: str
+    team_name: str
+    from_member_name: str
+    to_member_name: str | None = None
+    content: str
+    protocol: str = "plain"
+    timestamp: int
+    broadcast: bool
+    is_read: bool = False
+    meta: dict | None = Field(
+        default=None,
+        description=(
+            "Template descriptor of a framework message ({template, refs, params}). "
+            "Set only for template rows, whose ``content`` is empty until delivery renders it."
+        ),
+    )
+
+    @classmethod
+    def from_internal(cls, msg) -> MessageInfo:
+        """Build from internal ``TeamMessageBase`` SQLModel instance.
+
+        Args:
+            msg: A ``TeamMessageBase`` database row object.
+        """
+        return cls(
+            message_id=msg.message_id,
+            team_name=msg.team_name,
+            from_member_name=msg.from_member_name,
+            to_member_name=msg.to_member_name,
+            content=msg.content,
+            protocol=msg.protocol,
+            timestamp=msg.timestamp,
+            broadcast=msg.broadcast,
+            is_read=msg.is_read,
+            meta=parse_meta(getattr(msg, "meta", None)),
+        )
+
+
+class MonitorEventType(str, Enum):
+    """Observable event types exposed by the monitor.
+
+    Only team, member, task, and message events are included.
+    Internal events (plan approval, tool approval, worktree,
+    workspace lock, etc.) are excluded.
+    """
+
+    # Team lifecycle
+    TEAM_CREATED = "team_created"
+    TEAM_CLEANED = "team_cleaned"
+    TEAM_STANDBY = "team_standby"
+
+    # Member lifecycle
+    MEMBER_SPAWNED = "member_spawned"
+    MEMBER_RESTARTED = "member_restarted"
+    MEMBER_STATUS_CHANGED = "member_status_changed"
+    MEMBER_EXECUTION_CHANGED = "member_execution_changed"
+    MEMBER_SHUTDOWN = "member_shutdown"
+    MEMBER_CANCELED = "member_canceled"
+
+    # Task
+    TASK_CREATED = "task_created"
+    TASK_PLAN_REQUEST = "task_plan_request"
+    TASK_PLAN_RESPONSE = "task_plan_response"
+    TASK_UPDATED = "task_updated"
+    TASK_CLAIMED = "task_claimed"
+    TASK_STARTED = "task_started"
+    TASK_COMPLETED = "task_completed"
+    TASK_CANCELLED = "task_cancelled"
+    TASK_UNBLOCKED = "task_unblocked"
+    TASK_RELEASED = "task_released"
+    TASK_REVOKED = "task_revoked"
+    TASK_SUBMITTED_FOR_REVIEW = "task_submitted_for_review"
+    TASK_VERIFIED = "task_verified"
+    TASK_REVISION_REQUESTED = "task_revision_requested"
+
+    # Message
+    MESSAGE = "message"
+    BROADCAST = "broadcast"
+
+
+_MONITOR_EVENT_VALUES = frozenset(e.value for e in MonitorEventType)
+
+
+class MonitorEvent(BaseModel):
+    """Real-time event emitted by the monitor.
+
+    All payload fields from the four event categories (team, member,
+    task, message) are flattened into explicit optional fields.
+    Each event type only populates the relevant subset. Field names
+    mirror the internal ``BaseEventMessage`` payload schema, so the
+    conversion is a direct pass-through.
+
+    Common fields (always present):
+        event_type, team_name, timestamp
+
+    Team event fields:
+        TEAM_CREATED: display_name, leader_member_name, created
+
+    Member event fields:
+        MEMBER_RESTARTED: reason, restart_count
+        MEMBER_STATUS_CHANGED / MEMBER_EXECUTION_CHANGED: old_status, new_status
+        MEMBER_SHUTDOWN: force, target_status
+
+    Task event fields:
+        All TASK_*: task_id
+        TASK_CREATED: task_id, status
+        TASK_PLAN_REQUEST: task_id, status, plan_id, member_plan_md
+        TASK_PLAN_RESPONSE: task_id, status, plan_id, approved
+        TASK_SUBMITTED_FOR_REVIEW: task_id, reviewer
+        TASK_REVISION_REQUESTED: task_id, feedback
+
+    Message event fields:
+        MESSAGE: message_id, from_member_name, to_member_name
+        BROADCAST: message_id, from_member_name
+    """
+
+    event_type: MonitorEventType
+    team_name: str
+    member_name: str | None = None
+    timestamp: int = Field(description="Monitor receive time in milliseconds")
+
+    # -- Team fields --
+    display_name: str | None = None
+    leader_member_name: str | None = None
+    created: int | None = None
+
+    # -- Member fields --
+    old_status: str | None = None
+    new_status: str | None = None
+    reason: str | None = None
+    restart_count: int | None = None
+    force: bool | None = None
+    # Settled status a MEMBER_SHUTDOWN leads to: "shut_down" or "dormant".
+    target_status: str | None = None
+
+    # -- Task fields --
+    task_id: str | None = None
+    status: str | None = None
+    plan_id: str | None = None
+    member_plan_md: str | None = None
+    approved: bool | None = None
+    # Reviewer member names to notify when a task enters the verify gate
+    # (TASK_SUBMITTED_FOR_REVIEW).
+    reviewer: list[str] | None = None
+    # Reviewer feedback directing the rework loop (TASK_REVISION_REQUESTED).
+    feedback: str | None = None
+
+    # -- Message fields --
+    message_id: str | None = None
+    from_member_name: str | None = None
+    to_member_name: str | None = None
+
+    @classmethod
+    def from_event_message(cls, event_message) -> MonitorEvent | None:
+        """Build from internal ``EventMessage``.
+
+        Returns None if the event type is not in MonitorEventType
+        (i.e. internal events are silently dropped).
+
+        Args:
+            event_message: An ``EventMessage`` instance.
+        """
+        raw_type = event_message.event_type
+        if raw_type not in _MONITOR_EVENT_VALUES:
+            return None
+
+        return cls.model_validate(
+            {
+                **event_message.payload,
+                "event_type": raw_type,
+                "timestamp": int(round(time.time() * 1000)),
+            },
+        )

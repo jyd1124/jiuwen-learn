@@ -1,0 +1,323 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+"""Stop condition definitions for DeepAgent task loop."""
+from __future__ import annotations
+
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Optional,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ================================================================
+# Evaluation context (decoupled from AgentCallbackContext)
+# ================================================================
+
+@dataclass
+class StopEvaluationContext:
+    """Runtime context passed to each StopConditionEvaluator.
+
+    Decoupled from AgentCallbackContext so evaluators do not
+    depend on the agent callback system.
+
+    Attributes:
+        iteration: Number of completed outer-loop rounds.
+        token_usage: Cumulative token usage across all rounds.
+        elapsed_seconds: Wall-clock seconds since loop start.
+        last_result: Result dict from the most recent round.
+        extra: Arbitrary extra data for custom evaluators.
+    """
+
+    iteration: int = 0
+    token_usage: int = 0
+    elapsed_seconds: float = 0.0
+    last_result: Optional[Dict[str, Any]] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+
+# ================================================================
+# Evaluator interface
+# ================================================================
+
+class StopConditionEvaluator(ABC):
+    """Strategy interface for a single stop condition.
+
+    Implement ``should_stop()`` to return ``True`` when the
+    outer task loop should terminate.
+    """
+
+    @property
+    def name(self) -> str:
+        """Evaluator name used as stop_reason."""
+        return self.__class__.__name__
+
+    @abstractmethod
+    def should_stop(
+        self, ctx: StopEvaluationContext,
+    ) -> bool:
+        """Return True if the loop should stop.
+
+        Args:
+            ctx: Current evaluation context.
+
+        Returns:
+            True to stop the loop, False to continue.
+        """
+
+    def reset(self) -> None:
+        """Reset internal state for a new invoke cycle."""
+
+    def get_state(self) -> Optional[Dict[str, Any]]:
+        """Export serialisable state snapshot.
+
+        Returns:
+            A JSON-safe dict, or None if no state to save.
+        """
+        return None
+
+    def load_state(self, _data: Dict[str, Any]) -> None:
+        """Restore state from a persisted snapshot.
+
+        Args:
+            _data: Previously exported state dict.
+        """
+
+
+# ================================================================
+# Built-in evaluators
+# ================================================================
+
+class MaxRoundsEvaluator(StopConditionEvaluator):
+    """Stop after a fixed number of outer-loop rounds.
+
+    Attributes:
+        max_rounds: Maximum number of completed rounds.
+    """
+
+    def __init__(self, max_rounds: int) -> None:
+        self._max_rounds = max_rounds
+
+    def should_stop(self, ctx: StopEvaluationContext) -> bool:
+        """Return True when completed rounds >= max_rounds."""
+        return ctx.iteration >= self._max_rounds
+
+
+class TokenBudgetEvaluator(StopConditionEvaluator):
+    """Stop when cumulative token usage exceeds a budget.
+
+    Attributes:
+        max_tokens: Token budget across all rounds.
+    """
+
+    def __init__(self, max_tokens: int) -> None:
+        self._max_tokens = max_tokens
+
+    def should_stop(self, ctx: StopEvaluationContext) -> bool:
+        """Return True when token usage >= max_tokens."""
+        return ctx.token_usage >= self._max_tokens
+
+
+class TimeoutEvaluator(StopConditionEvaluator):
+    """Stop when wall-clock elapsed time exceeds a limit.
+
+    Attributes:
+        timeout_seconds: Elapsed-time limit in seconds.
+    """
+
+    def __init__(self, timeout_seconds: float) -> None:
+        self._timeout_seconds = timeout_seconds
+
+    def should_stop(self, ctx: StopEvaluationContext) -> bool:
+        """Return True when elapsed_seconds >= timeout_seconds."""
+        return ctx.elapsed_seconds >= self._timeout_seconds
+
+
+class NoProgressAnswerEvaluator(StopConditionEvaluator):
+    """Stop after repeated no-tool answers with little or no content."""
+
+    def __init__(
+        self,
+        *,
+        max_consecutive_empty_answers: int = 3,
+        min_answer_chars: int = 80,
+    ) -> None:
+        self._max_consecutive_empty_answers = max(
+            1,
+            int(max_consecutive_empty_answers),
+        )
+        self._min_answer_chars = max(0, int(min_answer_chars))
+        self._consecutive_empty_answers = 0
+
+    def should_stop(self, ctx: StopEvaluationContext) -> bool:
+        """Return True once repeated short answers indicate no progress."""
+        result = ctx.last_result or {}
+        result_type = str(result.get("result_type", "")).strip().lower()
+        output_len = len(str(result.get("output", "")).strip())
+
+        if result_type == "answer" and output_len < self._min_answer_chars:
+            self._consecutive_empty_answers += 1
+        else:
+            self._consecutive_empty_answers = 0
+
+        if (
+            self._consecutive_empty_answers
+            >= self._max_consecutive_empty_answers
+        ):
+            logger.info(
+                "No progress answer guard triggered: "
+                "round=%s, output_len=%s, "
+                "consecutive_empty_answers=%s, "
+                "max_consecutive_empty_answers=%s, "
+                "min_answer_chars=%s",
+                ctx.iteration,
+                output_len,
+                self._consecutive_empty_answers,
+                self._max_consecutive_empty_answers,
+                self._min_answer_chars,
+            )
+            return True
+        return False
+
+    def reset(self) -> None:
+        self._consecutive_empty_answers = 0
+
+    def get_state(self) -> Optional[Dict[str, Any]]:
+        return {
+            "consecutive_empty_answers": self._consecutive_empty_answers,
+            "max_consecutive_empty_answers": self._max_consecutive_empty_answers,
+            "min_answer_chars": self._min_answer_chars,
+        }
+
+    def load_state(self, data: Dict[str, Any]) -> None:
+        self._consecutive_empty_answers = max(
+            0,
+            int(data.get("consecutive_empty_answers", 0) or 0),
+        )
+
+
+class CompletionPromiseEvaluator(StopConditionEvaluator):
+    """Stop when a completion promise has been fulfilled.
+
+    The evaluator does NOT parse LLM output directly.
+    ``TaskCompletionRail`` detects the promise tag and calls
+    ``notify_fulfilled()`` to set the internal flag.
+
+    Attributes:
+        promise: Expected promise string.
+    """
+
+    def __init__(
+        self,
+        promise: str,
+        required_confirmations: int = 1,
+    ) -> None:
+        self._promise = promise
+        self._fulfilled: bool = False
+        self._matched_text: str = ""
+        self._required_confirmations = max(
+            1, int(required_confirmations)
+        )
+        self._confirmation_count = 0
+
+    def notify_fulfilled(self, matched_text: str) -> None:
+        """Mark the promise as fulfilled.
+
+        Args:
+            matched_text: The normalised text matched from output.
+        """
+        self._confirmation_count += 1
+        self._fulfilled = (
+            self._confirmation_count
+            >= self._required_confirmations
+        )
+        self._matched_text = matched_text
+
+    def notify_absent(self) -> None:
+        """Record that the expected promise was not present.
+
+        Confirmation counts are consecutive: any absent promise
+        breaks the streak and requires starting confirmation over.
+        """
+        self._confirmation_count = 0
+        self._fulfilled = False
+        self._matched_text = ""
+
+    def should_stop(self, ctx: StopEvaluationContext) -> bool:  # noqa: ARG002
+        """Return True when the promise flag is set."""
+        _ = ctx
+        return self._fulfilled
+
+    def reset(self) -> None:
+        self._fulfilled = False
+        self._matched_text = ""
+        self._confirmation_count = 0
+
+    def get_state(self) -> Optional[Dict[str, Any]]:
+        return {
+            "fulfilled": self._fulfilled,
+            "matched_text": self._matched_text,
+            "required_confirmations": self._required_confirmations,
+            "confirmation_count": self._confirmation_count,
+        }
+
+    def load_state(self, data: Dict[str, Any]) -> None:
+        self._fulfilled = bool(data.get("fulfilled", False))
+        self._matched_text = str(data.get("matched_text", ""))
+        self._required_confirmations = max(
+            1,
+            int(
+                data.get(
+                    "required_confirmations",
+                    self._required_confirmations,
+                )
+            ),
+        )
+        self._confirmation_count = max(
+            0,
+            int(data.get("confirmation_count", 0)),
+        )
+        self._fulfilled = (
+            self._confirmation_count
+            >= self._required_confirmations
+        ) or self._fulfilled
+
+
+class CustomPredicateEvaluator(StopConditionEvaluator):
+    """Stop based on a user-supplied predicate.
+
+    The predicate receives the full ``StopEvaluationContext``
+    so it can inspect iteration count, token usage, and any
+    custom data stored in ``ctx.extra``.
+
+    Attributes:
+        predicate: Callable that returns True to stop.
+    """
+
+    def __init__(
+        self,
+        predicate: Callable[[StopEvaluationContext], bool],
+    ) -> None:
+        self._predicate = predicate
+
+    def should_stop(self, ctx: StopEvaluationContext) -> bool:
+        """Delegate to user predicate."""
+        return self._predicate(ctx)
+
+
+__all__ = [
+    "StopEvaluationContext",
+    "StopConditionEvaluator",
+    "MaxRoundsEvaluator",
+    "TokenBudgetEvaluator",
+    "TimeoutEvaluator",
+    "NoProgressAnswerEvaluator",
+    "CompletionPromiseEvaluator",
+    "CustomPredicateEvaluator",
+]

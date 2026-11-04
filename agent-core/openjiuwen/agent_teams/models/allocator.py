@@ -1,0 +1,909 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Model config allocators for team member spawning.
+
+When ``TeamSpec.model_pool`` is non-empty, an allocator distributes pool
+entries across leader and teammates so concurrent calls spread across
+endpoints instead of saturating a single one. Four strategies ship:
+
+* ``RoundRobinModelAllocator`` — linear rotation through every entry,
+  ignoring ``model_name``. Good for pools where every entry is an
+  interchangeable endpoint of the same logical model. Always allocates.
+* ``ByModelNameAllocator`` — looks up the named group and round-robins
+  within it. The caller must pass ``model_name``; the allocator returns
+  ``None`` when the name is missing or absent from the pool, in which
+  case the caller falls back to its per-agent model.
+* ``RouterAllocator`` — single-endpoint router serving many model names
+  (OpenRouter, LiteLLM proxy, ...). Built when ``TeamSpec.model_pool``
+  is materialized from a ``ModelRouterConfig``. Lookup-by-name like
+  ``ByModelNameAllocator``, but ``allocate()`` with no hint returns the
+  first declared name so the leader has a deterministic default.
+* ``IntelliRouterAllocator`` — same lookup as ``RouterAllocator``, over
+  a pool materialized from an ``IntelliRouterConfig`` where each entry
+  carries a whole deployment list and the client-side router owns
+  retry / failover / load balancing. Availability is the router's job
+  here, not the allocator's; the allocator only picks the model name.
+
+The first three spread members *across* endpoints — availability is the
+allocator's concern. ``intelli_router`` inverts that: every member shares
+one deployment list and the client fails over per request. Pick one layer
+to own multi-endpoint reliability; stacking both duplicates the concern.
+
+Identity model: every assignment is referenced as
+``(model_name, group_index)`` — the entry's position within its
+same-name group in the pool at allocation time. The DB persists only
+this lightweight reference; the live config (credentials, endpoint
+URL, request knobs) is rehydrated from the in-session pool via
+``resolve_member_model``. Pool updates therefore reach all members on
+their next resolution without DB writes.
+
+When the pool is empty no allocator is built — every member resolves
+its model from ``TeamAgentSpec.agents`` via the regular per-agent
+fallback in ``TeamAgent._setup_agent``.
+
+Custom allocation strategies (weighted, least-recently-used, ...) only
+need to satisfy the ``ModelAllocator`` protocol.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, Protocol, TYPE_CHECKING, runtime_checkable
+
+from openjiuwen.agent_teams.models.pool import (
+    INTELLI_ROUTER_PROVIDER,
+    INTELLI_ROUTER_UNIFIED_MODEL,
+    ModelPoolEntry,
+)
+from openjiuwen.core.common.logging import team_logger
+
+if TYPE_CHECKING:
+    from openjiuwen.agent_teams.schema.blueprint import TeamAgentSpec
+    from openjiuwen.agent_teams.schema.deep_agent_spec import TeamModelConfig
+    from openjiuwen.agent_teams.schema.team import TeamSpec
+
+
+@dataclass(frozen=True, slots=True)
+class Allocation:
+    """One allocator result.
+
+    Carries the picked pool entry plus the position needed to persist a
+    DB reference. Helpers materialize the runtime config and the DB ref
+    so call sites never touch the entry directly.
+    """
+
+    entry: ModelPoolEntry
+    group_index: int
+    persistence_model_name: str | None = None
+    route_tag: str | None = None
+    """``fallback_tag`` pinning a model-group member to matching deployments."""
+
+    def to_team_model_config(self) -> "TeamModelConfig":
+        """Materialize the live ``TeamModelConfig`` for runtime use."""
+        return _with_route_tag(self.entry.to_team_model_config(), self.route_tag)
+
+    def to_db_ref(self) -> dict:
+        """Produce the lightweight model ref for DB persistence.
+
+        ``route_tag`` is only present for a model-group member pinned to one
+        model; it is a selection criterion, not a config snapshot.
+        """
+        ref: dict[str, Any] = {
+            "model_name": self.persistence_model_name or self.entry.model_name,
+            "model_index": self.group_index,
+        }
+        if self.route_tag:
+            ref["route_tag"] = self.route_tag
+        return ref
+
+
+@dataclass(frozen=True, slots=True)
+class CliModelAllocation:
+    """A real deployment projected for an external CLI process."""
+
+    model: str
+    provider: str
+    api_base: str
+    api_key: str
+    route_id: str | None = None
+
+    def to_external_config(self):
+        from openjiuwen.agent_teams.schema.team import ExternalCliModelConfig
+
+        return ExternalCliModelConfig(
+            model=self.model or None,
+            provider=self.provider or None,
+            api_base=self.api_base or None,
+            api_key=self.api_key or None,
+        )
+
+    def to_team_model_config(self):
+        """Materialize a physical deployment as a team model config."""
+        from openjiuwen.agent_teams.schema.deep_agent_spec import TeamModelConfig
+        from openjiuwen.core.foundation.llm import ModelClientConfig, ModelRequestConfig
+
+        return TeamModelConfig(
+            model_client_config=ModelClientConfig(
+                client_provider=self.provider,
+                api_base=self.api_base,
+                api_key=self.api_key,
+            ),
+            model_request_config=ModelRequestConfig(model=self.model),
+        )
+
+
+@runtime_checkable
+class ModelAllocator(Protocol):
+    """Allocates one pool entry per call.
+
+    Implementations encapsulate the policy for picking the next entry
+    (round-robin, weighted, least-recently-used, ...). Returning
+    ``None`` signals "no entry available" — callers fall back to the
+    member's per-agent model config.
+
+    Allocators must also expose ``state_dict`` / ``load_state_dict`` so
+    rotation counters survive full-restart recovery. The pool itself
+    lives on ``TeamSpec`` and is rebuilt from there on recovery; only
+    the volatile counters and a pool digest need to ride along inside
+    the session. ``load_state_dict`` automatically resets counters
+    when the persisted digest no longer matches the current pool, so a
+    pool composition change between save and load doesn't carry stale
+    indexes into the new layout.
+    """
+
+    def allocate(
+        self,
+        model_name: Optional[str] = None,
+        *,
+        provider_filter: Optional[Callable[[str], bool]] = None,
+    ) -> Optional[Allocation]:
+        """Return the next allocation, or None when unavailable.
+
+        Args:
+            model_name: Optional model-name hint. Allocators that
+                select by name (``ByModelNameAllocator``) require it
+                and return ``None`` when missing or unknown. Allocators
+                that ignore name (``RoundRobinModelAllocator``) accept
+                it for signature compatibility and discard it.
+            provider_filter: Optional predicate on ``api_provider``; when
+                set, entries whose provider does not satisfy the predicate
+                are skipped. Used by external-CLI members to match the
+                pool entry's protocol to the CLI kind (e.g. Claude needs
+                Anthropic, Codex needs OpenAI-compatible).
+        """
+        ...
+
+    def state_dict(self) -> dict:
+        """Return a JSON-friendly snapshot of allocator counters.
+
+        The returned dict must round-trip through ``json.dumps`` /
+        ``json.loads`` and through ``load_state_dict`` of the same
+        allocator class so a freshly-built allocator can resume the
+        previous rotation.
+        """
+        ...
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore counters previously produced by ``state_dict``.
+
+        Implementations should be defensive: tolerate missing keys
+        (resume from zero), unknown keys (ignore), and pool-composition
+        changes between save and load (skip stale group entries, leave
+        new ones at zero, optionally reset everything when the pool
+        digest differs).
+        """
+        ...
+
+
+@runtime_checkable
+class CliModelCatalog(Protocol):
+    """Catalog of physical models projected to external CLI agents."""
+
+    def list_cli_models(
+        self,
+        provider_filter: Callable[[str], bool] | None = None,
+    ) -> list[CliModelAllocation]:
+        """List physical models available to external CLI agents."""
+        ...
+
+    def resolve_cli_models(
+        self,
+        model_name: str,
+        provider_filter: Callable[[str], bool] | None = None,
+    ) -> list[CliModelAllocation]:
+        """Resolve physical models by name."""
+        ...
+
+
+def _router_config(entry: ModelPoolEntry) -> dict:
+    """The structured IntelliRouter config nested in a logical entry (may be empty)."""
+    router = (entry.metadata.get("client") or {}).get("intelli_router")
+    return router if isinstance(router, dict) else {}
+
+
+def _tag_key(tag: str) -> str:
+    """Comparison key for model names: spellings differing only in case are one model."""
+    return tag.strip().casefold()
+
+
+def _group_fallback_tag(router: dict) -> str | None:
+    """The tag a ``tag-filtered`` model group is already restricted to, if any."""
+    if router.get("strategy") != "tag-filtered":
+        return None
+    tag = str((router.get("strategy_kwargs") or {}).get("fallback_tag") or "").strip()
+    return tag or None
+
+
+def _selectable_route_tags(router: dict) -> list[str]:
+    """Tags a member can be pinned to: deployment ``fallback_tag`` values.
+
+    Spellings that differ only in case (``GLM-5.3-Flash`` / ``GLM-5.3-flash``)
+    collapse into one entry, written as the first spelling in group order; the
+    member pinned to it is routed to all of them (see ``_with_route_tag``).
+
+    A ``tag-filtered`` group only ever routes to its own tag, so pinning a
+    member to any other tag would bypass the group's restriction.
+    """
+    spellings: dict[str, str] = {}
+    for item in router.get("deployments") or []:
+        if not isinstance(item, dict):
+            continue
+        tag = str(item.get("fallback_tag") or "").strip()
+        if tag:
+            spellings.setdefault(_tag_key(tag), tag)
+    group_tag = _group_fallback_tag(router)
+    if group_tag is not None:
+        spellings = {key: tag for key, tag in spellings.items() if key == _tag_key(group_tag)}
+    return sorted(spellings.values())
+
+
+def _match_route_tag(tag: str, router: dict) -> str | None:
+    """The selectable spelling of ``tag`` (case-insensitive), or None if not served."""
+    key = _tag_key(tag)
+    return next((item for item in _selectable_route_tags(router) if _tag_key(item) == key), None)
+
+
+def _group_tag_spelling(router: Any) -> str | None:
+    """The deployment spelling of a ``tag-filtered`` group's own tag, if any.
+
+    ``router`` is the structured ``IntelliRouterConfig``. Returns None when
+    the group is not ``tag-filtered``, has no tag, or no deployment carries
+    the tag in any letter case.
+    """
+    if getattr(router, "strategy", None) != "tag-filtered":
+        return None
+    group_tag = str((getattr(router, "strategy_kwargs", None) or {}).get("fallback_tag") or "").strip()
+    if not group_tag:
+        return None
+    key = _tag_key(group_tag)
+    return next(
+        (
+            deployment.fallback_tag.strip()
+            for deployment in router.deployments
+            if deployment.fallback_tag and _tag_key(deployment.fallback_tag) == key
+        ),
+        None,
+    )
+
+
+def _with_route_tag(config: "TeamModelConfig", tag: str | None) -> "TeamModelConfig":
+    """Return ``config`` routed only to deployments whose ``fallback_tag`` is ``tag``.
+
+    Uses the router's existing ``tag-filtered`` strategy. ``strategy_kwargs``
+    is replaced, not merged: kwargs of the group's own strategy are not valid
+    for ``tag-filtered``. Deployments whose tag differs from ``tag`` only in
+    case are re-tagged to ``tag`` in this member's copy, so ``tag-filtered``
+    (exact match) routes to all of them. The shared pool entry is never
+    modified.
+
+    Without ``tag``, a group that is itself ``tag-filtered`` gets the same
+    treatment for its own tag: it is matched ignoring case against the
+    deployment tags, the first matching spelling in group order (the one
+    ``_selectable_route_tags`` shows) replaces it, and the deployments are
+    re-tagged. A pinned member and a group-wide member therefore compare
+    tags the same way. A group tag that matches no deployment is left as
+    configured, so the router reports that no deployment matches.
+    """
+    router = config.model_client_config.intelli_router
+    if router is None:
+        return config
+    if not tag:
+        tag = _group_tag_spelling(router)
+        if tag is None:
+            return config
+    key = _tag_key(tag)
+    deployments = [
+        deployment.model_copy(update={"fallback_tag": tag})
+        if deployment.fallback_tag and deployment.fallback_tag != tag and _tag_key(deployment.fallback_tag) == key
+        else deployment
+        for deployment in router.deployments
+    ]
+    client = config.model_client_config.model_copy(
+        update={
+            "intelli_router": router.model_copy(
+                update={
+                    "strategy": "tag-filtered",
+                    "strategy_kwargs": {"fallback_tag": tag},
+                    "deployments": deployments,
+                },
+            ),
+        },
+    )
+    return config.model_copy(update={"model_client_config": client})
+
+
+def _pool_digest(pool: list[ModelPoolEntry]) -> str:
+    """Stable digest of a pool's structural shape.
+
+    Captures (model_name, api_base_url) per entry in order. Changes to
+    credentials or metadata don't bump the digest — those refresh
+    in-place without invalidating allocator counters. Reordering or
+    add/remove of entries does change the digest, triggering a counter
+    reset on the next ``load_state_dict``.
+    """
+    h = hashlib.sha1(usedforsecurity=False)
+    for entry in pool:
+        h.update(entry.model_name.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(entry.api_base_url.encode("utf-8"))
+        h.update(b"\x1f")
+    return h.hexdigest()
+
+
+def _group_index_of(entry: ModelPoolEntry, group: list[ModelPoolEntry]) -> int:
+    """Return ``entry``'s position within ``group`` by reference identity."""
+    for i, candidate in enumerate(group):
+        if candidate is entry:
+            return i
+    return 0
+
+
+class RoundRobinModelAllocator:
+    """Round-robin allocator over a ``TeamSpec.model_pool``.
+
+    Each call to ``allocate`` returns the next entry in pool order and
+    wraps when the end is reached, so a team with N members and M pool
+    entries spreads members evenly across endpoints.
+    """
+
+    def __init__(self, pool: list[ModelPoolEntry]) -> None:
+        """Initialize with the pool entries to rotate over."""
+        self._pool = list(pool)
+        self._pool_digest = _pool_digest(self._pool)
+        self._index = 0
+        # Pre-compute name → list-of-entries so group_index lookups
+        # don't rescan the pool on every allocation.
+        self._groups: dict[str, list[ModelPoolEntry]] = {}
+        for entry in self._pool:
+            self._groups.setdefault(entry.model_name, []).append(entry)
+
+    def allocate(
+        self,
+        model_name: Optional[str] = None,
+        *,
+        provider_filter: Optional[Callable[[str], bool]] = None,
+    ) -> Optional[Allocation]:
+        """Return the next pool entry as an Allocation.
+
+        ``model_name`` is accepted for protocol compatibility but
+        ignored — round-robin is name-agnostic and rotates across
+        every entry in pool order.
+        """
+        if not self._pool:
+            return None
+        if provider_filter is None:
+            entry = self._pool[self._index % len(self._pool)]
+            self._index += 1
+        else:
+            filtered = [
+                entry
+                for entry in self._pool
+                if provider_filter(entry.api_provider) and (not model_name or entry.model_name == model_name)
+            ]
+            if not filtered:
+                return None
+            entry = filtered[self._index % len(filtered)]
+            self._index += 1
+        group = self._groups.get(entry.model_name) or [entry]
+        return Allocation(entry=entry, group_index=_group_index_of(entry, group))
+
+    def state_dict(self) -> dict:
+        """Snapshot counter + pool digest for session persistence."""
+        return {"index": self._index, "pool_digest": self._pool_digest}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore counter, resetting if the persisted digest mismatches."""
+        if state.get("pool_digest") != self._pool_digest:
+            self._index = 0
+            return
+        try:
+            self._index = int(state.get("index", 0))
+        except (TypeError, ValueError):
+            self._index = 0
+
+
+class ByModelNameAllocator:
+    """Lookup-by-name allocator with intra-group round-robin.
+
+    Pool entries are partitioned by their ``model_name`` field while
+    preserving insertion order. Each ``allocate(model_name=...)`` call
+    looks up the named group and returns the next endpoint from that
+    group's round-robin counter. The caller is responsible for picking
+    which model name a member should use (via ``LeaderSpec.model_name``,
+    ``TeamMemberSpec.model_name``, or the ``model_name`` parameter on
+    ``spawn_member``).
+
+    Returning ``None`` when the requested name is missing or unknown
+    keeps the fallback chain in ``TeamAgent._setup_agent`` intact: the
+    member then resolves its model from its per-agent spec instead.
+    """
+
+    def __init__(self, pool: list[ModelPoolEntry]) -> None:
+        """Initialize from the pool, partitioning entries by model_name."""
+        self._groups: dict[str, list[ModelPoolEntry]] = {}
+        for entry in pool:
+            self._groups.setdefault(entry.model_name, []).append(entry)
+        self._pool_digest = _pool_digest(list(pool))
+        self._inner_indexes: dict[str, int] = {name: 0 for name in self._groups}
+
+    def allocate(
+        self,
+        model_name: Optional[str] = None,
+        *,
+        provider_filter: Optional[Callable[[str], bool]] = None,
+    ) -> Optional[Allocation]:
+        """Return the next entry in the requested name's group.
+
+        Args:
+            model_name: Group key to look up. Required — a missing or
+                unknown name yields ``None`` so callers can fall back
+                to their per-agent model.
+            provider_filter: Optional predicate on ``api_provider``; when
+                set, entries whose provider does not satisfy the predicate
+                are skipped within the group.
+        """
+        if not model_name or model_name not in self._groups:
+            return None
+        group = self._groups[model_name]
+        if provider_filter is not None:
+            group = [e for e in group if provider_filter(e.api_provider)]
+            if not group:
+                return None
+        idx = self._inner_indexes[model_name] % len(group)
+        self._inner_indexes[model_name] += 1
+        picked = group[idx]
+        # group_index must map back to the original group position so
+        # resolve_member_model (which does not re-apply the filter) can
+        # find the same entry on rehydration.
+        original_group = self._groups[model_name]
+        original_idx = original_group.index(picked)
+        return Allocation(entry=picked, group_index=original_idx)
+
+    def state_dict(self) -> dict:
+        """Snapshot per-group counters + pool digest for session persistence.
+
+        Counters are serialised as a list of ``{"model_name", "index"}``
+        records rather than a ``dict[model_name, int]``. Model names may
+        contain '.' or '[' (e.g. ``"glm-5.1"``, ``"claude-3.5-sonnet"``),
+        and the session persistence layer historically interpreted such
+        characters in dict keys as nested-path encoding — which silently
+        rewrote keys like ``"glm-5.1"`` into ``{"glm-5": {"1": ...}}``
+        and crashed when sibling keys formed conflicting path prefixes.
+        Using a list keeps every model name as an opaque string value.
+        """
+        return {
+            "counters": [
+                {"model_name": name, "index": index}
+                for name, index in self._inner_indexes.items()
+            ],
+            "pool_digest": self._pool_digest,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore counters; reset all to zero on pool-digest mismatch.
+
+        A different pool digest means the persisted counters refer to a
+        layout that no longer matches reality. Returning to zero is the
+        only safe default — keeping stale counters would bias the new
+        rotation.
+
+        Accepts both the current list format under ``"counters"`` and the
+        legacy ``"inner_indexes"`` dict format so sessions persisted by
+        older versions still load cleanly.
+        """
+        if state.get("pool_digest") != self._pool_digest:
+            self._inner_indexes = {name: 0 for name in self._groups}
+            return
+        counters = state.get("counters")
+        if isinstance(counters, list):
+            for record in counters:
+                if not isinstance(record, dict):
+                    continue
+                name = record.get("model_name")
+                if name not in self._inner_indexes:
+                    continue
+                try:
+                    self._inner_indexes[name] = int(record.get("index", 0))
+                except (TypeError, ValueError):
+                    self._inner_indexes[name] = 0
+            return
+        legacy = state.get("inner_indexes")
+        if not isinstance(legacy, dict):
+            return
+        for name, raw in legacy.items():
+            if name not in self._inner_indexes:
+                continue
+            try:
+                self._inner_indexes[name] = int(raw)
+            except (TypeError, ValueError):
+                self._inner_indexes[name] = 0
+
+
+class RouterAllocator:
+    """Single-endpoint router allocator.
+
+    Drives a pool whose entries all share ``api_base_url`` / ``api_key``
+    / ``api_provider`` and only differ in ``model_name`` — the canonical
+    shape produced by ``ModelRouterConfig.to_pool_entries``. Pool layout:
+
+    * Each ``model_name`` appears exactly once. Lookup-by-name therefore
+      points at a unique entry, no within-group rotation.
+    * ``allocate(model_name=X)``: returns the entry for ``X``, or
+      ``None`` when ``X`` is not in the pool (caller falls back to its
+      per-agent model).
+    * ``allocate()`` (no hint): returns the first entry in pool order.
+      The router's first-declared model is the team's default model
+      so the leader can run without an explicit ``leader.model_name``.
+
+    Allocation is deterministic — there's no rotation counter to
+    persist. ``state_dict`` only carries a pool digest so a layout
+    change between save and load is detectable; ``load_state_dict`` is
+    a no-op when the digest matches and a no-op otherwise (no counter
+    to reset).
+    """
+
+    def __init__(self, pool: list[ModelPoolEntry]) -> None:
+        """Initialize from a router-shaped pool.
+
+        Args:
+            pool: Pool entries, typically produced by
+                ``ModelRouterConfig.to_pool_entries``. Each entry's
+                ``model_name`` must be unique within the pool.
+
+        Raises:
+            ValueError: when ``pool`` is empty (a router without any
+                model name is meaningless) or when entries share a
+                ``model_name`` (lookup would be ambiguous).
+        """
+        if not pool:
+            raise ValueError("RouterAllocator requires a non-empty pool")
+        names = [entry.model_name for entry in pool]
+        if len(set(names)) != len(names):
+            duplicates = sorted({n for n in names if names.count(n) > 1})
+            raise ValueError(
+                f"RouterAllocator pool must have unique model_names; duplicates: {duplicates}",
+            )
+        self._pool: list[ModelPoolEntry] = list(pool)
+        self._by_name: dict[str, ModelPoolEntry] = {entry.model_name: entry for entry in self._pool}
+        self._pool_digest = _pool_digest(self._pool)
+
+    def allocate(
+        self,
+        model_name: Optional[str] = None,
+        *,
+        provider_filter: Optional[Callable[[str], bool]] = None,
+    ) -> Optional[Allocation]:
+        """Return the entry for the requested name, or the default.
+
+        Args:
+            model_name: When set, look up the unique entry whose
+                ``model_name`` matches. ``None`` (or unknown) yields the
+                first declared entry so the leader gets a deterministic
+                default model.
+
+        Returns:
+            ``Allocation`` with ``group_index=0`` (each name has a single
+            endpoint under a router); ``None`` when ``model_name`` is
+            given but absent from the pool.
+        """
+        if model_name is None:
+            entry = next(
+                (entry for entry in self._pool if provider_filter is None or provider_filter(entry.api_provider)),
+                None,
+            )
+            return Allocation(entry=entry, group_index=0) if entry is not None else None
+        entry = self._by_name.get(model_name)
+        if entry is None or (provider_filter is not None and not provider_filter(entry.api_provider)):
+            return None
+        return Allocation(entry=entry, group_index=0)
+
+    def state_dict(self) -> dict:
+        """Snapshot the pool digest for layout-change detection."""
+        return {"pool_digest": self._pool_digest}
+
+    def load_state_dict(self, state: dict) -> None:
+        """No-op restore (router allocation has no rotating counter).
+
+        Defined for ``ModelAllocator`` protocol compatibility. Even when
+        the pool digest changes between save and load there is nothing to
+        reset — RouterAllocator has no rotation counter.
+        """
+        if state.get("pool_digest") == self._pool_digest:
+            return
+        # Pool composition changed; nothing to reset for router allocation
+        # since there is no rotation counter.
+
+
+class IntelliRouterAllocator:
+    """Allocator over an IntelliRouter-backed pool.
+
+    Allocation is deliberately identical to ``RouterAllocator``: an
+    IntelliRouter pool is a router pool whose single "endpoint" happens
+    to be client-side, so ``model_name`` still maps to exactly one entry
+    and ``allocate()`` with no hint still returns the first declared
+    name. What differs is only what an entry *means* — under
+    ``RouterAllocator`` it is one remote endpoint, here it is the whole
+    deployment list plus a model name to ask the router for. That is a
+    property of how the pool was built, not of how it is allocated,
+    which is why this allocator adds validation rather than behavior.
+
+    The validation matters because the pool can also be hand-written
+    (``model_pool=[...]`` plus ``model_pool_strategy="intelli_router"``)
+    rather than expanded from ``IntelliRouterConfig``. A hand-written
+    entry that names the wrong provider would silently materialize as a
+    plain client with empty credentials — the deployment list ignored,
+    the failure surfacing only on the first request. Checking at
+    construction turns that into a config error at ``build()`` time.
+    """
+
+    def __init__(self, pool: list[ModelPoolEntry]) -> None:
+        """Initialize from an IntelliRouter-shaped pool.
+
+        Args:
+            pool: Pool entries, typically produced by
+                ``IntelliRouterConfig.to_pool_entries``. Each entry must
+                declare ``api_provider == "intelli_router"`` and carry a
+                non-empty deployment list under
+                ``metadata.client.intelli_router.deployments``.
+
+        Raises:
+            ValueError: when the pool is not exactly one logical ``"*"``
+                entry, when the provider is wrong, or when a deployment is
+                malformed.
+        """
+        if not pool:
+            raise ValueError("IntelliRouterAllocator requires a non-empty pool")
+        self._pool = list(pool)
+        if len(self._pool) != 1 or self._pool[0].model_name != INTELLI_ROUTER_UNIFIED_MODEL:
+            raise ValueError(
+                "IntelliRouterAllocator requires exactly one logical '*' entry",
+            )
+        entry = self._pool[0]
+        self._pool_digest = _pool_digest(self._pool)
+        if entry.api_provider != INTELLI_ROUTER_PROVIDER:
+            raise ValueError(
+                "IntelliRouterAllocator requires its logical '*' entry to declare "
+                f"api_provider='{INTELLI_ROUTER_PROVIDER}'",
+            )
+        self._deployments = self._validate_deployment_catalog(entry)
+
+    def allocate(
+        self,
+        model_name: Optional[str] = None,
+        *,
+        provider_filter: Optional[Callable[[str], bool]] = None,
+    ) -> Optional[Allocation]:
+        """Return the logical entry, optionally pinned to one model.
+
+        Physical deployments are never allocated: a pinned member still gets
+        the ``"*"`` entry, routed through ``tag-filtered`` to the deployments
+        whose ``fallback_tag`` equals ``model_name`` ignoring case.
+
+        Args:
+            model_name: Empty or ``"*"`` selects the whole group; any other
+                value must be a selectable ``fallback_tag`` (any letter case;
+                stored as the spelling ``list_route_tags`` shows).
+            provider_filter: Ignored. Provider filtering applies to physical
+                CLI deployments, not the logical IntelliRouter entry.
+
+        Returns:
+            ``None`` for an unselectable name — an explicitly requested model
+            never falls back to the whole group.
+        """
+        tag = str(model_name or "").strip()
+        if tag in ("", INTELLI_ROUTER_UNIFIED_MODEL):
+            return Allocation(entry=self._pool[0], group_index=0)
+        matched = _match_route_tag(tag, _router_config(self._pool[0]))
+        if matched is None:
+            return None
+        return Allocation(entry=self._pool[0], group_index=0, route_tag=matched)
+
+    def list_route_tags(self) -> list[str]:
+        """Models (``fallback_tag`` values) a member can be pinned to, sorted."""
+        return _selectable_route_tags(_router_config(self._pool[0]))
+
+    def state_dict(self) -> dict:
+        return {"pool_digest": self._pool_digest}
+
+    def load_state_dict(self, state: dict) -> None:
+        """No-op restore; IntelliRouter has no rotating counter."""
+        if state.get("pool_digest") == self._pool_digest:
+            return
+        # Pool composition changes do not require a counter reset.
+
+    @classmethod
+    def _validate_deployment_catalog(cls, entry: ModelPoolEntry) -> tuple[dict, ...]:
+        """Reject malformed deployments while the allocator is constructed.
+
+        An invalid Team configuration must fail during construction rather
+        than later when an external CLI member is spawned.
+        """
+        client = entry.metadata.get("client") or {}
+        router = client.get("intelli_router")
+        raw = router.get("deployments") if isinstance(router, dict) else None
+        if not isinstance(raw, list) or not raw:
+            raise ValueError(
+                "IntelliRouterAllocator requires a non-empty deployments list",
+            )
+        for index, item in enumerate(raw):
+            if not isinstance(item, dict):
+                raise ValueError(f"IntelliRouterAllocator deployment at index {index} must be an object")
+            model = str(item.get("model_name") or "").strip()
+            provider = str(item.get("provider") or "").strip()
+            if not model or not provider:
+                raise ValueError(
+                    "IntelliRouterAllocator deployment at index "
+                    f"{index} requires non-empty model_name and provider: {item!r}"
+                )
+        # Keep one immutable-by-convention snapshot for all CLI catalog
+        # queries.  The allocator must not observe later mutation of entry
+        # metadata while a spawn request is being resolved.
+        import copy
+
+        return tuple(copy.deepcopy(item) for item in raw)
+
+    def list_cli_models(
+        self,
+        provider_filter: Optional[Callable[[str], bool]] = None,
+    ) -> list[CliModelAllocation]:
+        """List real deployment candidates for external CLI projection."""
+        catalog = [
+            CliModelAllocation(
+                model=str(item.get("model_name") or "").strip(),
+                provider=str(item.get("provider") or "").strip(),
+                api_base=str(item.get("api_base") or ""),
+                api_key=str(item.get("api_key") or ""),
+                route_id=str(item.get("route_id") or "") or None,
+            )
+            for item in self._deployments
+        ]
+        if provider_filter is None:
+            return catalog
+        return [item for item in catalog if provider_filter(item.provider)]
+
+    def resolve_cli_models(
+        self,
+        model_name: str,
+        provider_filter: Optional[Callable[[str], bool]] = None,
+    ) -> list[CliModelAllocation]:
+        """Resolve a real deployment name, never the Team ``"*"`` entry."""
+        name = str(model_name or "").strip()
+        if not name or name == "*":
+            return []
+        return [item for item in self.list_cli_models(provider_filter) if item.model == name]
+
+
+def resolve_member_model(
+    team_spec: "TeamSpec",
+    *,
+    model_name: Optional[str],
+    model_index: Optional[int],
+    route_tag: Optional[str] = None,
+) -> Optional["TeamModelConfig"]:
+    """Resolve a member's model from a stored reference against the live pool.
+
+    Pure positional lookup — does NOT touch the allocator and does NOT
+    advance any rotation counter. Resolution order:
+
+    1. Group for ``model_name`` exists, ``model_index`` is in range →
+       return that entry's config (picks up any credential / endpoint
+       refresh because the entry is read live from the session pool).
+    2. Group exists but ``model_index`` is out of range (group shrank)
+       → return entry at index ``0`` for a deterministic fallback.
+    3. Group missing or pool empty → ``None`` so the caller falls back
+       to the per-agent model declared in ``TeamAgentSpec.agents``.
+
+    Args:
+        team_spec: Resolved team identity carrying the current pool.
+        model_name: Reference produced at spawn time via
+            ``Allocation.to_db_ref``.
+        model_index: Reference produced at spawn time via
+            ``Allocation.to_db_ref``.
+        route_tag: ``fallback_tag`` persisted for a pinned model-group
+            member. Re-applied when the current group still serves it;
+            dropped with a warning otherwise, so a group edited between runs
+            degrades to group-wide routing instead of a member that can never
+            get a deployment.
+
+    Returns:
+        A live ``TeamModelConfig`` when the reference can be resolved
+        against the current pool, otherwise ``None``.
+    """
+    if not team_spec.model_pool or not model_name:
+        return None
+    group = [e for e in team_spec.model_pool if e.model_name == model_name]
+    if not group:
+        return None
+    idx = model_index if isinstance(model_index, int) and 0 <= model_index < len(group) else 0
+    entry = group[idx]
+    if route_tag:
+        matched = _match_route_tag(route_tag, _router_config(entry))
+        if matched is None:
+            team_logger.warning(
+                "persisted route tag {!r} is no longer served by the current model group; "
+                "falling back to group-wide routing",
+                route_tag,
+            )
+        route_tag = matched
+    return _with_route_tag(entry.to_team_model_config(), route_tag)
+
+
+def build_model_allocator(
+    spec: "TeamAgentSpec",
+    team_spec: "TeamSpec",
+) -> Optional[ModelAllocator]:
+    """Build a model allocator for a team, or return ``None``.
+
+    Pool-based allocation is only enabled when ``team_spec.model_pool``
+    is non-empty. Without a pool the function returns ``None`` so every
+    member resolves its model from ``TeamAgentSpec.agents`` as before
+    and behavior matches the legacy code path exactly. The strategy
+    selected by ``team_spec.model_pool_strategy`` decides which
+    concrete allocator is built.
+
+    Args:
+        spec: Team agent specification (reserved for future allocator
+            policies that need access to per-agent metadata).
+        team_spec: Resolved team identity carrying ``model_pool`` and
+            ``model_pool_strategy``.
+
+    Returns:
+        A ``ModelAllocator`` instance when a pool is configured,
+        otherwise ``None``.
+
+    Raises:
+        ValueError: when ``model_pool_strategy`` is not a recognized
+            strategy name.
+    """
+    del spec  # reserved for future policies that need agent metadata
+    if not team_spec.model_pool:
+        return None
+    strategy = team_spec.model_pool_strategy
+    if strategy == "round_robin":
+        return RoundRobinModelAllocator(team_spec.model_pool)
+    if strategy == "by_model_name":
+        return ByModelNameAllocator(team_spec.model_pool)
+    if strategy == "router":
+        return RouterAllocator(team_spec.model_pool)
+    if strategy == "intelli_router":
+        return IntelliRouterAllocator(team_spec.model_pool)
+    raise ValueError(
+        f"Unknown model_pool_strategy '{strategy}'; expected one of: "
+        f"round_robin, by_model_name, router, intelli_router",
+    )
+
+
+__all__ = [
+    "Allocation",
+    "CliModelAllocation",
+    "CliModelCatalog",
+    "ByModelNameAllocator",
+    "IntelliRouterAllocator",
+    "ModelAllocator",
+    "RoundRobinModelAllocator",
+    "RouterAllocator",
+    "build_model_allocator",
+    "resolve_member_model",
+]

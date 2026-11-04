@@ -1,0 +1,289 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Fault tolerance and team recovery for TeamAgent."""
+
+from __future__ import annotations
+
+from typing import (
+    TYPE_CHECKING,
+    Any,
+)
+
+from openjiuwen.agent_teams.schema.status import MemberStatus
+from openjiuwen.agent_teams.schema.team import TeamRole
+from openjiuwen.core.common.logging import team_logger
+
+if TYPE_CHECKING:
+    from openjiuwen.agent_teams.agent.agent_configurator import AgentConfigurator
+    from openjiuwen.agent_teams.agent.spawn_manager import SpawnManager
+
+
+class RecoveryManager:
+    """Handles fault tolerance and team recovery.
+
+    Responsibilities:
+    - Team recovery from database state
+    - Member context rebuilding
+    - Allocator state persistence
+    - Leader configuration persistence
+    """
+
+    def __init__(
+        self,
+        configurator: AgentConfigurator,
+        spawn_manager: SpawnManager,
+    ):
+        self._configurator = configurator
+        self._spawn_manager = spawn_manager
+
+    async def recover_team(self) -> list[str]:
+        team_backend = self._configurator.team_backend
+        team_name = self._configurator.team_name
+        if not team_backend or team_name is None:
+            return []
+
+        member_name = self._configurator.member_name
+        team_logger.info("[{}] recovering team", member_name or "?")
+        await team_backend.restore_external_cli_specs_from_db()
+        all_members = await team_backend.list_member_roster()
+        restarted: list[str] = []
+
+        for member in all_members:
+            if member.member_name == member_name:
+                continue
+
+            # Shutdown is owned by the member finalizer. Recovery must neither
+            # revive a departed member nor complete an in-flight shutdown on
+            # behalf of a runtime that may still be starting or exiting. A
+            # DORMANT member is retired on purpose and wakes only when named
+            # (F_118) — never from a cold recovery sweep.
+            if member.status in {
+                MemberStatus.SHUTDOWN_REQUESTED.value,
+                MemberStatus.SHUTDOWN.value,
+                MemberStatus.DORMANT.value,
+            }:
+                continue
+
+            # Idempotency: a teammate already running in this runtime keeps its
+            # live spawn handle, so skip it. ``recover_team`` can be invoked more
+            # than once per activation; without this
+            # guard ``restart_teammate`` tears down and rebuilds an already
+            # healthy teammate, re-registering its whole tool set each time.
+            if self._spawn_manager.has_live_handle(member.member_name):
+                team_logger.debug(
+                    "[{}] teammate {} already running; skip recover restart",
+                    member_name or "?",
+                    member.member_name,
+                )
+                continue
+
+            # A passive human member has no runtime to recover — spawning
+            # one would conjure a DeepAgent out of a pure roster identity
+            # (and a failed spawn would strand the row in RESTARTING,
+            # breaking settled/completion checks). It stays READY forever.
+            # Paired with the structural guard in ``SpawnManager.spawn_teammate``
+            # (F_14 whitelist-drift lesson: one skip point per layer, each
+            # pointing at the other, so a future drift is grep-able).
+            if await team_backend.is_passive_human(member.member_name):
+                team_logger.debug(
+                    "[{}] passive human {} has no runtime; skip recover restart",
+                    member_name or "?",
+                    member.member_name,
+                )
+                continue
+
+            try:
+                current_status = MemberStatus(member.status)
+            except ValueError:
+                team_logger.warning(
+                    "Skipping teammate {} with unknown recovery status {}",
+                    member.member_name,
+                    member.status,
+                )
+                continue
+            claimed = await team_backend.db.member.claim_member_restart(
+                member.member_name,
+                team_name,
+                current_status,
+            )
+            if not claimed:
+                team_logger.warning("Skipping teammate {} because its recovery status changed", member.member_name)
+                continue
+            if await self._spawn_manager.restart_teammate(member.member_name):
+                restarted.append(member.member_name)
+
+        return restarted
+
+    def persist_leader_config(self, session) -> None:
+        from openjiuwen.agent_teams.runtime.metadata import (
+            TEAM_CHECKPOINTS_KEY,
+            TEAM_DB_STATE_KEY,
+            TEAM_DB_STATE_PENDING_CREATE,
+            read_team_checkpoints,
+            read_team_db_state,
+            write_team_namespace,
+        )
+
+        spec = self._configurator.spec
+        ctx = self._configurator.ctx
+        team_name = self._configurator.team_name
+        if spec is None or ctx is None or team_name is None:
+            return
+
+        payload: dict[str, Any] = {
+            "spec": spec.model_dump(mode="json"),
+            "context": ctx.model_dump(mode="json"),
+            TEAM_DB_STATE_KEY: read_team_db_state(session, team_name) or TEAM_DB_STATE_PENDING_CREATE,
+            # Preserve already-persisted named checkpoints: this full overwrite
+            # must not drop snapshots taken in a prior round.
+            TEAM_CHECKPOINTS_KEY: read_team_checkpoints(session, team_name) or {},
+        }
+        allocator = self._configurator.model_allocator
+        if allocator is not None:
+            payload["model_allocator_state"] = allocator.state_dict()
+        write_team_namespace(session, team_name, payload)
+
+    async def _mark_teammate_restarting_for_session_switch(
+        self,
+        member_name: str,
+        current_status: MemberStatus,
+    ) -> bool:
+        """Move a live teammate into a restartable status for session rebind.
+
+        Session switching must only tear down the live runtime and re-spawn it
+        under the new session; team rows and old session data stay intact.
+        ``READY``/``BUSY`` cannot transition directly to ``RESTARTING``, so we
+        normalize through ``ERROR`` first when needed.
+        """
+        team_backend = self._configurator.team_backend
+        if not team_backend:
+            return False
+
+        team_name = self._configurator.team_name
+        if team_name is None:
+            return False
+
+        db = team_backend.db
+
+        if current_status == MemberStatus.RESTARTING:
+            return True
+
+        # PAUSED / STOPPED / ERROR / SHUTDOWN are all directly transitionable
+        # to RESTARTING per ``MEMBER_TRANSITIONS``. Only the "active" states
+        # (READY / BUSY / SHUTDOWN_REQUESTED / UNSTARTED) need the ERROR
+        # normalization step to clear an invalid direct hop.
+        directly_restartable = {
+            MemberStatus.PAUSED,
+            MemberStatus.STOPPED,
+            MemberStatus.ERROR,
+            MemberStatus.SHUTDOWN,
+        }
+        if current_status not in directly_restartable:
+            updated = await db.member.update_member_status(
+                member_name,
+                team_name,
+                MemberStatus.ERROR.value,
+            )
+            if not updated:
+                team_logger.warning(
+                    "Failed to move teammate {} from {} to ERROR before session rebind",
+                    member_name,
+                    current_status.value,
+                )
+                return False
+            current_status = MemberStatus.ERROR
+
+        if current_status == MemberStatus.RESTARTING:
+            return True
+
+        updated = await db.member.update_member_status(
+            member_name,
+            team_name,
+            MemberStatus.RESTARTING.value,
+        )
+        if not updated:
+            team_logger.warning(
+                "Failed to move teammate {} into RESTARTING during session rebind",
+                member_name,
+            )
+            return False
+        return True
+
+    async def collect_live_teammates_for_session_switch(self) -> list[tuple[str, MemberStatus]]:
+        """Snapshot live teammates that need rebinding when the session switches.
+
+        Returns the (member_name, current_status) pairs of teammates whose
+        process handles are still alive and whose DB status is not
+        UNSTARTED/SHUTDOWN. The leader is excluded.
+        """
+        team_backend = self._configurator.team_backend
+        if self._configurator.role != TeamRole.LEADER or not team_backend:
+            return []
+
+        members = await team_backend.list_member_roster()
+        leader_member_name = self._configurator.member_name
+        spawned = self._spawn_manager.spawned_handles
+        live_teammates = {
+            member_name
+            for member_name, handle in spawned.items()
+            if member_name != leader_member_name and handle is not None
+        }
+        result: list[tuple[str, MemberStatus]] = []
+        for member in members:
+            if member.member_name not in live_teammates:
+                continue
+            member_status = MemberStatus(member.status)
+            # UNSTARTED never ran; SHUTDOWN/STOPPED are not "live" by
+            # definition (runtime gone). Spawned-handles filtering above
+            # already excludes most of these, but the status guard keeps
+            # the snapshot honest when a stale handle is still registered.
+            if member_status in {
+                MemberStatus.UNSTARTED,
+                MemberStatus.SHUTDOWN,
+                MemberStatus.STOPPED,
+            }:
+                continue
+            result.append((member.member_name, member_status))
+        return result
+
+    async def restart_for_session_switch(
+        self,
+        recoverable_members: list[tuple[str, MemberStatus]],
+        *,
+        cleanup_first: bool,
+    ) -> None:
+        """Restart the given teammates after a session switch.
+
+        ``cleanup_first=True`` tears down the old handles before restart;
+        ``False`` assumes coordination teardown already cleared them.
+        """
+        for member_name, member_status in recoverable_members:
+            if cleanup_first:
+                await self._spawn_manager.cleanup_teammate(member_name)
+            if not await self._mark_teammate_restarting_for_session_switch(
+                member_name,
+                member_status,
+            ):
+                continue
+            await self._spawn_manager.restart_teammate(member_name)
+
+    def persist_allocator_state(self, team_session) -> None:
+        from openjiuwen.agent_teams.runtime.metadata import merge_team_namespace
+
+        allocator = self._configurator.model_allocator
+        team_name = self._configurator.team_name
+        if team_session is None or allocator is None or team_name is None:
+            return
+        try:
+            merge_team_namespace(
+                team_session,
+                team_name,
+                {"model_allocator_state": allocator.state_dict()},
+            )
+        except Exception as e:
+            team_logger.error(
+                "[{}] failed to persist allocator state: {}",
+                self._configurator.member_name or "?",
+                e,
+            )

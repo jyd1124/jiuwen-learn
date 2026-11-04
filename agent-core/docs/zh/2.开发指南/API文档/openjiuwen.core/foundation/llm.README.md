@@ -1,0 +1,32 @@
+# llm
+
+`openjiuwen.core.foundation.llm`是openJiuwen中用于统一管理和调用大模型实例的核心模块。
+
+**详细 API 文档**：[llm.md](./llm/llm.md)
+
+**Classes**：
+
+| CLASS | DESCRIPTION |
+|-------|-------------|
+| **Model** | 大模型封装类，提供统一的调用接口。 |
+| **BaseModelClient** | 大模型客户端抽象基类。 |
+| **OpenAIModelClient** | OpenAI兼容的大模型客户端实现。 |
+| **OpenAIAccountModelClient** | OpenAI账户OAuth大模型客户端实现，通过OAuth凭据免密登录，无需配置`api_key`。 |
+| **AnthropicModelClient** | Anthropic 协议客户端。`DashScope` / `DeepSeek` 等旧 `client_provider` 为 OpenAI 兼容别名，见[LLM 协议收敛](../../基础功能/LLM协议收敛.md)。 |
+| **system_one.JevSystemOneClient** | 通过 System One API 调用 Jev 类型化评估的独立轻量客户端，不注册为聊天 `ModelClient`。 |
+| **BaseOutputParser** | 输出解析器抽象基类。 |
+| **JsonOutputParser** | JSON格式输出解析器。 |
+| **MarkdownOutputParser** | Markdown格式输出解析器。 |
+| **ModelRequestConfig** | 模型请求配置类。 |
+| **ModelClientConfig** | 模型客户端配置类。 |
+| **BaseModelInfo** | 模型信息基类。 |
+| **BaseMessage** | 消息基类。 |
+| **AssistantMessage** | 助手消息类。 |
+| **UserMessage** | 用户消息类。 |
+| **SystemMessage** | 系统消息类。 |
+| **ToolMessage** | 工具消息类。 |
+| **AssistantMessageChunk** | 助手消息流式块类。 |
+| **ToolCall** | 工具调用类。 |
+| **ImageGenerationResponse** | 图像生成响应类，包含生成的图片URL或Base64数据。 |
+| **AudioGenerationResponse** | 音频生成响应类，包含生成的音频URL或二进制数据。 |
+| **VideoGenerationResponse** | 视频生成响应类，包含生成的视频URL或二进制数据。 |

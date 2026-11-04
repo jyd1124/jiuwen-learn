@@ -1,0 +1,2636 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+import base64
+import hashlib
+import html
+import io
+import json
+import os
+import pathlib
+import re
+import shlex
+import sys
+import asyncio
+import shutil
+import threading
+import time
+import weakref
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Callable, Dict, Any, AsyncIterator, List, Optional, Tuple
+
+import pdfplumber
+
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.session import get_current_session
+from openjiuwen.core.common.logging import logger
+from openjiuwen.core.foundation.tool.base import Tool, render_tool_output
+from openjiuwen.core.sys_operation import SysOperation
+from openjiuwen.core.sys_operation.cwd import get_agent_history_root, get_cwd
+from openjiuwen.harness.prompts.tools import ToolCardBuildOptions, build_tool_card
+from openjiuwen.harness.tools.base_tool import ToolOutput
+from openjiuwen.harness.tools.rg_binary import resolve_rg_binary
+
+
+_FILE_EDIT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+_FILE_EDIT_LOCKS_GUARD = threading.Lock()
+
+# POSIX NAME_MAX / PATH_MAX. Overlong values must not reach Path.resolve()
+# (ENAMETOOLONG aborts the turn instead of returning a tool error).
+_NAME_MAX = 255
+_PATH_MAX = 4096
+
+
+def _get_file_edit_lock(file_path: str) -> asyncio.Lock:
+    """Return the process-wide edit transaction lock for a normalized path."""
+    key = os.path.normcase(os.path.abspath(file_path))
+    with _FILE_EDIT_LOCKS_GUARD:
+        lock = _FILE_EDIT_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _FILE_EDIT_LOCKS[key] = lock
+        return lock
+
+# Device files that would block indefinitely or produce infinite output.
+_BLOCKED_DEVICE_PATHS: frozenset = frozenset({
+    "/dev/zero", "/dev/random", "/dev/urandom", "/dev/full",
+    "/dev/stdin", "/dev/tty", "/dev/console",
+    "/dev/stdout", "/dev/stderr",
+    "/dev/fd/0", "/dev/fd/1", "/dev/fd/2",
+})
+
+# Binary file extensions that are not directly readable as text.
+# PDF and image extensions are handled separately and are NOT in this set.
+_BINARY_EXTENSIONS: frozenset = frozenset({
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".obj", ".o", ".a", ".lib",
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    ".pyc", ".pyo", ".class", ".wasm",
+    ".db", ".sqlite", ".sqlite3",
+})
+
+
+@dataclass
+class _FileReadState:
+    """State recorded when a file is read; used by EditFileTool for pre-read validation."""
+    mtime_ns: int
+    size_bytes: int
+    is_partial: bool  # True if only a subset of lines was read (offset > 0 or explicit limit)
+    content: Optional[str] = None
+    # Cumulative coverage tracking for WriteFileTool's full-file overwrite guard.
+    # total_lines: total line count of the file, counted once on first read and cached
+    #              (re-counted after the file is detected stale).
+    # read_ranges: list of 1-indexed inclusive [start, end] line intervals that have
+    #              been read, merged on each read. When the union of ranges covers
+    #              [1, total_lines], the file is "logically fully read" even via
+    #              partial reads — at which point write_file is allowed.
+    total_lines: int = 0
+    read_ranges: list = None  # list of (start, end) tuples; None == not yet tracking
+
+
+@dataclass(frozen=True)
+class _ReadStateRecord:
+    """Inputs needed to update read coverage for a file."""
+
+    mtime_ns: int
+    size_bytes: int
+    is_partial: bool
+    offset: int = 0
+    line_count: int = 0
+
+
+@dataclass
+class _RawTextState:
+    content: str
+    line_count: int
+
+
+def _merge_range(ranges: list, new: tuple) -> list:
+    """Merge a (start, end) interval into a sorted, non-overlapping list."""
+    ranges = list(ranges)
+    ranges.append(new)
+    ranges.sort()
+    merged: list = []
+    for start, end in ranges:
+        if not merged:
+            merged.append([start, end])
+            continue
+        last = merged[-1]
+        if start <= last[1] + 1:  # overlapping or adjacent
+            last[1] = max(last[1], end)
+        else:
+            merged.append([start, end])
+    return [(s, e) for s, e in merged]
+
+
+def _ranges_cover(ranges: list, lo: int, hi: int) -> bool:
+    """True when the union of `ranges` fully covers [lo, hi]."""
+    covered_to = lo - 1
+    for start, end in sorted(ranges):
+        if start > covered_to + 1:
+            return False  # gap before this range
+        covered_to = max(covered_to, end)
+        if covered_to >= hi:
+            return True
+    return covered_to >= hi
+
+
+def _first_unread_offset(ranges: list) -> int:
+    """Return the 0-based offset of the first unread line, given read ranges."""
+    covered_to = 0
+    for start, end in sorted(ranges or []):
+        if start > covered_to + 1:
+            return covered_to
+        covered_to = max(covered_to, end)
+    return covered_to
+
+
+# Module-level read state registry.
+# ReadFileTool populates it on successful text reads.
+# EditFileTool consumes it to enforce "must read before edit" and detect external modifications.
+_FILE_READ_REGISTRY: Dict[str, _FileReadState] = {}
+
+_HISTORY_LOCK = asyncio.Lock()
+MAX_HISTORY_PER_FILE: int = 100
+
+
+async def _append_op_history(history_path: str, file_path: str, action: str,
+                              old_content: Optional[str], new_content: Optional[str]) -> None:
+    """Append a write/edit/delete operation to the per-workspace history JSON file.
+
+    Async-safe: concurrent coroutines share _HISTORY_LOCK so reads and writes
+    to the JSON file are serialised without blocking the event loop.
+    The JSON file is the single source of truth; there is no in-memory cache.
+    """
+    entry = {
+        "action": action,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "old_content": old_content,
+        "new_content": new_content,
+    }
+    try:
+        async with _HISTORY_LOCK:
+            history: Dict[str, list] = {}
+            if os.path.exists(history_path):
+                with open(history_path, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            entries = history.setdefault(file_path, [])
+            entries.append(entry)
+            if len(entries) > MAX_HISTORY_PER_FILE:
+                history[file_path] = entries[-MAX_HISTORY_PER_FILE:]
+            os.makedirs(os.path.dirname(history_path), exist_ok=True)
+            tmp = history_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, history_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[_append_op_history] Failed to persist file op history to %s: %s", history_path, exc)
+
+
+def _parse_rm_targets(command: str) -> List[str]:
+    """Extract explicit, non-glob file paths from a simple rm command.
+
+    Returns empty list for compound commands, glob patterns, or recursive flags.
+    """
+    stripped = command.strip()
+    if any(op in stripped for op in ('|', ';', '&&', '||', '\n', '`', '$(')):
+        return []
+    try:
+        parts = shlex.split(stripped)
+    except ValueError:
+        return []
+    if not parts or os.path.basename(parts[0]) != 'rm':
+        return []
+    targets = []
+    for part in parts[1:]:
+        if part.startswith('-'):
+            if any(c in part for c in ('r', 'R')):
+                return []  # recursive deletion — leave to post-execution cross-reference
+            continue
+        if any(c in part for c in ('*', '?', '[', '{')):
+            continue  # glob pattern — leave to post-execution cross-reference
+        targets.append(part)
+    return targets
+
+
+def _parse_ps_remove_targets(command: str) -> List[str]:
+    """Extract explicit, non-glob file paths from a simple PowerShell Remove-Item command.
+
+    Handles Remove-Item and its aliases (rm, del, ri, erase).
+    Returns empty list for recursive deletions, wildcards, or compound commands.
+    """
+    stripped = command.strip()
+    if any(op in stripped for op in ('|', ';', '\n', '`')):
+        return []
+
+    remove_aliases = ('remove-item', 'ri', 'rm', 'del', 'erase')
+    cmd_lower = stripped.lower()
+    matched_alias = next(
+        (a for a in remove_aliases if cmd_lower.startswith(a + ' ') or cmd_lower == a),
+        None,
+    )
+    if not matched_alias:
+        return []
+
+    rest = stripped[len(matched_alias):].strip()
+
+    # Reject recursive deletions
+    if re.search(r'-Recurse\b', rest, re.IGNORECASE):
+        return []
+
+    # Strip value-less flags so they don't interfere with path extraction
+    rest = re.sub(r'-(?:Force|WhatIf|Confirm|Verbose)\b', '', rest, flags=re.IGNORECASE).strip()
+    # Strip -ErrorAction <value>
+    rest = re.sub(r'-ErrorAction\s+\S+', '', rest, flags=re.IGNORECASE).strip()
+
+    # Handle named -Path or -LiteralPath flag
+    path_match = re.search(r'-(?:Path|LiteralPath)\s+(["\']?)(.+?)\1(?:\s|$)', rest, re.IGNORECASE)
+    if path_match:
+        path = path_match.group(2).strip()
+        return [] if any(c in path for c in ('*', '?', '[')) else [path]
+
+    # Positional paths — strip surrounding quotes, skip flags and wildcards
+    targets = []
+    for token in rest.split():
+        if token.startswith('-'):
+            continue
+        token = token.strip('"\'')
+        if any(c in token for c in ('*', '?', '[')):
+            continue
+        targets.append(token)
+    return targets
+
+
+async def _record_rm_targets_before_deletion(
+        history_path: str, file_paths: List[str], operation: "SysOperation") -> None:
+    """Read and record explicit rm targets into history before the rm command runs."""
+    cwd = get_cwd()
+    for raw_path in file_paths:
+        try:
+            p = pathlib.Path(raw_path).expanduser()
+            abs_path = str((pathlib.Path(cwd) / p).resolve() if not p.is_absolute() else p.resolve())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[_record_rm_targets_before_deletion] path resolve failed %s: %s", raw_path, exc)
+            continue
+        if not os.path.isfile(abs_path):
+            continue
+        try:
+            res = await operation.fs().read_file(abs_path)
+            if res.code != StatusCode.SUCCESS.code:
+                continue
+            content = res.data.content if res.data else ""
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+            await _append_op_history(history_path, abs_path, "delete", content, None)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[_record_rm_targets_before_deletion] %s: %s", abs_path, exc)
+
+
+async def _detect_and_record_deletions(history_path: str) -> None:
+    """After bash execution, scan history to detect and record files that no longer exist."""
+    try:
+        async with _HISTORY_LOCK:
+            if not os.path.exists(history_path):
+                return
+            with open(history_path, "r", encoding="utf-8") as f:
+                history: Dict[str, list] = json.load(f)
+            now = datetime.now(timezone.utc).isoformat()
+            deletions_added = False
+            for file_path, entries in history.items():
+                if not entries:
+                    continue
+                if entries[-1].get("action") == "delete":
+                    continue
+                if not os.path.exists(file_path):
+                    old_content = entries[-1].get("new_content")
+                    entries.append({
+                        "action": "delete",
+                        "timestamp": now,
+                        "old_content": old_content,
+                        "new_content": None,
+                    })
+                    if len(entries) > MAX_HISTORY_PER_FILE:
+                        history[file_path] = entries[-MAX_HISTORY_PER_FILE:]
+                    deletions_added = True
+            if not deletions_added:
+                return
+            os.makedirs(os.path.dirname(history_path), exist_ok=True)
+            tmp = history_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, history_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[_detect_and_record_deletions] %s: %s", history_path, exc)
+
+
+class MaxFileReadTokenExceededError(Exception):
+    """Raised when file content exceeds the maximum allowed token count."""
+
+    def __init__(self, token_count: int, max_tokens: int) -> None:
+        super().__init__(
+            f"Error: File content (estimated {token_count} tokens) exceeds maximum allowed tokens ({max_tokens}). "
+            "Use grep for specific content or read a smaller offset/limit range."
+        )
+        self.token_count = token_count
+        self.max_tokens = max_tokens
+
+
+class _TokenBudget:
+    """Tracks cumulative token spend against a fixed budget for progressive extraction."""
+
+    def __init__(self, max_tokens: int) -> None:
+        self.max_tokens = max_tokens
+        self.spent = 0
+
+    def can_fit(self, tokens: int) -> bool:
+        return self.spent + tokens <= self.max_tokens
+
+    def spend(self, tokens: int) -> None:
+        self.spent += tokens
+
+    @property
+    def exhausted(self) -> bool:
+        return self.spent >= self.max_tokens
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Parse a JSON object, ignoring trailing XML/tool junk after the closing brace."""
+    if not isinstance(text, str):
+        return None
+    start = text.find("{")
+    if start < 0:
+        return None
+    stack = 0
+    in_string = False
+    escape = False
+    end = None
+    for index, char in enumerate(text[start:], start):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            stack += 1
+        elif char == "}":
+            stack -= 1
+            if stack == 0:
+                end = index + 1
+                break
+    if end is None:
+        return None
+    try:
+        parsed = json.loads(text[start:end])
+    except (TypeError, ValueError):
+        # JSONDecodeError is a ValueError subclass; do not list both (G.ERR.09).
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _overlong_path_error(file_path: str) -> Optional[str]:
+    """Return an error if *file_path* cannot be a real filesystem path."""
+    if not isinstance(file_path, str) or not file_path:
+        return None
+    if len(file_path) > _PATH_MAX:
+        return (
+            f"file_path is too long ({len(file_path)} chars; max {_PATH_MAX}). "
+            "Pass a plain path in `file_path` and the file body in `content`."
+        )
+    normalized = file_path.replace("\\", "/")
+    for part in pathlib.PurePosixPath(normalized).parts:
+        if part in (".", "..", "/"):
+            continue
+        if len(part) > _NAME_MAX:
+            return (
+                f"file_path has a component longer than {_NAME_MAX} characters. "
+                "Pass a plain path in `file_path` and the file body in `content` "
+                "— do not serialize the whole tool-call JSON into `file_path`."
+            )
+    return None
+
+
+def _looks_like_plain_file_path(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if not stripped or stripped.startswith("{"):
+        return False
+    return _overlong_path_error(stripped) is None
+
+
+def _should_prefer_nested_content(nested_content: Any, current_content: Any) -> bool:
+    """Whether nested JSON ``content`` should replace the outer field."""
+    if not isinstance(nested_content, str):
+        return False
+    if not isinstance(current_content, str) or not current_content.strip():
+        return True
+    return len(nested_content) > len(current_content)
+
+
+def _coerce_file_tool_inputs(inputs: Any) -> Dict[str, Any]:
+    """Unwrap nested / stringified write_file payloads into a normal args dict.
+
+    Some models (observed with DeepSeek tool XML) put the entire
+    ``{"file_path": "...", "content": "..."}`` object into ``file_path``.
+    Resolving that blob as a relative path raises ENAMETOOLONG and used to
+    kill the headless turn. Unwrap one level when the nested object has a
+    plain ``file_path``.
+    """
+    if inputs is None:
+        return {}
+    if isinstance(inputs, str):
+        parsed = _extract_json_object(inputs)
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                "tool arguments must be an object with file_path "
+                "(and content for write_file)"
+            )
+        inputs = parsed
+    if not isinstance(inputs, dict):
+        raise ValueError("tool arguments must be an object")
+
+    out = dict(inputs)
+    raw_path = out.get("file_path")
+    nested: Optional[Dict[str, Any]] = None
+    if isinstance(raw_path, dict):
+        nested = raw_path
+    elif isinstance(raw_path, str) and raw_path.lstrip().startswith("{"):
+        nested = _extract_json_object(raw_path)
+
+    if isinstance(nested, dict) and _looks_like_plain_file_path(nested.get("file_path")):
+        out["file_path"] = nested["file_path"]
+        if _should_prefer_nested_content(nested.get("content"), out.get("content")):
+            out["content"] = nested["content"]
+        for key in ("old_string", "new_string", "replace_all"):
+            if key in nested and key not in out:
+                out[key] = nested[key]
+        logger.info(
+            "Unwrapped nested JSON payload from file_path into %s",
+            out.get("file_path"),
+        )
+    return out
+
+
+def _resolve_tool_file_path(operation: SysOperation, file_path: str) -> str:
+    """Resolve relative tool paths against the configured sys_operation work_dir.
+
+    Keeps UNC paths unchanged. Relative paths are only accepted when the operation
+    exposes a work_dir; otherwise the caller must still provide an absolute path.
+
+    Overlong or un-statable paths raise ``ValueError`` (not ``OSError``) so
+    callers can return ``ToolOutput(success=False)`` instead of failing the turn.
+    """
+    _ = operation
+    if not isinstance(file_path, str) or not file_path:
+        raise ValueError("file_path is required")
+    err = _overlong_path_error(file_path)
+    if err:
+        raise ValueError(err)
+
+    expanded = os.path.expanduser(file_path)
+    if expanded.startswith("\\\\") or expanded.startswith("//") or os.path.isabs(expanded):
+        err = _overlong_path_error(expanded)
+        if err:
+            raise ValueError(err)
+        return expanded
+
+    work_dir = get_cwd()
+    try:
+        resolved = str(
+            (pathlib.Path(work_dir).expanduser().resolve() / expanded).resolve()
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"Invalid file_path ({exc}). Pass a plain path in `file_path` "
+            "and the file body in `content`."
+        ) from exc
+    err = _overlong_path_error(resolved)
+    if err:
+        raise ValueError(err)
+    return resolved
+
+
+def _is_unc_path(path_value: str) -> bool:
+    return path_value.startswith("\\\\") or path_value.startswith("//")
+
+
+class ReadFileTool(Tool):
+    MAX_LINES_TO_READ: int = 2000
+    MAX_SIZE_BYTES: int = 256 * 1024   # 256 KB
+    MAX_TOKENS: int = 25_000
+    PDF_MAX_PAGES_PER_READ: int = 20
+    PDF_AT_MENTION_INLINE_THRESHOLD: int = 100
+    _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+
+    def __init__(
+        self,
+        operation: SysOperation,
+        language: str = "cn",
+        agent_id: Optional[str] = None,
+        enable_image_multimodal: bool | Callable[[], bool] = True,
+    ):
+        super().__init__(
+            build_tool_card(
+                "read_file",
+                "ReadFileTool",
+                language,
+                agent_id=agent_id,
+                options=ToolCardBuildOptions(parallel_safe=True),
+            )
+        )
+        self.operation = operation
+        self._enable_image_multimodal = enable_image_multimodal
+
+    @property
+    def enable_image_multimodal(self) -> bool:
+        """Return the current native-image policy.
+
+        Auto mode is represented by a callable so a long-lived tool can pick
+        up a completed capability probe or a main-model change without being
+        rebuilt.
+        """
+        if callable(self._enable_image_multimodal):
+            return bool(self._enable_image_multimodal())
+        return self._enable_image_multimodal
+
+    @enable_image_multimodal.setter
+    def enable_image_multimodal(
+        self,
+        value: bool | Callable[[], bool],
+    ) -> None:
+        self._enable_image_multimodal = value
+
+    # ------------------------------------------------------------------
+    # File-type predicates
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_pdf(file_path: str) -> bool:
+        return file_path.lower().endswith(".pdf")
+
+    @staticmethod
+    def _is_notebook(file_path: str) -> bool:
+        return file_path.lower().endswith(".ipynb")
+
+    @classmethod
+    def _is_image(cls, file_path: str) -> bool:
+        _, ext = os.path.splitext(file_path.lower())
+        return ext in cls._IMAGE_EXTENSIONS
+
+    @classmethod
+    def _is_binary_check_exempt(cls, file_path: str) -> bool:
+        """File types handled by dedicated readers, exempt from the binary-file guard."""
+        return cls._is_pdf(file_path) or cls._is_notebook(file_path) or cls._is_image(file_path)
+
+    @staticmethod
+    def _is_pdf_supported(model_name: str) -> bool:
+        """Returns False for claude-3-haiku variants, which cannot process inline PDFs."""
+        return "claude-3-haiku" not in model_name.lower()
+
+    @staticmethod
+    def _is_blocked_device(file_path: str) -> bool:
+        if file_path in _BLOCKED_DEVICE_PATHS:
+            return True
+        # Linux /proc/<pid>/fd/0-2 aliases for stdio
+        if file_path.startswith("/proc/") and file_path.endswith(("/fd/0", "/fd/1", "/fd/2")):
+            return True
+        return False
+
+    @staticmethod
+    def _is_binary(file_path: str) -> bool:
+        _, ext = os.path.splitext(file_path.lower())
+        return ext in _BINARY_EXTENSIONS
+
+    # ------------------------------------------------------------------
+    # PDF page range parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_pdf_page_range(pages: Optional[str], total_pages: int) -> Optional[Tuple[int, int]]:
+        """Parse a PDF page range string into an inclusive (start, end) pair.
+
+        Accepts formats: "3", "1-5", "10-", "-5".
+        Returns None when the range string is malformed or yields an empty range.
+        """
+        if not pages:
+            return (1, total_pages) if total_pages > 0 else None
+        raw = pages.strip()
+        try:
+            if "-" not in raw:
+                page = int(raw)
+                if page < 1:
+                    return None
+                clamped = min(total_pages, page)
+                return (clamped, clamped)
+            start_text, end_text = raw.split("-", 1)
+            start = int(start_text) if start_text else 1
+            end = int(end_text) if end_text else total_pages
+            start = max(1, start)
+            end = min(total_pages, end)
+            if start > end:
+                return None
+            return (start, end)
+        except (ValueError, TypeError):
+            return None
+
+    # ------------------------------------------------------------------
+    # Capability flags
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def is_read_only() -> bool:
+        return True
+
+    @staticmethod
+    def is_concurrency_safe() -> bool:
+        return True
+
+    @staticmethod
+    def check_permissions() -> str:
+        return "allow"
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_model_name(kwargs: Dict[str, Any]) -> str:
+        return str(
+            kwargs.get("model")
+            or kwargs.get("model_name")
+            or kwargs.get("llm_model")
+            or ""
+        )
+
+    @staticmethod
+    def _cat_n(text: str) -> str:
+        """Format text with cat-style 1-indexed line numbers."""
+        if text == "":
+            return ""
+        lines = text.splitlines()
+        return "\n".join(f"{idx:>6}\t{line}" for idx, line in enumerate(lines, 1))
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Rough token estimate: ~4 UTF-8 characters per token."""
+        return max(1, len(text) // 4)
+
+    @staticmethod
+    def _raw_line_count(text: str) -> int:
+        return len(text.splitlines()) if text else 0
+
+    def _is_text_read_for_edit(self, file_path: str) -> bool:
+        return (
+            not self._is_image(file_path)
+            and not self._is_pdf(file_path)
+            and not file_path.lower().endswith(".ipynb")
+        )
+
+    def _is_plain_text_candidate(self, file_path: str) -> bool:
+        return (
+            self._is_text_read_for_edit(file_path)
+            and not self._is_binary(file_path)
+        )
+
+    async def _read_raw_text_for_edit_state(self, file_path: str) -> Optional[_RawTextState]:
+        """Read raw text content for EditFileTool stale-write checks."""
+        try:
+            res = await self.operation.fs().read_file(file_path)
+            if res.code != StatusCode.SUCCESS.code:
+                return None
+            content = res.data.content if res.data else ""
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+            normalized = str(content).replace("\r\n", "\n")
+            return _RawTextState(content=normalized, line_count=self._raw_line_count(normalized))
+        except Exception:
+            return None
+
+    async def _record_read_state(
+            self,
+            file_path: str,
+            record: _ReadStateRecord,
+    ) -> None:
+        if not record.mtime_ns or not self._is_text_read_for_edit(file_path):
+            return
+
+        # ---- Cumulative coverage tracking for WriteFileTool ----
+        # WriteFileTool performs a full-file overwrite, so it must refuse to write
+        # unless the agent has actually seen every line of the file. A single
+        # partial read (offset/limit) only saw a window, so historically it was
+        # rejected — but large files can ONLY be read in partial windows
+        # (MAX_LINES_TO_READ / MAX_TOKENS), which made them permanently
+        # unwritable (read partial -> write rejected -> read partial -> loop).
+        #
+        # Resolution: track the union of every line interval the agent has read.
+        # When the union covers [1, total_lines], the file is "logically fully
+        # read" and write is allowed. Intervals merge across reads, so an agent
+        # that reads head -> tail -> middle ends up fully covered once the gap is
+        # filled — yet any still-unread range keeps the overwrite blocked,
+        # preventing data loss from overwriting unseen content.
+        existing = _FILE_READ_REGISTRY.get(file_path)
+
+        # Stale check: if the file changed externally since the last read, the
+        # accumulated coverage is no longer valid — reset and recompute total.
+        if existing is not None and (
+            existing.mtime_ns != record.mtime_ns or existing.size_bytes != record.size_bytes
+        ):
+            existing = None
+
+        # total_lines: cached on first read (or after a stale reset). Counting
+        # reads the whole file once (content stays out of the agent context);
+        # the cost is paid only once per file per modification.
+        total_lines = existing.total_lines if (existing and existing.total_lines) else 0
+        raw_state = None
+        if not total_lines:
+            raw_state = await self._read_raw_text_for_edit_state(file_path)
+            total_lines = raw_state.line_count if raw_state else 0
+
+        # Map this read to a 1-indexed closed interval [start_line, end_line].
+        # offset is 0-based lines-skipped, so the first line returned is line
+        # (offset + 1); end is offset + line_count. A zero-row read (e.g. offset
+        # past EOF) is skipped — it contributes no coverage.
+        start_line = max(1, record.offset + 1)
+        end_line = start_line + max(0, record.line_count) - 1
+        read_ranges = list(existing.read_ranges) if (existing and existing.read_ranges) else []
+        if record.line_count > 0:
+            read_ranges = _merge_range(read_ranges, (start_line, end_line))
+
+        is_logically_complete = (
+            total_lines > 0 and _ranges_cover(read_ranges, 1, total_lines)
+        )
+
+        # Full-file content snapshot for stale re-check: only keep it once the
+        # whole file has been covered (segmented reads leave content=None, so
+        # stale re-check falls back to mtime/size only — same as today).
+        if is_logically_complete and raw_state is None:
+            raw_state = await self._read_raw_text_for_edit_state(file_path)
+
+        _FILE_READ_REGISTRY[file_path] = _FileReadState(
+            mtime_ns=record.mtime_ns,
+            size_bytes=record.size_bytes,
+            is_partial=record.is_partial,
+            content=raw_state.content if raw_state else None,
+            total_lines=total_lines,
+            read_ranges=read_ranges,
+        )
+
+    # ------------------------------------------------------------------
+    # Per-type readers
+    # ------------------------------------------------------------------
+
+    async def _read_text(self, file_path: str, offset: int, limit: int, apply_size_cap: bool = True) -> str:
+        """Read `limit` lines starting after skipping `offset` lines (0-based skip).
+
+        apply_size_cap: apply MAX_SIZE_BYTES check only when reading without an explicit
+        user-supplied limit (mirrors TS: maxSizeBytes is passed only when limit is None).
+        """
+        start = max(0, offset) + 1    # convert 0-based skip to 1-indexed start line
+        end = start + max(0, limit) - 1
+        res = await self.operation.fs().read_file(file_path, line_range=(start, end))
+        if res.code != StatusCode.SUCCESS.code:
+            raise RuntimeError(res.message)
+        content = res.data.content or ""
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
+
+        if apply_size_cap:
+            byte_len = len(content.encode("utf-8", errors="replace"))
+            if byte_len > self.MAX_SIZE_BYTES:
+                raise RuntimeError(
+                    f"Error: File content ({byte_len // 1024} KB) exceeds maximum allowed size "
+                    f"({self.MAX_SIZE_BYTES // 1024} KB). "
+                    "Use grep for specific content or read a smaller offset/limit range."
+                )
+
+        tokens = self._estimate_tokens(content)
+        if tokens > self.MAX_TOKENS:
+            raise MaxFileReadTokenExceededError(tokens, self.MAX_TOKENS)
+
+        rendered = self._cat_n(content)
+
+        # Empty file or offset beyond end-of-file: return an explicit warning string.
+        if not content.strip():
+            if offset == 0:
+                return "Warning: the file exists but the contents are empty."
+            else:
+                return (
+                    f"Error: The file exists but no content was returned at offset {offset}. "
+                    "Use a smaller offset or read from the beginning."
+                )
+
+        return rendered
+
+    async def _read_notebook(self, file_path: str) -> str:
+        res = await self.operation.fs().read_file(file_path)
+        if res.code != StatusCode.SUCCESS.code:
+            raise RuntimeError(res.message)
+        raw_text = res.data.content or ""
+        if isinstance(raw_text, bytes):
+            raw_text = raw_text.decode("utf-8", errors="replace")
+
+        byte_len = len(raw_text.encode("utf-8", errors="replace"))
+        if byte_len > self.MAX_SIZE_BYTES:
+            raise RuntimeError(
+                f"Error: Notebook content ({byte_len // 1024} KB) exceeds maximum allowed size "
+                f"({self.MAX_SIZE_BYTES // 1024} KB). "
+                "Use grep to search for specific cell content instead of reading the whole notebook."
+            )
+
+        notebook = json.loads(raw_text)
+        cells = notebook.get("cells", [])
+        budget = _TokenBudget(self.MAX_TOKENS)
+        blocks = []
+        extracted_count = 0
+        for idx, cell in enumerate(cells, 1):
+            cell_type = cell.get("cell_type", "unknown")
+            source = "".join(cell.get("source", []))
+            cell_lines = [f"## Cell {idx} [{cell_type}]"]
+            if source:
+                cell_lines.append(source.rstrip("\n"))
+            outputs = cell.get("outputs") or []
+            if outputs:
+                cell_lines.append("### Outputs")
+            for out in outputs:
+                text = ""
+                if "text" in out:
+                    text = "".join(out.get("text", []))
+                elif "data" in out and isinstance(out["data"], dict):
+                    txt = out["data"].get("text/plain")
+                    if isinstance(txt, list):
+                        text = "".join(txt)
+                    elif isinstance(txt, str):
+                        text = txt
+                elif "ename" in out and "evalue" in out:
+                    text = f"{out.get('ename')}: {out.get('evalue')}"
+                if text:
+                    cell_lines.append(text.rstrip("\n"))
+
+            cell_text = "\n".join(cell_lines)
+            cell_tokens = self._estimate_tokens(cell_text)
+            if extracted_count > 0 and not budget.can_fit(cell_tokens):
+                blocks.append(
+                    f"… (truncated — {extracted_count}/{len(cells)} cells extracted, "
+                    f"{self.MAX_TOKENS}-token budget reached)"
+                )
+                break
+            budget.spend(cell_tokens)
+            blocks.append(cell_text)
+            extracted_count += 1
+        return "\n".join(blocks).strip()
+
+    async def _read_pdf(self, file_path: str, pages: Optional[str]) -> str:
+        res = await self.operation.fs().read_file(file_path, mode="bytes")
+        if res.code != StatusCode.SUCCESS.code:
+            raise RuntimeError(res.message)
+        content = res.data.content or b""
+        if not isinstance(content, bytes):
+            raise RuntimeError("PDF content is not bytes")
+
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            total_pages = len(pdf.pages)
+
+            # Require pages param when document is too long to inline safely.
+            if not pages and total_pages > self.PDF_AT_MENTION_INLINE_THRESHOLD:
+                raise RuntimeError(
+                    f"This PDF has {total_pages} pages, which is too many to read at once. "
+                    f"Use the pages parameter to specify a range (e.g., pages='1-10'). "
+                    f"Maximum {self.PDF_MAX_PAGES_PER_READ} pages per request."
+                )
+
+            result = self._parse_pdf_page_range(pages, total_pages)
+            if result is None:
+                raise RuntimeError(f"Invalid or empty PDF page range: '{pages}'")
+            start, end = result
+
+            page_count = end - start + 1
+            if page_count > self.PDF_MAX_PAGES_PER_READ:
+                raise RuntimeError(
+                    f"Requested {page_count} pages exceeds the maximum of "
+                    f"{self.PDF_MAX_PAGES_PER_READ} pages per read. "
+                    "Narrow the pages parameter range."
+                )
+
+            budget = _TokenBudget(self.MAX_TOKENS)
+            parts = []
+            extracted_count = 0
+            for page_no in range(start, end + 1):
+                page_text = pdf.pages[page_no - 1].extract_text() or ""
+                page_block = f"## Page {page_no}\n{page_text}".rstrip()
+                page_tokens = self._estimate_tokens(page_block)
+                if extracted_count > 0 and not budget.can_fit(page_tokens):
+                    parts.append(
+                        f"… (truncated — {extracted_count}/{page_count} pages extracted, "
+                        f"{self.MAX_TOKENS}-token budget reached)"
+                    )
+                    break
+                budget.spend(page_tokens)
+                parts.append(page_block)
+                extracted_count += 1
+            return "\n\n".join(parts).strip()
+
+    @staticmethod
+    def _estimate_base64_tokens(byte_length: int) -> int:
+        """Token estimate for base64-encoding `byte_length` bytes, without encoding.
+
+        Computes the exact base64.b64encode() output length (3 raw bytes -> 4
+        encoded chars, rounded up to a multiple of 4) from the byte count
+        alone, so budget checks don't need to pay for a real encode just to
+        measure size.
+        """
+        encoded_length = ((byte_length + 2) // 3) * 4
+        return max(1, int(encoded_length * 0.125))
+
+    @staticmethod
+    def _compress_image(img: Any, size: Tuple[int, int], quality: int) -> Optional[bytes]:
+        """Render an isolated, downsized JPEG copy of an already-decoded PIL image.
+
+        `img.convert("RGB")` returns a new image object, so `img` itself is
+        never mutated and stays reusable by other compression tiers.
+        """
+        try:
+            out = io.BytesIO()
+            tier = img.convert("RGB")
+            tier.thumbnail(size)
+            tier.save(out, format="JPEG", quality=quality)
+            return out.getvalue()
+        except (OSError, ValueError) as exc:
+            logger.debug("Failed to compress image bytes: %s", exc)
+            return None
+
+    async def _read_image(self, file_path: str, model_name: str) -> Dict[str, Any]:
+
+        res = await self.operation.fs().read_file(file_path, mode="bytes")
+        if res.code != StatusCode.SUCCESS.code:
+            raise RuntimeError(res.message)
+        raw = res.data.content or b""
+        if not isinstance(raw, bytes):
+            raise RuntimeError("Image content is not bytes")
+        if not raw:
+            raise RuntimeError(f"Image file is empty: {file_path}")
+
+        _, ext = os.path.splitext(file_path.lower())
+        image_type = ext.lstrip(".") or "png"
+        dimensions: str | None = None
+        resized = raw
+
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            logger.debug("Pillow is unavailable for image metadata extraction (%s): %s", file_path, exc)
+        else:
+            try:
+                # Decode once; every compression tier below works off this same
+                # image object (via .copy()/.convert(), which never mutate it).
+                with Image.open(io.BytesIO(raw)) as img:
+                    detected_format = (img.format or "PNG").lower()
+                    image_type = detected_format  # prefer format detected from buffer
+                    dimensions = f"{img.width}x{img.height}"
+
+                    # Tier 1: standard resize, same format as the source (thumbnail to 1536×1536).
+                    tier1 = img.copy()
+                    tier1.thumbnail((1536, 1536))
+                    out = io.BytesIO()
+                    tier1.save(out, format=detected_format.upper())
+                    candidate = out.getvalue()
+                    if candidate and len(candidate) < len(raw):
+                        resized = candidate
+
+                    # Tier 2/3: only pay for further compression if tier 1 still busts the budget.
+                    # Token budget check uses a byte-length estimate, not a real base64 encode.
+                    if self._estimate_base64_tokens(len(resized)) > self.MAX_TOKENS:
+                        compressed = self._compress_image(img, size=(800, 800), quality=40)
+                        if compressed and self._estimate_base64_tokens(len(compressed)) <= self.MAX_TOKENS:
+                            resized = compressed
+                            image_type = "jpeg"
+                        else:
+                            # Final fallback: 400×400 JPEG q=20 (mirrors TS Sharp fallback).
+                            fallback = self._compress_image(img, size=(400, 400), quality=20)
+                            if fallback:
+                                resized = fallback
+                                image_type = "jpeg"
+            except (OSError, ValueError) as exc:
+                logger.debug("Failed to parse image metadata (%s): %s", file_path, exc)
+
+        mime_type = f"image/{image_type}"
+        parts = [
+            f"Image file read: {file_path}",
+            f"format: {image_type}",
+            f"size_bytes: {len(raw)}",
+            f"transmitted_size_bytes: {len(resized)}",
+        ]
+        if dimensions:
+            parts.append(f"dimensions: {dimensions}")
+
+        if not self.enable_image_multimodal:
+            parts.append(
+                "Image bytes are not attached because read_file native image multimodal input is disabled."
+            )
+            parts.append(
+                "If a vision tool is configured, call image_ocr or visual_question_answering with this file path."
+            )
+            return {
+                "content": "\n".join(parts),
+                "multimodal": [],
+            }
+
+        encoded = base64.b64encode(resized).decode("ascii")
+        data_url = f"data:{mime_type};base64,{encoded}"
+        parts.append("Image bytes are attached as multimodal input and omitted from this tool result.")
+        return {
+            "content": "\n".join(parts),
+            "multimodal": [
+                {
+                    "type": "image",
+                    "source": "read_file",
+                    "source_path": file_path,
+                    "mime_type": mime_type,
+                    "data_url": data_url,
+                }
+            ],
+        }
+
+    # ------------------------------------------------------------------
+    # invoke / stream
+    # ------------------------------------------------------------------
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs) -> ToolOutput:
+        file_path = inputs.get("file_path")
+        if not file_path:
+            return ToolOutput(success=False, error="file_path is required")
+
+        try:
+            file_path = _resolve_tool_file_path(self.operation, file_path)
+        except ValueError as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+        # Blocked device paths — would hang or produce infinite output (errorCode 9).
+        if self._is_blocked_device(file_path):
+            return ToolOutput(
+                success=False,
+                error=f"Reading device file '{file_path}' is not allowed.",
+            )
+
+        # Binary files are not readable as text (errorCode 4); PDF, notebooks, and images are exempt.
+        if (
+            not self._is_binary_check_exempt(file_path)
+            and not self._is_plain_text_candidate(file_path)
+        ):
+            return ToolOutput(
+                success=False,
+                error=f"Binary files cannot be read as text: '{os.path.basename(file_path)}'.",
+            )
+
+        pages: Optional[str] = inputs.get("pages")
+
+        # Validate pages format and range size before any I/O (errorCode 7 / 8).
+        if pages is not None and self._is_pdf(file_path):
+            # Format check: parse against sys.maxsize to detect structural errors.
+            parsed = self._parse_pdf_page_range(pages, sys.maxsize)
+            if parsed is None:
+                return ToolOutput(
+                    success=False,
+                    error=f"Invalid PDF page range format: '{pages}'. "
+                          "Use formats like '3', '1-5', or '10-20'. Pages are 1-indexed.",
+                )
+            # Open-ended ranges (e.g. "10-") resolve end to sys.maxsize at parse time,
+            # which means we cannot bound the size — reject them upfront (errorCode 8).
+            start_pg, end_pg = parsed
+            if end_pg >= sys.maxsize or (end_pg - start_pg + 1) > self.PDF_MAX_PAGES_PER_READ:
+                return ToolOutput(
+                    success=False,
+                    error=f"Page range '{pages}' exceeds the maximum of "
+                          f"{self.PDF_MAX_PAGES_PER_READ} pages per request. "
+                          "Please use a smaller or fully-bounded range (e.g. '1-20').",
+                )
+
+        offset: int = int(inputs.get("offset", 0))
+        raw_limit = inputs.get("limit")
+        user_supplied_limit: bool = raw_limit is not None
+        limit: int = (
+            min(int(raw_limit), self.MAX_LINES_TO_READ)
+            if user_supplied_limit
+            else self.MAX_LINES_TO_READ
+        )
+        model_name: str = self._resolve_model_name(kwargs)
+
+        mtime_ns: int = 0
+        size_bytes: int = 0
+        try:
+            _st = os.stat(file_path)
+            mtime_ns = _st.st_mtime_ns
+            size_bytes = _st.st_size
+        except OSError:
+            pass
+
+        if (
+            self._is_plain_text_candidate(file_path)
+            and not user_supplied_limit
+            and size_bytes > self.MAX_SIZE_BYTES
+        ):
+            return ToolOutput(
+                success=False,
+                error=(
+                    f"Error: File content ({size_bytes / 1024:.1f}KB) exceeds maximum allowed size "
+                    f"({self.MAX_SIZE_BYTES // 1024}KB). "
+                    "Use grep for specific content or read a smaller offset/limit range."
+                ),
+            )
+
+        try:
+            if self._is_pdf(file_path):
+                rendered = await self._read_pdf(file_path, pages)
+            elif self._is_notebook(file_path):
+                rendered = await self._read_notebook(file_path)
+            elif self._is_image(file_path):
+                rendered = await self._read_image(file_path, model_name)
+            else:
+                # MAX_SIZE_BYTES cap only applies when no explicit limit was given
+                # (mirrors TS: maxSizeBytes passed only when limit is undefined).
+                rendered = await self._read_text(
+                    file_path, offset, limit, apply_size_cap=not user_supplied_limit
+                )
+        except MaxFileReadTokenExceededError as exc:
+            return ToolOutput(success=False, error=str(exc))
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+        if isinstance(rendered, dict):
+            content = str(rendered.get("content", ""))
+            result_data = dict(rendered)
+        else:
+            content = rendered
+            result_data = {"content": content}
+
+        line_count = len(content.splitlines()) if content else 0
+
+        # Populate read registry for EditFileTool pre-read validation and
+        # WriteFileTool cumulative coverage tracking.
+        await self._record_read_state(
+            file_path=file_path,
+            record=_ReadStateRecord(
+                mtime_ns=mtime_ns,
+                size_bytes=size_bytes,
+                is_partial=user_supplied_limit or offset > 0,
+                offset=offset,
+                line_count=line_count,
+            ),
+        )
+
+        return ToolOutput(
+            success=True,
+            data={
+                **result_data,
+                "content": content,
+                "file_path": file_path,
+                "line_count": line_count,
+            },
+        )
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs) -> AsyncIterator[Any]:
+        if False:
+            yield None
+
+
+# Backward-compatible camelCase aliases for legacy callers.
+ReadFileTool.isReadOnly = staticmethod(ReadFileTool.is_read_only)
+ReadFileTool.isConcurrencySafe = staticmethod(ReadFileTool.is_concurrency_safe)
+ReadFileTool.checkPermissions = staticmethod(ReadFileTool.check_permissions)
+
+
+class WriteFileTool(Tool):
+    """Full-file writer with Claude Write-tool style stale-write protection."""
+
+    MAX_FILE_SIZE: int = 1 * 1024 * 1024 * 1024  # 1 GiB
+    MAX_CONTENT_SIZE: int = 5 * 1024 * 1024  # 5 MiB — larger files must use bash/shell I/O
+
+    def __init__(self, operation: SysOperation, language: str = "cn", agent_id: Optional[str] = None):
+        super().__init__(
+            build_tool_card(
+                "write_file",
+                "WriteFileTool",
+                language,
+                agent_id=agent_id,
+                options=ToolCardBuildOptions(parallel_safe=False),
+            )
+        )
+        self.operation = operation
+
+    @staticmethod
+    def _detect_encoding(raw: bytes) -> str:
+        return "utf-16-le" if raw[:2] == b"\xff\xfe" else "utf-8"
+
+    def _build_history_path(self, session: Any) -> str:
+        base_dir = get_agent_history_root()
+        agent_id = (
+            session.agent_id() if hasattr(session, "agent_id")
+            else session.get_agent_id() if hasattr(session, "get_agent_id")
+            else None
+        ) or "default"
+        return os.path.join(
+            base_dir, ".agent_history",
+            f"file_ops_{agent_id}_{session.get_session_id()}.json",
+        )
+
+    async def _read_existing_text(self, file_path: str) -> Tuple[str, str]:
+        res = await self.operation.fs().read_file(file_path, mode="bytes")
+        if res.code != StatusCode.SUCCESS.code:
+            raise OSError(res.message)
+
+        raw = res.data.content if res.data else b""
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+
+        encoding = self._detect_encoding(raw)
+        return raw.decode(encoding, errors="replace"), encoding
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs) -> ToolOutput:
+        try:
+            inputs = _coerce_file_tool_inputs(inputs)
+        except ValueError as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+        path: Optional[str] = inputs.get("file_path")
+        content = inputs.get("content")
+
+        if not path:
+            return ToolOutput(success=False, error="file_path is required")
+        if isinstance(path, str) and path.lstrip().startswith("{"):
+            return ToolOutput(
+                success=False,
+                error=(
+                    "file_path looks like a JSON object, not a filesystem path. "
+                    "Call write_file with `file_path` as a plain path string and "
+                    "`content` as a separate string field."
+                ),
+            )
+        if content is None:
+            return ToolOutput(success=False, error="content is required")
+        if not isinstance(content, str):
+            return ToolOutput(success=False, error="content must be a string")
+
+        content_bytes = len(content.encode("utf-8", errors="replace"))
+        if content_bytes > self.MAX_CONTENT_SIZE:
+            return ToolOutput(
+                success=False,
+                error=(
+                    f"content is too large ({content_bytes // (1024 * 1024)} MiB) for write_file. "
+                    f"Maximum allowed is {self.MAX_CONTENT_SIZE // (1024 * 1024)} MiB. "
+                    "Use the bash or powershell tool to write large files instead, e.g.:\n"
+                    "  python -c \"open('path', 'w').write('...' * N)\"\n"
+                    "  or use shell redirection / a script that writes incrementally."
+                ),
+            )
+
+        try:
+            path = _resolve_tool_file_path(self.operation, path)
+        except ValueError as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+        is_unc = _is_unc_path(path)
+
+        encoding = "utf-8"
+        old_content: Optional[str] = None
+        operation_type = "create"
+
+        if not is_unc:
+            try:
+                file_exists = os.path.exists(path)
+                if file_exists:
+                    if os.path.isdir(path):
+                        return ToolOutput(success=False, error=f"Target path is a directory: {path}")
+
+                    stat = os.stat(path)
+                    if stat.st_size > self.MAX_FILE_SIZE:
+                        return ToolOutput(
+                            success=False,
+                            error=(
+                                f"Error: File is too large ({stat.st_size // (1024 ** 3)} GiB). "
+                                "Maximum allowed size is 1 GiB."
+                            ),
+                        )
+
+                    read_state = _FILE_READ_REGISTRY.get(path)
+                    # WriteFileTool overwrites the whole file, so the agent must
+                    # have seen every line first — otherwise unread content would
+                    # be lost. A single partial read only covered a window, so
+                    # require cumulative coverage of the whole file instead.
+                    # This unblocks large files (which can only be read in
+                    # partial windows) while still refusing to overwrite a file
+                    # that was only partially read.
+                    ranges = read_state.read_ranges if read_state else None
+                    is_logically_complete = (
+                        read_state is not None
+                        and read_state.total_lines > 0
+                        and ranges is not None
+                        and _ranges_cover(ranges, 1, read_state.total_lines)
+                    )
+                    if read_state is None or not is_logically_complete:
+                        if read_state is None:
+                            msg = (
+                                f"Error: File has not been read yet: {path}. "
+                                "Read it before attempting to write it."
+                            )
+                        else:
+                            # Point the agent at the first unread line so it knows
+                            # exactly where to resume — this prevents a blind loop.
+                            resume_offset = _first_unread_offset(ranges)
+                            # Lines read so far = sum of interval lengths in ranges.
+                            lines_read = sum(e - s + 1 for s, e in (ranges or []))
+                            msg = (
+                                f"Error: File has not been fully read yet. "
+                                f"You have read {lines_read} of {read_state.total_lines} lines. "
+                                f"Continue with read_file offset={resume_offset} before writing."
+                                f"until the whole file is covered, then write. "
+                                f"A full-file overwrite cannot use partial reads — "
+                                f"it would lose the unread content."
+                            )
+                        return ToolOutput(success=False, error=msg)
+
+                    old_content, encoding = await self._read_existing_text(path)
+                    old_content_lf = old_content.replace("\r\n", "\n")
+
+                    if read_state.mtime_ns != stat.st_mtime_ns or read_state.size_bytes != stat.st_size:
+                        content_unchanged = read_state.content is not None and old_content_lf == read_state.content
+                        if not content_unchanged:
+                            _FILE_READ_REGISTRY.pop(path, None)
+                            return ToolOutput(
+                                success=False,
+                                error=(
+                                    f"Error: File has been modified since read: {path}. "
+                                    "Read it again before attempting to write it."
+                                ),
+                            )
+
+                    operation_type = "update"
+            except OSError as exc:
+                return ToolOutput(success=False, error=str(exc))
+
+        res = await self.operation.fs().write_file(
+            path,
+            content,
+            prepend_newline=False,
+            create_if_not_exist=True,
+            encoding=encoding,
+        )
+        if res.code != StatusCode.SUCCESS.code:
+            return ToolOutput(success=False, error=res.message)
+
+        if not is_unc:
+            try:
+                stat_after = os.stat(path)
+                _FILE_READ_REGISTRY[path] = _FileReadState(
+                    mtime_ns=stat_after.st_mtime_ns,
+                    size_bytes=stat_after.st_size,
+                    is_partial=False,
+                    content=content.replace("\r\n", "\n"),
+                )
+            except OSError:
+                _FILE_READ_REGISTRY.pop(path, None)
+
+        _session = get_current_session()
+        if _session is not None:
+            _history_path = self._build_history_path(_session)
+            await _append_op_history(_history_path, path, "write", old_content, content)
+
+        return ToolOutput(
+            success=True,
+            data={
+                "file_path": path,
+                "bytes_written": len(content.encode(encoding, errors="replace")),
+                "type": operation_type,
+                "created": operation_type == "create",
+                "original_file": old_content,
+            }
+        )
+
+    def render_for_llm(self, output: ToolOutput) -> str:
+        """Confirm the write without echoing the previous file content."""
+        if not output.success:
+            return super().render_for_llm(output)
+        data = output.data
+        action = "Created" if data["created"] else "Updated"
+        return f"{action} {data['file_path']} ({data['bytes_written']} bytes written)."
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs) -> AsyncIterator[Any]:
+        pass
+
+
+class EditFileTool(Tool):
+    """Enhanced file edit tool implementing the full Edit tool specification.
+
+    Key behaviours:
+    - Pre-read validation: file must be read by ReadFileTool before editing
+    - External modification detection: mtime_ns + file-size dual check
+    - Uniqueness validation: old_string must match exactly once unless replace_all=True
+    - Quote tolerance: automatic straight/curly quote fallback when exact match fails
+    - XML desanitization: reverses HTML entity encoding via html.unescape()
+    - New file creation: old_string='' + non-existent path creates new file
+    - EOL preservation: detects and preserves CRLF vs LF on write
+    - Trailing whitespace stripping on new_string lines (skipped for .md / .mdx)
+    - File size guard: rejects files > 1 GiB
+    - Rejects .ipynb files (use NotebookEdit instead)
+    - Rejects old_string == new_string (no-op)
+    - UNC path handling: skips local filesystem checks for \\\\server or //server paths
+    """
+
+    MAX_FILE_SIZE: int = 1 * 1024 * 1024 * 1024  # 1 GiB
+    _MD_EXTENSIONS: frozenset = frozenset({".md", ".mdx"})
+    _STRAIGHT_TO_CURLY: dict = str.maketrans({'"': '\u201c', '\u201c': '"', '\u201d': '"',
+                                               "'": '\u2018', '\u2018': "'", '\u2019': "'"})
+
+    def __init__(self, operation: SysOperation, language: str = "cn", agent_id: Optional[str] = None):
+        super().__init__(
+            build_tool_card(
+                "edit_file",
+                "EditFileTool",
+                language,
+                agent_id=agent_id,
+                options=ToolCardBuildOptions(parallel_safe=False),
+            )
+        )
+        self.operation = operation
+
+    # ------------------------------------------------------------------
+    # Static helpers
+    # ------------------------------------------------------------------
+
+    # Mirrors TS DESANITIZATIONS table in FileEditTool/utils.ts.
+    # Claude cannot output certain XML tokens (they're sanitized by the API), so it
+    # emits compressed abbreviations that the Edit tool must reverse.
+    _DESANITIZATIONS: dict = {
+        "<fnr>": "<function_results>",
+        "<n>": "<name>",
+        "</n>": "</name>",
+        "<o>": "<output>",
+        "</o>": "</output>",
+        "<e>": "<error>",
+        "</e>": "</error>",
+        "<s>": "<system>",
+        "</s>": "</system>",
+        "<r>": "<result>",
+        "</r>": "</result>",
+        "< META_START >": "<META_START>",
+        "< META_END >": "<META_END>",
+        "< EOT >": "<EOT>",
+        "< META >": "<META>",
+        "< SOS >": "<SOS>",
+        "\n\nH:": "\n\nHuman:",
+        "\n\nA:": "\n\nAssistant:",
+    }
+
+    @staticmethod
+    def _detect_eol(raw: bytes) -> str:
+        return "\r\n" if b"\r\n" in raw else "\n"
+
+    @staticmethod
+    def _detect_encoding(raw: bytes) -> str:
+        return "utf-16-le" if raw[:2] == b"\xff\xfe" else "utf-8"
+
+    @classmethod
+    def _desanitize(cls, value: str) -> str:
+        result = html.unescape(value)
+        for source, target in cls._DESANITIZATIONS.items():
+            result = result.replace(source, target)
+        return result
+
+    @staticmethod
+    def _strip_trailing_whitespace(value: str) -> str:
+        parts = value.splitlines(keepends=True)
+        if not parts:
+            return value.rstrip()
+
+        stripped_parts: List[str] = []
+        for part in parts:
+            body = part
+            line_ending = ""
+            if part.endswith("\r\n"):
+                body = part[:-2]
+                line_ending = "\r\n"
+            elif part.endswith(("\n", "\r")):
+                body = part[:-1]
+                line_ending = part[-1]
+            stripped_parts.append(body.rstrip() + line_ending)
+        return "".join(stripped_parts)
+
+    @staticmethod
+    def _find_similar_paths(file_path: str, max_results: int = 5) -> List[str]:
+        directory = os.path.dirname(file_path) or "."
+        target_base = os.path.splitext(os.path.basename(file_path))[0].lower()
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return []
+
+        similar: List[str] = []
+        for name in names:
+            candidate_base = os.path.splitext(name)[0].lower()
+            if candidate_base == target_base or target_base in candidate_base or candidate_base in target_base:
+                similar.append(os.path.join(directory, name))
+            if len(similar) >= max_results:
+                break
+        return similar
+
+    @staticmethod
+    def _normalize_quotes(value: str) -> str:
+        return (
+            value.replace("\u2018", "'")
+            .replace("\u2019", "'")
+            .replace("\u201c", '"')
+            .replace("\u201d", '"')
+        )
+
+    @staticmethod
+    def _is_opening_quote_context(chars: List[str], index: int) -> bool:
+        if index == 0:
+            return True
+        return chars[index - 1] in {" ", "\t", "\n", "\r", "(", "[", "{", "\u2014", "\u2013"}
+
+    @classmethod
+    def _apply_curly_double_quotes(cls, value: str) -> str:
+        chars = list(value)
+        result: List[str] = []
+        for index, char in enumerate(chars):
+            if char == '"':
+                result.append("\u201c" if cls._is_opening_quote_context(chars, index) else "\u201d")
+            else:
+                result.append(char)
+        return "".join(result)
+
+    @classmethod
+    def _apply_curly_single_quotes(cls, value: str) -> str:
+        chars = list(value)
+        result: List[str] = []
+        for index, char in enumerate(chars):
+            if char != "'":
+                result.append(char)
+                continue
+            prev_char = chars[index - 1] if index > 0 else ""
+            next_char = chars[index + 1] if index < len(chars) - 1 else ""
+            if prev_char.isalpha() and next_char.isalpha():
+                result.append("\u2019")
+            else:
+                result.append("\u2018" if cls._is_opening_quote_context(chars, index) else "\u2019")
+        return "".join(result)
+
+    @classmethod
+    def _preserve_quote_style(cls, old_str: str, actual_old_str: str, new_str: str) -> str:
+        if old_str == actual_old_str:
+            return new_str
+
+        result = new_str
+        if "\u201c" in actual_old_str or "\u201d" in actual_old_str:
+            result = cls._apply_curly_double_quotes(result)
+        if "\u2018" in actual_old_str or "\u2019" in actual_old_str:
+            result = cls._apply_curly_single_quotes(result)
+        return result
+
+    def _try_quote_variants(self, content: str, old_str: str) -> Optional[str]:
+        """Return a quote-substituted variant of old_str that matches content, or None."""
+        normalized_content = self._normalize_quotes(content)
+        normalized_old = self._normalize_quotes(old_str)
+        index = normalized_content.find(normalized_old)
+        if index == -1:
+            return None
+        return content[index:index + len(old_str)]
+
+    def _build_history_path(self, session: Any) -> str:
+        base_dir = get_agent_history_root()
+        agent_id = (
+            session.agent_id() if hasattr(session, "agent_id")
+            else session.get_agent_id() if hasattr(session, "get_agent_id")
+            else None
+        ) or "default"
+        return os.path.join(
+            base_dir, ".agent_history",
+            f"file_ops_{agent_id}_{session.get_session_id()}.json",
+        )
+
+    async def _read_existing_text(self, file_path: str) -> Tuple[str, bytes]:
+        res = await self.operation.fs().read_file(file_path, mode="bytes")
+        if res.code != StatusCode.SUCCESS.code:
+            raise OSError(res.message)
+
+        raw = res.data.content if res.data else b""
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+
+        encoding = self._detect_encoding(raw)
+        return raw.decode(encoding, errors="replace"), raw
+
+    # ------------------------------------------------------------------
+    # invoke
+    # ------------------------------------------------------------------
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs) -> ToolOutput:
+        """Serialize the complete read-modify-write transaction per file."""
+        try:
+            inputs = _coerce_file_tool_inputs(inputs)
+        except ValueError as exc:
+            return ToolOutput(success=False, error=str(exc))
+        file_path = inputs.get("file_path")
+        if not isinstance(file_path, str) or not file_path.strip():
+            return await self._invoke_unlocked(inputs, **kwargs)
+        try:
+            resolved_path = _resolve_tool_file_path(self.operation, file_path)
+        except ValueError:
+            return await self._invoke_unlocked(inputs, **kwargs)
+
+        async with _get_file_edit_lock(resolved_path):
+            return await self._invoke_unlocked(inputs, **kwargs)
+
+    async def _invoke_unlocked(self, inputs: Dict[str, Any], **kwargs) -> ToolOutput:  # noqa: C901
+        file_path: Optional[str] = inputs.get("file_path")
+        old_str: str = inputs.get("old_string", "")
+        new_str: Optional[str] = inputs.get("new_string")
+        replace_all: bool = bool(inputs.get("replace_all", False))
+
+        if not file_path:
+            return ToolOutput(success=False, error="file_path is required")
+        if new_str is None:
+            return ToolOutput(success=False, error="new_string is required")
+
+        try:
+            file_path = _resolve_tool_file_path(self.operation, file_path)
+        except ValueError as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+
+        # Reject Jupyter notebooks — use NotebookEdit instead.
+        if file_path.lower().endswith(".ipynb"):
+            return ToolOutput(
+                success=False,
+                error="Cannot edit .ipynb files with this tool. Use NotebookEdit instead.",
+            )
+
+        # Reject no-op edits.
+        if old_str == new_str:
+            return ToolOutput(
+                success=False,
+                error="old_string and new_string are identical; no changes would be made.",
+            )
+
+        is_unc = _is_unc_path(file_path)
+        file_exists = os.path.exists(file_path) if not is_unc else True
+
+        # ---- New file creation (old_string == '') --------------------------------
+        if old_str == "":
+            if file_exists and not is_unc:
+                try:
+                    existing_content, _ = await self._read_existing_text(file_path)
+                except OSError as exc:
+                    return ToolOutput(success=False, error=str(exc))
+                if existing_content.strip() != "":
+                    return ToolOutput(
+                        success=False,
+                        error="Cannot create new file - file already exists.",
+                    )
+            write_res = await self.operation.fs().write_file(
+                file_path, new_str, prepend_newline=False, create_if_not_exist=True
+            )
+            if write_res.code != StatusCode.SUCCESS.code:
+                return ToolOutput(success=False, error=f"Create failed: {write_res.message}")
+            # Register the new file as read so subsequent edits don't require a re-read.
+            try:
+                _st = os.stat(file_path)
+                _FILE_READ_REGISTRY[file_path] = _FileReadState(
+                    mtime_ns=_st.st_mtime_ns,
+                    size_bytes=_st.st_size,
+                    is_partial=False,
+                    content=new_str.replace("\r\n", "\n"),
+                )
+            except OSError:
+                pass
+            return ToolOutput(success=True, data={"file_path": file_path, "replacements": 0, "created": True})
+
+        # ---- File must exist for non-empty old_string ----------------------------
+        if not file_exists:
+            similar = self._find_similar_paths(file_path)
+            hint = f" Similar paths: {similar}" if similar else ""
+            return ToolOutput(
+                success=False,
+                error=f"Error: File not found: '{file_path}'.{hint}",
+            )
+
+        # ---- File size guard -----------------------------------------------------
+        if not is_unc:
+            try:
+                _stat = os.stat(file_path)
+            except OSError as exc:
+                return ToolOutput(success=False, error=str(exc))
+
+            if _stat.st_size > self.MAX_FILE_SIZE:
+                return ToolOutput(
+                    success=False,
+                    error=(
+                        f"Error: File is too large ({_stat.st_size // (1024 ** 3)} GiB). "
+                        "Maximum allowed size is 1 GiB."
+                    ),
+                )
+
+            current_mtime = _stat.st_mtime_ns
+            current_size = _stat.st_size
+        else:
+            current_mtime = 0
+            current_size = 0
+
+        # ---- Pre-read validation ---------------------------------------------
+        # Only require that read_file has been called at least once for this
+        # path. A partial read (offset/limit) is accepted: old_string is
+        # matched against freshly re-read content below, and the external
+        # modification check still rejects edits against a stale read.
+        # Requiring a *full* read here would make large files — which
+        # read_file itself forces into partial reads via MAX_LINES_TO_READ /
+        # MAX_TOKENS — permanently uneditable.
+        read_state = _FILE_READ_REGISTRY.get(file_path)
+        if read_state is None:
+            return ToolOutput(
+                success=False,
+                error=(
+                    f"Error: File must be read before editing: {file_path}. "
+                    "Read it before attempting to edit it."
+                ),
+            )
+
+        # ---- External modification check (timestamp + size dual check) -----------
+        if not is_unc and (read_state.mtime_ns != current_mtime or read_state.size_bytes != current_size):
+            content_unchanged = False
+            if read_state.content is not None:
+                try:
+                    compare_content, _ = await self._read_existing_text(file_path)
+                    compare_content = compare_content.replace("\r\n", "\n")
+                    content_unchanged = compare_content == read_state.content
+                except OSError:
+                    content_unchanged = False
+
+            if not content_unchanged:
+                _FILE_READ_REGISTRY.pop(file_path, None)
+                return ToolOutput(
+                    success=False,
+                    error=(
+                        f"Error: File has been modified since read: {file_path}. "
+                        "Read it again before attempting to edit it."
+                    ),
+                )
+
+        # ---- Read raw bytes to detect EOL style ----------------------------------
+        try:
+            content, raw = await self._read_existing_text(file_path)
+        except OSError as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+        eol = self._detect_eol(raw)
+
+        # Normalise to LF internally for matching and replacement.
+        content_lf = content.replace("\r\n", "\n")
+
+        # ---- XML desanitization + trailing whitespace stripping ------------------
+        old_str_clean = self._desanitize(old_str).replace("\r\n", "\n")
+        _, ext = os.path.splitext(file_path.lower())
+        preserve_md = ext in self._MD_EXTENSIONS
+        new_str_clean = self._desanitize(new_str).replace("\r\n", "\n")
+        if not preserve_md:
+            new_str_clean = self._strip_trailing_whitespace(new_str_clean)
+
+        # ---- Matching + quote tolerance ------------------------------------------
+        match_str = old_str_clean
+        if match_str not in content_lf:
+            variant = self._try_quote_variants(content_lf, old_str_clean)
+            if variant is None:
+                return ToolOutput(
+                    success=False,
+                    error=(
+                        f"Error: old_string not found in '{file_path}'. "
+                        "Read the file and retry with the exact current text."
+                    ),
+                )
+            match_str = variant
+            new_str_clean = self._preserve_quote_style(old_str_clean, match_str, new_str_clean)
+
+        # ---- Uniqueness validation -----------------------------------------------
+        count = content_lf.count(match_str)
+        if not replace_all and count > 1:
+            return ToolOutput(
+                success=False,
+                error=(
+                    f"Error: old_string matches {count} times in '{file_path}'. "
+                    "Provide more surrounding context to make it unique, "
+                    "or set replace_all=true only if replacing every occurrence is intended."
+                ),
+            )
+
+        # ---- Perform replacement -------------------------------------------------
+        if replace_all:
+            new_content_lf = content_lf.replace(match_str, new_str_clean)
+            replaced = count
+        else:
+            new_content_lf = content_lf.replace(match_str, new_str_clean, 1)
+            replaced = 1
+
+        # Restore original EOL style.
+        new_content = new_content_lf.replace("\n", eol) if eol == "\r\n" else new_content_lf
+
+        # ---- Write back ----------------------------------------------------------
+        write_res = await self.operation.fs().write_file(
+            file_path,
+            new_content,
+            prepend_newline=False,
+            options={"expected_content_sha256": hashlib.sha256(raw).hexdigest()},
+        )
+        if write_res.code != StatusCode.SUCCESS.code:
+            return ToolOutput(success=False, error=f"Write failed: {write_res.message}")
+
+        # Update registry so the next edit doesn't require a re-read.
+        try:
+            _st2 = os.stat(file_path)
+            _FILE_READ_REGISTRY[file_path] = _FileReadState(
+                mtime_ns=_st2.st_mtime_ns,
+                size_bytes=_st2.st_size,
+                is_partial=False,
+                content=new_content_lf,
+            )
+        except OSError:
+            _FILE_READ_REGISTRY.pop(file_path, None)
+
+        _session = get_current_session()
+        if _session is not None:
+            _history_path = self._build_history_path(_session)
+            await _append_op_history(_history_path, file_path, "edit", content, new_content)
+
+        return ToolOutput(
+            success=True,
+            data={"file_path": file_path, "replacements": replaced},
+        )
+
+    def render_for_llm(self, output: ToolOutput) -> str:
+        """Confirm the edit; creating a file via an empty old_string reads as a creation."""
+        if not output.success:
+            return super().render_for_llm(output)
+        data = output.data
+        if data.get("created"):
+            return f"Created {data['file_path']}."
+        return f"Edited {data['file_path']} ({data['replacements']} replacement(s))."
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs) -> AsyncIterator[Any]:
+        if False:
+            yield None
+
+
+class GlobTool(Tool):
+    DEFAULT_MAX_RESULTS: int = 100
+
+    def __init__(self, operation: SysOperation, language: str = "cn", agent_id: Optional[str] = None):
+        super().__init__(
+            build_tool_card(
+                "glob",
+                "GlobTool",
+                language,
+                agent_id=agent_id,
+                options=ToolCardBuildOptions(parallel_safe=True),
+            )
+        )
+        self.operation = operation
+
+    def _resolve_search_path(self, path: Optional[str]) -> str:
+        if path:
+            return _resolve_tool_file_path(self.operation, path)
+        return str(pathlib.Path(get_cwd()).expanduser().resolve())
+
+    def _relativize_paths(self, paths: List[str], base_path: str) -> List[str]:
+        # FsOperation.search_files resolves symlinks internally (via Path.resolve),
+        # so returned file paths may live under e.g. /private/var on macOS while
+        # the caller-supplied base_path is /var. Normalize the base to real path
+        # so os.path.relpath does not produce "../../../" against a symlinked root.
+        resolved_base = str(pathlib.Path(base_path).resolve())
+        relative_paths: List[str] = []
+        for item in paths:
+            try:
+                relative_paths.append(os.path.relpath(item, resolved_base))
+            except ValueError:
+                relative_paths.append(item)
+        return relative_paths
+
+    @staticmethod
+    def _expand_brace_pattern(pattern: str) -> List[str]:
+        """Expand shell-style brace patterns like *.{py,js} into ['*.py', '*.js']."""
+        if '{' not in pattern or '}' not in pattern:
+            return [pattern]
+
+        def expand_group(s: str) -> List[str]:
+            match = re.search(r'\{([^{}]*)\}', s)
+            if not match:
+                return [s]
+            prefix = s[:match.start()]
+            suffix = s[match.end():]
+            results = []
+            for opt in match.group(1).split(','):
+                results.extend(expand_group(prefix + opt.strip() + suffix))
+            return results
+
+        return expand_group(pattern)
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs) -> ToolOutput:
+        pattern = inputs.get("pattern")
+        if not pattern:
+            return ToolOutput(success=False, error="pattern is required")
+
+        try:
+            path = self._resolve_search_path(inputs.get("path"))
+        except ValueError as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+        started_at = time.perf_counter()
+
+        expanded_patterns = self._expand_brace_pattern(pattern)
+        all_matching_files: List[str] = []
+        seen: set = set()
+
+        for pat in expanded_patterns:
+            res = await self.operation.fs().search_files(path, pat)
+            if res.code != StatusCode.SUCCESS.code:
+                return ToolOutput(success=False, error=res.message)
+            if res.data:
+                for item in res.data.matching_files:
+                    if item.path not in seen:
+                        seen.add(item.path)
+                        all_matching_files.append(item.path)
+
+        truncated = len(all_matching_files) > self.DEFAULT_MAX_RESULTS
+        limited_files = all_matching_files[:self.DEFAULT_MAX_RESULTS]
+        filenames = self._relativize_paths(limited_files, path)
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+
+        return ToolOutput(
+            success=True,
+            data={
+                "durationMs": duration_ms,
+                "numFiles": len(filenames),
+                "filenames": filenames,
+                "truncated": truncated,
+                "matching_files": limited_files,
+                "count": len(filenames),
+            }
+        )
+
+    def render_for_llm(self, output: ToolOutput) -> str:
+        """List matching files one per line, noting when the list was cut."""
+        if not output.success:
+            return super().render_for_llm(output)
+        files = output.data["matching_files"]
+        if not files:
+            return "No files found."
+        text = "\n".join(files)
+        if output.data["truncated"]:
+            text += f"\n(Results truncated to the first {len(files)} files; use a more specific path or pattern.)"
+        return text
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs) -> AsyncIterator[Any]:
+        pass
+
+
+class ListDirTool(Tool):
+
+    def __init__(self, operation: SysOperation, language: str = "cn", agent_id: Optional[str] = None):
+        super().__init__(
+            build_tool_card(
+                "list_files",
+                "ListDirTool",
+                language,
+                agent_id=agent_id,
+                options=ToolCardBuildOptions(parallel_safe=True),
+            )
+        )
+        self.operation = operation
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs) -> ToolOutput:
+        path = inputs.get("path", ".")
+        show_hidden = inputs.get("show_hidden", False)
+
+        files_res = await self.operation.fs().list_files(path)
+        dirs_res = await self.operation.fs().list_directories(path)
+
+        if files_res.code != StatusCode.SUCCESS.code:
+            return ToolOutput(success=False, error=f"Failed to list files: {files_res.message}")
+        if dirs_res.code != StatusCode.SUCCESS.code:
+            return ToolOutput(success=False, error=f"Failed to list directories: {dirs_res.message}")
+
+        files = [item.name for item in files_res.data.list_items] if files_res.data else []
+        dirs = [item.name for item in dirs_res.data.list_items] if dirs_res.data else []
+
+        if not show_hidden:
+            files = [f for f in files if not f.startswith('.')]
+            dirs = [d for d in dirs if not d.startswith('.')]
+
+        files.sort()
+        dirs.sort()
+
+        return ToolOutput(
+            success=True,
+            data={
+                "files": files,
+                "dirs": dirs
+            }
+        )
+
+    def render_for_llm(self, output: ToolOutput) -> str:
+        """List directories (with a trailing slash) before files, one per line."""
+        if not output.success:
+            return super().render_for_llm(output)
+        entries = [f"{name}/" for name in output.data["dirs"]] + output.data["files"]
+        return "\n".join(entries) or "No entries found."
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs) -> AsyncIterator[Any]:
+        pass
+
+
+def render_grep_output(output: ToolOutput) -> str:
+    """Render a grep result as its matched lines in every output mode.
+
+    Shared by every tool that returns the grep result shape. A failed rg run
+    (exit code 2, e.g. an unreadable file) may still carry matches, so they
+    follow the error instead of being dropped.
+
+    Args:
+        output: A grep tool result.
+
+    Returns:
+        The model-facing text.
+    """
+    data = output.data
+    if data is None:
+        return render_tool_output(output)
+    matches = data["stdout"]
+    if data["appliedLimit"] is not None:
+        matches += f"\n(Results truncated to {data['appliedLimit']} entries; pass offset to see more.)"
+    if output.success:
+        return matches or "No matches found."
+    error = output.error or f"Search failed with exit code {data['exit_code']}."
+    return f"{error}\n{matches}" if matches else error
+
+
+class GrepTool(Tool):
+    DEFAULT_HEAD_LIMIT: int = 250
+    MAX_COLUMNS: int = 500
+    VCS_DIRECTORIES_TO_EXCLUDE: Tuple[str, ...] = (".git", ".svn", ".hg", ".bzr", ".jj", ".sl")
+
+    def __init__(self, operation: SysOperation, language: str = "cn", agent_id: Optional[str] = None):
+        super().__init__(
+            build_tool_card(
+                "grep",
+                "GrepTool",
+                language,
+                agent_id=agent_id,
+                options=ToolCardBuildOptions(parallel_safe=True),
+            )
+        )
+        self.operation = operation
+
+    @staticmethod
+    def _shell_quote(value: Any) -> str:
+        text = str(value)
+        if os.name == "nt":
+            return "'" + text.replace("'", "''") + "'"
+        return shlex.quote(text)
+
+    @staticmethod
+    def _as_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return default
+
+    @staticmethod
+    def _as_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+        if value is None or value == "":
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _apply_head_limit(
+            cls, items: List[str], limit: Optional[int], offset: int = 0
+    ) -> Tuple[List[str], Optional[int]]:
+        offset = max(0, offset)
+        if limit == 0:
+            return items[offset:], None
+
+        effective_limit = limit if limit is not None else cls.DEFAULT_HEAD_LIMIT
+        sliced = items[offset: offset + effective_limit]
+        was_truncated = len(items) - offset > effective_limit
+        return sliced, effective_limit if was_truncated else None
+
+    # Models often pass language extensions (``rs``, ``py``) as ``type``.
+    # ripgrep expects type *names* (``rust``, ``py``). Map common aliases.
+    # ``tsx``/``jsx`` are not built-in rg types; ``ts``/``js`` already cover
+    # ``*.tsx`` / ``*.jsx``.
+    _RG_TYPE_ALIASES: Dict[str, str] = {
+        "rs": "rust",
+        "rust": "rust",
+        "py": "py",
+        "python": "py",
+        "js": "js",
+        "javascript": "js",
+        "jsx": "js",
+        "ts": "ts",
+        "typescript": "ts",
+        "tsx": "ts",
+        "go": "go",
+        "golang": "go",
+        "c": "c",
+        "h": "c",
+        "cpp": "cpp",
+        "cc": "cpp",
+        "cxx": "cpp",
+        "java": "java",
+        "kt": "kotlin",
+        "kotlin": "kotlin",
+        "rb": "ruby",
+        "ruby": "ruby",
+        "php": "php",
+        "swift": "swift",
+        "scala": "scala",
+        "sh": "sh",
+        "bash": "sh",
+        "zsh": "sh",
+        "md": "markdown",
+        "markdown": "markdown",
+        "toml": "toml",
+        "yaml": "yaml",
+        "yml": "yaml",
+        "json": "json",
+        "html": "html",
+        "css": "css",
+        "sql": "sql",
+    }
+
+    @classmethod
+    def _normalize_rg_file_type(cls, file_type: Optional[str]) -> Optional[str]:
+        """Map extension-style type filters to ripgrep ``--type`` names.
+
+        Known aliases are matched case-insensitively (and with an optional
+        leading ``.``). Unknown values are returned unchanged so custom
+        case-sensitive ripgrep types keep working.
+        """
+        if file_type is None:
+            return None
+        raw = str(file_type).strip()
+        if not raw:
+            return None
+        lookup = raw.lower()
+        if lookup.startswith("."):
+            lookup = lookup[1:]
+        mapped = cls._RG_TYPE_ALIASES.get(lookup)
+        if mapped is not None:
+            return mapped
+        return raw
+
+    @staticmethod
+    def _split_glob_patterns(glob_value: Optional[str]) -> List[str]:
+        if not glob_value:
+            return []
+
+        glob_patterns: List[str] = []
+        for raw_pattern in str(glob_value).split():
+            if "{" in raw_pattern and "}" in raw_pattern:
+                glob_patterns.append(raw_pattern)
+            else:
+                glob_patterns.extend(part for part in raw_pattern.split(",") if part)
+        return glob_patterns
+
+    def _resolve_search_path(self, path: Optional[str]) -> str:
+        if path:
+            return _resolve_tool_file_path(self.operation, path)
+        return str(pathlib.Path(get_cwd()).expanduser().resolve())
+
+    def _build_rg_command(
+            self,
+            *,
+            pattern: str,
+            path: str,
+            glob: Optional[str],
+            output_mode: str,
+            context_before: Optional[int],
+            context_after: Optional[int],
+            context_c: Optional[int],
+            context: Optional[int],
+            show_line_numbers: bool,
+            case_insensitive: bool,
+            file_type: Optional[str],
+            multiline: bool,
+            rg_path: str = "rg",
+    ) -> str:
+        parts: List[str] = [
+            self._shell_quote(rg_path),
+            "--hidden",
+            "--color=never",
+            "--max-columns",
+            str(self.MAX_COLUMNS),
+        ]
+
+        if multiline:
+            parts.extend(["-U", "--multiline-dotall"])
+        if case_insensitive:
+            parts.append("-i")
+
+        if output_mode == "files_with_matches":
+            parts.append("-l")
+        elif output_mode == "count":
+            parts.append("-c")
+        elif show_line_numbers:
+            parts.append("-n")
+
+        if output_mode == "content":
+            if context is not None:
+                parts.extend(["-C", str(context)])
+            elif context_c is not None:
+                parts.extend(["-C", str(context_c)])
+            else:
+                if context_before is not None:
+                    parts.extend(["-B", str(context_before)])
+                if context_after is not None:
+                    parts.extend(["-A", str(context_after)])
+
+        for directory in self.VCS_DIRECTORIES_TO_EXCLUDE:
+            parts.extend(["--glob", self._shell_quote(f"!{directory}")])
+
+        if file_type:
+            parts.extend(["--type", self._shell_quote(file_type)])
+
+        for glob_pattern in self._split_glob_patterns(glob):
+            parts.extend(["--glob", self._shell_quote(glob_pattern)])
+
+        if pattern.startswith("-"):
+            parts.extend(["-e", self._shell_quote(pattern)])
+        else:
+            parts.append(self._shell_quote(pattern))
+
+        parts.append(self._shell_quote(path))
+        return " ".join(parts)
+
+    def _build_select_string_command(
+            self,
+            *,
+            pattern: str,
+            path: str,
+            glob: Optional[str],
+            output_mode: str,
+            context_before: Optional[int],
+            context_after: Optional[int],
+            context_c: Optional[int],
+            context: Optional[int],
+            case_insensitive: bool,
+    ) -> str:
+        """Build a PowerShell Select-String command as fallback when rg is unavailable on Windows."""
+        sq = self._shell_quote
+
+        # Expand {ts,tsx} brace syntax — PS -like doesn't support it
+        glob_patterns = self._split_glob_patterns(glob)
+        expanded_globs: List[str] = []
+        for p in glob_patterns:
+            m = re.match(r'^(.*)\{([^}]+)\}(.*)$', p)
+            if m:
+                expanded_globs.extend(f"{m.group(1)}{alt}{m.group(3)}" for alt in m.group(2).split(","))
+            else:
+                expanded_globs.append(p)
+
+        # Context lines: -C / context takes priority over -B / -A
+        effective_c = context if context is not None else context_c
+        ctx_b = effective_c if effective_c is not None else (context_before or 0)
+        ctx_a = effective_c if effective_c is not None else (context_after or 0)
+
+        # VCS exclusion regex for -notmatch: (\\|/)(\.git|\.svn|...)(\\|/|$)
+        vcs_alts = "|".join(d.replace(".", r"\.") for d in self.VCS_DIRECTORIES_TO_EXCLUDE)
+        vcs_pat = sq(r"(\\|/)(" + vcs_alts + r")(\\|/|$)")
+
+        # --- Pipeline stages ---
+        pipeline: List[str] = []
+
+        # Stage 1: file enumeration + VCS pruning
+        is_file = os.path.isfile(path)
+        if is_file:
+            pipeline.append(f"Get-Item -LiteralPath {sq(path)}")
+        else:
+            pipeline.append(f"Get-ChildItem -LiteralPath {sq(path)} -Recurse -File")
+            pipeline.append(f"Where-Object {{ $_.FullName -notmatch {vcs_pat} }}")
+
+        # Stage 2: glob filter (skip for single-file input)
+        if expanded_globs and not is_file:
+            conds = " -or ".join(f"$_.Name -like {sq(p)}" for p in expanded_globs)
+            pipeline.append(f"Where-Object {{ {conds} }}")
+
+        # Stage 3: Select-String
+        # Default is case-insensitive; -CaseSensitive enables exact matching
+        cs_flag = " -CaseSensitive" if not case_insensitive else ""
+        ctx_flag = f" -Context {ctx_b},{ctx_a}" if output_mode == "content" and (ctx_b or ctx_a) else ""
+        pipeline.append(f"Select-String -Pattern {sq(pattern)}{cs_flag}{ctx_flag}")
+
+        # Stage 4: output formatting to match rg/grep line format
+        if output_mode == "files_with_matches":
+            pipeline.append("Select-Object -ExpandProperty Path -Unique")
+        elif output_mode == "count":
+            pipeline.append("Group-Object Path | ForEach-Object { \"$($_.Name):$($_.Count)\" }")
+        elif ctx_b or ctx_a:
+            # Manually expand PreContext / PostContext arrays into filepath:linenum:content lines
+            pipeline.append(
+                "ForEach-Object {"
+                " $m=$_; $p=$m.Context.PreContext.Length;"
+                " for($i=0;$i-lt$p;$i++){ \"$($m.Path):$([int]$m.LineNumber-$p+$i):$($m.Context.PreContext[$i])\" };"
+                " \"$($m.Path):$($m.LineNumber):$($m.Line)\";"
+                " for($i=0;$i-lt$m.Context.PostContext.Length;$i++)"
+                "{ \"$($m.Path):$([int]$m.LineNumber+1+$i):$($m.Context.PostContext[$i])\" }"
+                " }"
+            )
+        else:
+            pipeline.append("ForEach-Object { \"$($_.Path):$($_.LineNumber):$($_.Line)\" }")
+
+        return "$ErrorActionPreference='SilentlyContinue'; " + " | ".join(pipeline)
+
+    def _build_grep_command(
+            self,
+            *,
+            pattern: str,
+            path: str,
+            glob: Optional[str],
+            output_mode: str,
+            context_before: Optional[int],
+            context_after: Optional[int],
+            context_c: Optional[int],
+            context: Optional[int],
+            show_line_numbers: bool,
+            case_insensitive: bool,
+            multiline: bool,
+    ) -> Optional[str]:
+        if multiline:
+            return None
+
+        # Use POSIX ERE (-E) so patterns with (, |, etc. match rg semantics
+        # better than basic regex. Always pass the pattern via -e and end
+        # options with -- so values like "--config" are never treated as flags.
+        parts: List[str] = ["grep", "-R", "-E", "--binary-files=without-match"]
+
+        for directory in self.VCS_DIRECTORIES_TO_EXCLUDE:
+            parts.append(f"--exclude-dir={self._shell_quote(directory)}")
+
+        if case_insensitive:
+            parts.append("-i")
+
+        if output_mode == "files_with_matches":
+            parts.append("-l")
+        elif output_mode == "count":
+            parts.append("-c")
+        elif show_line_numbers:
+            parts.append("-n")
+
+        if output_mode == "content":
+            if context is not None:
+                parts.extend(["-C", str(context)])
+            elif context_c is not None:
+                parts.extend(["-C", str(context_c)])
+            else:
+                if context_before is not None:
+                    parts.extend(["-B", str(context_before)])
+                if context_after is not None:
+                    parts.extend(["-A", str(context_after)])
+
+        for glob_pattern in self._split_glob_patterns(glob):
+            parts.append(f"--include={self._shell_quote(glob_pattern)}")
+
+        parts.extend([
+            "-e",
+            self._shell_quote(pattern),
+            "--",
+            self._shell_quote(path),
+        ])
+        return " ".join(parts)
+
+    @staticmethod
+    def _extract_file_path_from_line(line: str, mode: str) -> Optional[str]:
+        if not line:
+            return None
+        if mode == "files_with_matches":
+            return line
+        if mode == "count":
+            if ":" not in line:
+                return None
+            return line.rsplit(":", 1)[0]
+
+        match = re.match(r"^(.*?):(\d+|[-]+):(.*)$", line)
+        if match:
+            return match.group(1)
+        return line.split(":", 1)[0] if ":" in line else None
+
+    @staticmethod
+    def _relativize_line(line: str, base_path: str, mode: str) -> str:
+        file_path = GrepTool._extract_file_path_from_line(line, mode)
+        if not file_path:
+            return line
+
+        try:
+            relative_path = os.path.relpath(file_path, base_path)
+        except ValueError:
+            return line
+
+        if mode == "files_with_matches":
+            return relative_path
+
+        prefix = file_path + ":"
+        if line.startswith(prefix):
+            return relative_path + ":" + line[len(prefix):]
+        return line
+
+    def _build_structured_output(
+            self,
+            *,
+            stdout: str,
+            stderr: str,
+            exit_code: int,
+            output_mode: str,
+            head_limit: Optional[int],
+            offset: int,
+            base_path: str,
+    ) -> Dict[str, Any]:
+        raw_lines = [line for line in stdout.splitlines() if line.strip()]
+        limited_lines, applied_limit = self._apply_head_limit(raw_lines, head_limit, offset)
+        final_lines = [self._relativize_line(line, base_path, output_mode) for line in limited_lines]
+        content = "\n".join(final_lines)
+
+        data: Dict[str, Any] = {
+            "stdout": content,
+            "stderr": stderr,
+            "exit_code": exit_code,
+            "mode": output_mode,
+            "appliedOffset": offset if offset > 0 else None,
+            "appliedLimit": applied_limit,
+        }
+
+        if output_mode == "content":
+            data.update({
+                "content": content,
+                "filenames": [],
+                "numFiles": 0,
+                "numLines": len(final_lines),
+                "count": len(final_lines),
+            })
+            return data
+
+        if output_mode == "count":
+            total_matches = 0
+            file_count = 0
+            for line in final_lines:
+                if ":" not in line:
+                    continue
+                count_str = line.rsplit(":", 1)[1]
+                try:
+                    total_matches += int(count_str)
+                    file_count += 1
+                except ValueError:
+                    continue
+            data.update({
+                "content": content,
+                "filenames": [],
+                "numFiles": file_count,
+                "numMatches": total_matches,
+                "count": total_matches,
+            })
+            return data
+
+        data.update({
+            "filenames": final_lines,
+            "numFiles": len(final_lines),
+            "count": len(final_lines),
+        })
+        return data
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs) -> ToolOutput:
+        pattern = inputs.get("pattern")
+        if not pattern:
+            return ToolOutput(success=False, error="pattern is required")
+
+        try:
+            path = self._resolve_search_path(inputs.get("path"))
+        except ValueError as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+        output_mode = str(inputs.get("output_mode") or "content")
+        if output_mode not in {"content", "files_with_matches", "count"}:
+            return ToolOutput(success=False, error="output_mode must be one of: content, files_with_matches, count")
+
+        ignore_case = self._as_bool(inputs.get("-i", inputs.get("ignore_case", False)))
+        show_line_numbers = self._as_bool(inputs.get("-n", True), default=True)
+        context_before = self._as_int(inputs.get("-B"))
+        context_after = self._as_int(inputs.get("-A"))
+        context_c = self._as_int(inputs.get("-C"))
+        context = self._as_int(inputs.get("context"))
+        head_limit = self._as_int(inputs.get("head_limit"))
+        offset = self._as_int(inputs.get("offset"), 0) or 0
+        multiline = self._as_bool(inputs.get("multiline", False))
+        glob = inputs.get("glob")
+        file_type = self._normalize_rg_file_type(inputs.get("type"))
+
+        has_context_controls = any(
+            value is not None for value in [context_before, context_after, context_c, context]
+        )
+        if output_mode != "content" and has_context_controls:
+            context_before = None
+            context_after = None
+            context_c = None
+            context = None
+
+        rg_bin = resolve_rg_binary()
+        if rg_bin:
+            cmd = self._build_rg_command(
+                pattern=str(pattern),
+                path=path,
+                glob=glob,
+                output_mode=output_mode,
+                context_before=context_before,
+                context_after=context_after,
+                context_c=context_c,
+                context=context,
+                show_line_numbers=show_line_numbers,
+                case_insensitive=ignore_case,
+                file_type=file_type,
+                multiline=multiline,
+                rg_path=rg_bin,
+            )
+        elif os.name == "nt":
+            if file_type:
+                return ToolOutput(success=False, error="type filter requires ripgrep (rg) to be installed")
+            if multiline:
+                return ToolOutput(success=False, error="multiline search requires ripgrep (rg) to be installed")
+            cmd = self._build_select_string_command(
+                pattern=str(pattern),
+                path=path,
+                glob=glob,
+                output_mode=output_mode,
+                context_before=context_before,
+                context_after=context_after,
+                context_c=context_c,
+                context=context,
+                case_insensitive=ignore_case,
+            )
+        else:
+            if file_type:
+                return ToolOutput(success=False, error="type filter requires ripgrep (rg) to be installed")
+            cmd = self._build_grep_command(
+                pattern=str(pattern),
+                path=path,
+                glob=glob,
+                output_mode=output_mode,
+                context_before=context_before,
+                context_after=context_after,
+                context_c=context_c,
+                context=context,
+                show_line_numbers=show_line_numbers,
+                case_insensitive=ignore_case,
+                multiline=multiline,
+            )
+            if cmd is None:
+                return ToolOutput(success=False, error="multiline search requires ripgrep (rg) to be installed")
+
+        shell_type = "powershell" if os.name == "nt" else "auto"
+        res = await self.operation.shell().execute_cmd(cmd, timeout=30, shell_type=shell_type)
+
+        if res.code != StatusCode.SUCCESS.code:
+            return ToolOutput(success=False, error=res.message)
+
+        stdout = res.data.stdout if res.data else ""
+        stderr = res.data.stderr if res.data else ""
+        exit_code = res.data.exit_code if res.data else -1
+        success = (exit_code in [0, 1])
+
+        return ToolOutput(
+            success=success,
+            data=self._build_structured_output(
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=exit_code,
+                output_mode=output_mode,
+                head_limit=head_limit,
+                offset=offset,
+                base_path=path if os.path.isdir(path) else os.path.dirname(path) or ".",
+            ),
+            error=stderr if not success else None
+        )
+
+    def render_for_llm(self, output: ToolOutput) -> str:
+        """Render through the shared grep result formatter."""
+        return render_grep_output(output)
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs) -> AsyncIterator[Any]:
+        pass

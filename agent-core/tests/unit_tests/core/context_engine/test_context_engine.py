@@ -1,0 +1,1268 @@
+# -*- coding: UTF-8 -*-
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+
+import asyncio
+import time
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+    patch,
+)
+
+import pytest
+from pydantic import BaseModel
+
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import (
+    BaseError,
+    build_error,
+)
+from openjiuwen.core.context_engine import (
+    ContextEngine,
+    ContextEngineConfig,
+    NativeTokenizerCounter,
+    StringLengthCounter,
+    TiktokenCounter,
+    TokenizerSpec,
+)
+from openjiuwen.core.context_engine.context.context import SessionModelContext
+from openjiuwen.core.context_engine.processor.base import ContextEvent, ContextProcessor
+from openjiuwen.core.context_engine.processor.forked.compressor.dialogue_compressor import DialogueCompressorConfig
+from openjiuwen.core.context_engine.processor.forked.compressor.support.compression_executor import CompressionResult
+from openjiuwen.core.context_engine.processor.forked.offloader.message_offloader import MessageSummaryOffloaderConfig
+from openjiuwen.core.context_engine.schema.messages import OffloadUserMessage
+from openjiuwen.core.foundation.llm import (
+    AssistantMessage,
+    SystemMessage,
+    ToolMessage,
+    UserMessage, BaseMessage,
+)
+from openjiuwen.core.session.agent import create_agent_session
+from openjiuwen.core.session.checkpointer import CheckpointerFactory
+from openjiuwen.core.session.workflow import create_workflow_session
+from openjiuwen.core.single_agent import AgentCard
+
+
+_blocking_started: asyncio.Event | None = None
+_blocking_release: asyncio.Event | None = None
+
+
+class BlockingCompressorConfig(BaseModel):
+    pass
+
+
+@ContextEngine.register_processor()
+class BlockingCompressor(ContextProcessor):
+    async def trigger_add_messages(self, context, messages_to_add, **kwargs) -> bool:
+        return True
+
+    async def on_add_messages(self, context, messages_to_add, **kwargs):
+        if _blocking_started is not None:
+            _blocking_started.set()
+        if _blocking_release is not None:
+            await _blocking_release.wait()
+        return None, messages_to_add
+
+    def load_state(self, state):
+        return
+
+    def save_state(self):
+        return {}
+
+
+class ActiveCompactingCompressorConfig(BaseModel):
+    replacement: str = "[COMPRESSED]"
+
+
+@ContextEngine.register_processor()
+class ActiveCompactingCompressor(ContextProcessor):
+    async def on_add_messages(self, context, messages_to_add, **kwargs):
+        messages = context.get_messages()
+        if not messages:
+            return None, messages_to_add
+        updated = list(messages)
+        updated[0] = UserMessage(content=self.config.replacement)
+        context.set_messages(updated)
+        return ContextEvent(event_type=self.processor_type(), messages_to_modify=[0]), messages_to_add
+
+    def load_state(self, state):
+        return
+
+    def save_state(self):
+        return {}
+
+
+class GetOnlyActiveCompressorConfig(BaseModel):
+    replacement: str = "[GET-COMPRESSED]"
+
+
+@ContextEngine.register_processor()
+class GetOnlyActiveCompressor(ContextProcessor):
+    async def on_get_context_window(self, context, context_window, **kwargs):
+        if not context_window.context_messages:
+            return None, context_window
+        context_window.context_messages = [UserMessage(content=self.config.replacement)]
+        return ContextEvent(
+            event_type=self.processor_type(),
+            messages_to_modify=[0],
+            compact_summary=self.config.replacement,
+        ), context_window
+
+    def load_state(self, state):
+        return
+
+    def save_state(self):
+        return {}
+
+
+class TestContextEngine:
+    @pytest.fixture
+    def session(self):
+        return create_agent_session("test_session", card=AgentCard(id="test_agent"))
+
+    @pytest.fixture
+    def same_session(self):
+        return create_agent_session("test_session", card=AgentCard(id="test_agent"))
+
+    @pytest.fixture
+    def another_session(self):
+        return create_agent_session("another_session", card=AgentCard(id="test_agent"))
+
+    @pytest.fixture
+    def engine(self):
+        return ContextEngine(ContextEngineConfig(default_window_message_num=5))
+
+    @pytest.mark.asyncio
+    async def test_create_context_with_history_and_session(self, engine, session):
+        history = [UserMessage(content="hello"), SystemMessage(content="sys")]
+        context = await engine.create_context(context_id="ctx", session=session, history_messages=history)
+
+        assert isinstance(context, SessionModelContext)
+        assert context.session_id() == session.get_session_id()
+        assert context.context_id() == "ctx"
+        assert context.get_messages() == history
+
+    @pytest.mark.asyncio
+    async def test_create_context_reuses_existing(self, engine, session):
+        ctx1 = await engine.create_context(context_id="ctx", session=session)
+        ctx2 = await engine.create_context(context_id="ctx", session=session)
+
+        assert ctx1 is ctx2
+
+    @pytest.mark.asyncio
+    async def test_create_context_uses_string_counter_when_tiktoken_is_disabled(self, session):
+        engine = ContextEngine(ContextEngineConfig(enable_tiktoken_counter=False))
+
+        context = await engine.create_context(context_id="ctx", session=session)
+
+        assert isinstance(context.token_counter(), StringLengthCounter)
+        assert context.token_counter().measurement_fallback_reason == "tiktoken_disabled"
+
+    @pytest.mark.asyncio
+    async def test_create_context_creates_default_tiktoken_counter_when_enabled(self, session):
+        engine = ContextEngine(ContextEngineConfig(enable_tiktoken_counter=True))
+
+        with patch("openjiuwen.core.context_engine.token.tokenizer_selector.TiktokenCounter") as counter_cls:
+            counter = MagicMock()
+            counter_cls.return_value = counter
+            context = await engine.create_context(context_id="ctx", session=session)
+
+        counter_cls.assert_called_once_with()
+        assert context.token_counter() is counter
+
+    def test_context_overflow_matcher_reads_wrapped_provider_error(self):
+        provider_error = RuntimeError("invalid_request_error")
+        provider_error.body = {
+            "error": {
+                "type": "invalid_request_error",
+                "message": (
+                    "This model's maximum context length is 1048576 tokens. "
+                    "Please reduce the length of the messages."
+                ),
+            }
+        }
+        wrapped_error = RuntimeError("model call failed")
+        wrapped_error.__cause__ = provider_error
+
+        assert ContextEngine.is_context_overflow_error(wrapped_error) is True
+
+    def test_context_overflow_matcher_reads_dashscope_input_length_error(self):
+        """Bailian/DashScope reports overflow as an input length range error (#1810)."""
+        httpx = pytest.importorskip("httpx")
+        openai = pytest.importorskip("openai")
+        body = {
+            "error": {
+                "code": "invalid_parameter_error",
+                "param": None,
+                "message": "Range of input length should be [1, 1000000]",
+                "type": "invalid_request_error",
+            }
+        }
+        request = httpx.Request("POST", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
+        provider_error = openai.BadRequestError(
+            f"Error code: 400 - {body}",
+            response=httpx.Response(400, request=request, json=body),
+            body=body,
+        )
+        wrapped_error = RuntimeError("[181001] model call failed")
+        wrapped_error.__cause__ = provider_error
+
+        assert ContextEngine.is_context_overflow_error(provider_error) is True
+        assert ContextEngine.is_context_overflow_error(wrapped_error) is True
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "insufficient_quota: billing limit reached",
+            "maximum output tokens exceeded",
+            "output token limit reached",
+            "network timeout",
+        ],
+    )
+    def test_context_overflow_matcher_ignores_unrelated_model_errors(self, message):
+        assert ContextEngine.is_context_overflow_error(RuntimeError(message)) is False
+
+    def test_context_overflow_matcher_ignores_unread_streaming_response(self):
+        """An unread stream body must not abort overflow detection."""
+
+        class _UnreadResponse:
+            @property
+            def text(self):
+                raise RuntimeError(
+                    "Attempted to access streaming response content, "
+                    "without having called `read()`."
+                )
+
+            @property
+            def content(self):
+                raise RuntimeError(
+                    "Attempted to access streaming response content, "
+                    "without having called `read()`."
+                )
+
+        provider_error = RuntimeError("auth failed")
+        provider_error.response = _UnreadResponse()
+        wrapped = RuntimeError("model call failed")
+        wrapped.__cause__ = provider_error
+
+        assert ContextEngine.is_context_overflow_error(wrapped) is False
+
+        overflow = RuntimeError("maximum context length is 1048576 tokens")
+        overflow.response = _UnreadResponse()
+        assert ContextEngine.is_context_overflow_error(overflow) is True
+
+    @pytest.mark.asyncio
+    async def test_recover_from_model_exception_compresses_context_once(self, engine, session):
+        context = await engine.create_context(
+            context_id="ctx",
+            session=session,
+            processors=[(
+                "ActiveCompactingCompressor",
+                ActiveCompactingCompressorConfig(replacement="[RECOVERED]"),
+            )],
+            history_messages=[UserMessage(content="large historical context")],
+        )
+        session.commit = AsyncMock()
+        provider_error = RuntimeError("invalid_request_error")
+        provider_error.body = {
+            "error": {
+                "message": "This model's maximum context length is 1048576 tokens.",
+            }
+        }
+
+        recovered = await engine.recover_from_model_exception(
+            context_id="ctx",
+            session=session,
+            context=context,
+            exception=provider_error,
+        )
+
+        assert recovered is True
+        assert context.get_messages()[0].content == "[RECOVERED]"
+        session.commit.assert_awaited_once_with()
+        assert any(
+            state["status"] == "completed"
+            for state in context._processor_state_recorder.history()
+        )
+
+    @pytest.mark.asyncio
+    async def test_recover_from_model_exception_skips_partial_stream(self, engine, session):
+        context = await engine.create_context(
+            context_id="ctx",
+            session=session,
+            processors=[(
+                "ActiveCompactingCompressor",
+                ActiveCompactingCompressorConfig(replacement="[STREAM_RECOVERED]"),
+            )],
+            history_messages=[UserMessage(content="large historical context")],
+        )
+        session.commit = AsyncMock()
+        provider_error = RuntimeError(
+            "This model's maximum context length is 1048576 tokens."
+        )
+
+        recovered = await engine.recover_from_model_exception(
+            context_id="ctx",
+            session=session,
+            context=context,
+            exception=provider_error,
+            streaming=True,
+            stream_chunks_emitted=1,
+        )
+
+        assert recovered is False
+        assert context.get_messages()[0].content == "large historical context"
+        session.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_compress_context_preserves_explicit_empty_trigger(self, engine, session):
+        context = await engine.create_context(
+            context_id="ctx",
+            session=session,
+        )
+        context._select_processors = MagicMock(return_value=[MagicMock()])
+        context._run_active_compression_processors = AsyncMock(return_value=False)
+
+        await context.compress_context(compression_trigger="")
+
+        context._run_active_compression_processors.assert_awaited_once()
+        assert context._run_active_compression_processors.await_args.kwargs["compression_trigger"] == ""
+
+    @pytest.mark.asyncio
+    async def test_create_context_isolated_per_session(self, engine, session, another_session):
+        ctx1 = await engine.create_context(context_id="ctx", session=session)
+        ctx2 = await engine.create_context(context_id="ctx", session=another_session)
+
+        assert ctx1 is not ctx2
+        assert ctx1.session_id() != ctx2.session_id()
+
+    @pytest.mark.asyncio
+    async def test_clear_context_all(self, engine, session):
+        await engine.create_context(context_id="ctx1", session=session)
+        await engine.create_context(context_id="ctx2", session=session)
+
+        await engine.clear_context()
+
+        assert engine.get_context(context_id="ctx1", session_id=session.get_session_id()) is None
+        assert engine.get_context(context_id="ctx2", session_id=session.get_session_id()) is None
+
+    @pytest.mark.asyncio
+    async def test_clear_context_by_session(self, engine, session, another_session):
+        await engine.create_context(context_id="ctx1", session=session)
+        await engine.create_context(context_id="ctx2", session=another_session)
+
+        await engine.clear_context(session_id=session.get_session_id())
+
+        assert engine.get_context(context_id="ctx1", session_id=session.get_session_id()) is None
+        assert engine.get_context(context_id="ctx2", session_id=another_session.get_session_id()) is not None
+
+    @pytest.mark.asyncio
+    async def test_clear_context_by_session_and_context(self, engine, session, another_session):
+        await engine.create_context(context_id="ctx1", session=session)
+        await engine.create_context(context_id="ctx2", session=another_session)
+
+        await engine.clear_context(session_id=session.get_session_id(), context_id="ctx1")
+        await engine.clear_context(session_id=another_session.get_session_id(), context_id="ctx2")
+
+        assert engine.get_context(context_id="ctx1", session_id=session.get_session_id()) is None
+        assert engine.get_context(context_id="ctx2", session_id=another_session.get_session_id()) is None
+
+    @pytest.mark.asyncio
+    async def test_context_save_and_load(self, session, same_session):
+        check_pointer = CheckpointerFactory.get_checkpointer()
+        await check_pointer.pre_agent_execute(
+            session=getattr(session, "_inner"), inputs=None
+        )
+        ce_1 = ContextEngine(ContextEngineConfig(default_window_message_num=5))
+        context_1 = await ce_1.create_context(
+            "test_context",
+            session,
+        )
+        messages = [
+            SystemMessage(content="1"),
+            UserMessage(content="2"),
+            AssistantMessage(content="3"),
+            ToolMessage(content="4", tool_call_id=""),
+            OffloadUserMessage(content="5", offload_type="in_memory", offload_handle="abc"),
+        ]
+
+        await context_1.add_messages(messages)
+        await ce_1.save_contexts(session, ["test_context"])
+        await session.post_run()
+
+        await check_pointer.pre_agent_execute(
+            session=getattr(same_session, "_inner"), inputs=None
+        )
+        ce_2 = ContextEngine(ContextEngineConfig(default_window_message_num=5))
+        context_2 = await ce_2.create_context(
+            "test_context",
+            same_session,
+        )
+
+        assert context_1.get_messages() == context_2.get_messages()
+
+    @pytest.mark.asyncio
+    async def test_context_save_and_load_with_invalid_context_id(self, session, same_session):
+        check_pointer = CheckpointerFactory.get_checkpointer()
+        await check_pointer.pre_agent_execute(
+            session=getattr(session, "_inner"), inputs=None
+        )
+        ce_1 = ContextEngine(ContextEngineConfig(default_window_message_num=5))
+        context_1 = await ce_1.create_context(
+            "test_context.0.0.1",
+            session,
+        )
+        messages = [
+            SystemMessage(content="1"),
+            UserMessage(content="2"),
+            AssistantMessage(content="3"),
+            ToolMessage(content="4", tool_call_id=""),
+            OffloadUserMessage(content="5", offload_type="in_memory", offload_handle="abc"),
+        ]
+
+        await context_1.add_messages(messages)
+        await ce_1.save_contexts(session)
+        await session.post_run()
+
+        await check_pointer.pre_agent_execute(
+            session=getattr(same_session, "_inner"), inputs=None
+        )
+        ce_2 = ContextEngine(ContextEngineConfig(default_window_message_num=5))
+        context_2 = await ce_2.create_context(
+            "test_context.0.0.1",
+            same_session,
+        )
+
+        assert context_1.get_messages() == context_2.get_messages()
+
+    # ---------- create_context supplements ----------
+    @pytest.mark.asyncio
+    async def test_create_context_with_session_none_uses_default_session_id(self, engine):
+        context = await engine.create_context(context_id="ctx", session=None)
+        assert context.session_id() == "default_session_id"
+        assert context.context_id() == "ctx"
+        assert engine.get_context(context_id="ctx", session_id="default_session_id") is context
+
+    @pytest.mark.asyncio
+    async def test_create_context_empty_history_messages(self, engine, session):
+        context = await engine.create_context(context_id="ctx", session=session, history_messages=[])
+        assert context.get_messages() == []
+
+    @pytest.mark.asyncio
+    async def test_create_context_history_messages_none_creates_empty(self, engine, session):
+        context = await engine.create_context(context_id="ctx", session=session)
+        assert context.get_messages() == []
+
+    @pytest.mark.asyncio
+    async def test_context_id_dots_replaced_by_underscores(self, engine, session):
+        context = await engine.create_context(context_id="a.b.c", session=session)
+        assert context.context_id() == "a_b_c"
+        retrieved = engine.get_context(context_id="a.b.c", session_id=session.get_session_id())
+        assert retrieved is context
+
+    @pytest.mark.asyncio
+    async def test_create_context_default_context_id(self, engine, session):
+        context = await engine.create_context(session=session)
+        assert context.context_id() == "default_context_id"
+
+    @pytest.mark.asyncio
+    async def test_create_context_with_custom_token_counter(self, engine, session):
+        token_counter = MagicMock()
+        context = await engine.create_context(
+            context_id="ctx", session=session, token_counter=token_counter
+        )
+        assert context.token_counter() is token_counter
+
+    @pytest.mark.asyncio
+    async def test_rebind_context_model_preserves_history_and_refreshes_binding(
+        self, session, another_session
+    ):
+        old_counter = MagicMock()
+        new_counter = MagicMock()
+        engine = ContextEngine(
+            ContextEngineConfig(
+                model_name="old-model",
+                model_provider="old-provider",
+                context_window_tokens=100,
+            )
+        )
+        old_context = await engine.create_context(
+            context_id="ctx", session=session, token_counter=old_counter
+        )
+        untouched_context = await engine.create_context(
+            context_id="ctx", session=another_session, token_counter=old_counter
+        )
+        await old_context.add_messages(UserMessage(content="history"))
+        old_context._usage_measurement_cache["cached"] = object()
+        old_context._usage_report_cache["cached"] = object()
+
+        new_config = ContextEngineConfig(
+            model_name="new-model",
+            model_provider="new-provider",
+            context_window_tokens=200,
+        )
+        with patch.object(engine, "_select_token_counter", return_value=new_counter):
+            rebound = engine.rebind_context_model(
+                new_config,
+                session_id=session.get_session_id(),
+            )
+
+        assert rebound == 1
+        assert engine.get_context("ctx", session.get_session_id()) is old_context
+        assert old_context.get_messages()[-1].content == "history"
+        assert old_context.token_counter() is new_counter
+        assert old_context.context_window_tokens() == 200
+        assert old_context._model_name == "new-model"
+        assert old_context._usage_measurement_cache == {}
+        assert old_context._usage_report_cache == {}
+        assert untouched_context.token_counter() is old_counter
+        assert untouched_context._model_name == "old-model"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("enabled", "expected_counter"),
+        [
+            (True, TiktokenCounter),
+            (False, StringLengthCounter),
+        ],
+    )
+    async def test_create_context_without_model_respects_tiktoken_switch(
+        self, session, enabled, expected_counter
+    ):
+        engine = ContextEngine(
+            ContextEngineConfig(enable_tiktoken_counter=enabled)
+        )
+
+        context = await engine.create_context(context_id="ctx", session=session)
+
+        assert isinstance(context.token_counter(), expected_counter)
+        if not enabled:
+            assert (
+                context.token_counter().measurement_fallback_reason
+                == "tiktoken_disabled"
+            )
+
+    @pytest.mark.asyncio
+    async def test_create_context_without_local_tokenizer_uses_string_length(self, session):
+        engine = ContextEngine(
+            ContextEngineConfig(
+                enable_tiktoken_counter=False,
+                model_name="deepseek-chat",
+                model_provider="DeepSeek",
+            )
+        )
+
+        context = await engine.create_context(context_id="ctx", session=session)
+
+        assert isinstance(context.token_counter(), StringLengthCounter)
+        assert context.token_counter().measurement_fallback_reason == "model_tokenizer_spec_missing"
+
+    @pytest.mark.asyncio
+    async def test_create_context_uses_local_native_tokenizer_without_download(
+        self, session, tmp_path
+    ):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import Whitespace
+
+        artifact = tmp_path / "tokenizer.json"
+        tokenizer = Tokenizer(
+            WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]")
+        )
+        tokenizer.pre_tokenizer = Whitespace()
+        tokenizer.save(str(artifact))
+
+        engine = ContextEngine(
+            ContextEngineConfig(
+                enable_tiktoken_counter=True,
+                enable_tokenizer_download=True,
+                tokenizer_offline=False,
+                tokenizer_spec=TokenizerSpec(
+                    provider="deepseek",
+                    model="deepseek-chat",
+                    source="local",
+                    artifact_path=str(artifact),
+                ),
+            )
+        )
+
+        context = await engine.create_context(context_id="ctx", session=session)
+
+        assert isinstance(context.token_counter(), NativeTokenizerCounter)
+
+    @pytest.mark.asyncio
+    async def test_create_context_uses_cached_family_tokenizer_when_switch_is_false(
+        self, session, tmp_path
+    ):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import Whitespace
+
+        artifact = tmp_path / "tokenizer.json"
+        tokenizer = Tokenizer(
+            WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]")
+        )
+        tokenizer.pre_tokenizer = Whitespace()
+        tokenizer.save(str(artifact))
+
+        engine = ContextEngine(
+            ContextEngineConfig(
+                enable_tiktoken_counter=False,
+                model_provider="openai",
+                model_name="GLM-5.2_Thinking",
+                tokenizer_registry=[
+                    TokenizerSpec(
+                        provider="OpenAI",
+                        model="glm-5.2",
+                        source="LOCAL",
+                        artifact_path=str(artifact),
+                    )
+                ],
+            )
+        )
+
+        context = await engine.create_context(context_id="ctx", session=session)
+
+        assert isinstance(context.token_counter(), NativeTokenizerCounter)
+        assert context.token_counter().measurement_source == "family_tokenizer_fallback"
+
+    @pytest.mark.asyncio
+    async def test_create_context_missing_tokenizer_falls_back_without_download(
+        self, session, monkeypatch
+    ):
+        from openjiuwen.core.context_engine.token.tokenizer_manager import (
+            TokenizerArtifactManager,
+        )
+
+        manager_options = {}
+        original_init = TokenizerArtifactManager.__init__
+
+        def capture_init(manager, **kwargs):
+            manager_options.update(kwargs)
+            original_init(manager, **kwargs)
+
+        monkeypatch.setattr(TokenizerArtifactManager, "__init__", capture_init)
+        monkeypatch.setattr(
+            TokenizerArtifactManager,
+            "_resolve_huggingface",
+            lambda _manager, _spec: None,
+        )
+
+        engine = ContextEngine(
+            ContextEngineConfig(
+                enable_tiktoken_counter=True,
+                enable_tokenizer_download=True,
+                tokenizer_offline=False,
+                model_provider="DeepSeek",
+                model_name="deepseek-chat",
+                tokenizer_spec=TokenizerSpec(
+                    provider="DeepSeek",
+                    model="deepseek-chat",
+                    source="huggingface",
+                    id="missing/tokenizer",
+                ),
+            )
+        )
+
+        context = await engine.create_context(context_id="ctx", session=session)
+
+        assert isinstance(context.token_counter(), StringLengthCounter)
+        assert manager_options["enable_download"] is False
+        assert manager_options["offline"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("refactored_context_processors")
+    async def test_create_context_with_registered_processor(self, engine, session):
+        config = MessageSummaryOffloaderConfig()
+        context = await engine.create_context(
+            context_id="ctx",
+            session=session,
+            processors=[("MessageSummaryOffloader", config)],
+        )
+        assert context is not None
+        assert len(getattr(context, "_processors")) == 1
+
+    @pytest.mark.asyncio
+    async def test_create_context_unknown_processor_type_raises(self, engine, session):
+        from pydantic import BaseModel
+
+        class UnknownProcessorConfig(BaseModel):
+            pass
+
+        with pytest.raises(BaseError) as exc_info:
+            await engine.create_context(
+                context_id="ctx",
+                session=session,
+                processors=[("UnknownProcessorType", UnknownProcessorConfig())],
+            )
+        assert exc_info.value.code == StatusCode.CONTEXT_EXECUTION_ERROR.code
+
+    @pytest.mark.asyncio
+    async def test_create_context_processor_init_fails_raises(self, engine, session):
+        from openjiuwen.core.context_engine.processor.forked.offloader.message_offloader import (
+            MessageSummaryOffloaderConfig
+        )
+        with patch.object(
+            engine,
+            "_create_processor",
+            side_effect=build_error(
+                StatusCode.CONTEXT_EXECUTION_ERROR,
+                msg="init processor type 'MessageSummaryOffloader' failed",
+            )
+        ):
+            with pytest.raises(BaseError) as exc_info:
+                await engine.create_context(
+                    context_id="ctx",
+                    session=session,
+                    processors=[("MessageSummaryOffloader", MessageSummaryOffloaderConfig())],
+                )
+        assert exc_info.value.code == StatusCode.CONTEXT_EXECUTION_ERROR.code
+
+    @pytest.mark.asyncio
+    async def test_compress_context_force_executes_registered_compressor_ignoring_threshold(self, engine, session):
+        context = await engine.create_context(
+            context_id="ctx",
+            session=session,
+            processors=[(
+                "ActiveCompactingCompressor",
+                ActiveCompactingCompressorConfig(replacement="[COMPRESSED]"),
+            )],
+        )
+        await context.add_messages([UserMessage(content="large historical context")])
+
+        result = await engine.compress_context(context_id="ctx", session=session)
+
+        assert result == "compressed"
+        assert context.get_messages()[0].content == "[COMPRESSED]"
+
+    @pytest.mark.asyncio
+    async def test_compress_context_force_executes_get_window_compressor(self, engine, session):
+        context = await engine.create_context(
+            context_id="ctx",
+            session=session,
+            processors=[(
+                "GetOnlyActiveCompressor",
+                GetOnlyActiveCompressorConfig(replacement="[GET-COMPACTED]"),
+            )],
+        )
+        await context.add_messages([UserMessage(content="large historical context")])
+
+        result = await engine.compress_context(context_id="ctx", session=session, return_state=True)
+
+        assert result["result"] == "compressed"
+        assert result["compact_summary"] == "[GET-COMPACTED]"
+        assert context.get_messages()[0].content == "[GET-COMPACTED]"
+
+    @pytest.mark.asyncio
+    async def test_compress_context_persists_and_commits_compressed_messages(self, engine, session):
+        context = await engine.create_context(
+            context_id="ctx",
+            session=session,
+            processors=[(
+                "GetOnlyActiveCompressor",
+                GetOnlyActiveCompressorConfig(replacement="[GET-COMPACTED]"),
+            )],
+        )
+        await context.add_messages([UserMessage(content="large historical context")])
+        await engine.save_contexts(session)
+        session.commit = AsyncMock()
+
+        result = await engine.compress_context(
+            context_id="ctx",
+            session_id=session.get_session_id(),
+            return_state=True,
+        )
+
+        assert result["result"] == "compressed"
+        persisted_messages = session.get_state("context")["ctx"]["messages"]
+        assert [message.content for message in persisted_messages] == ["[GET-COMPACTED]"]
+        session.commit.assert_awaited_once_with()
+
+        restored_context = await engine.create_context(context_id="ctx", session=session)
+        assert [message.content for message in restored_context.get_messages()] == ["[GET-COMPACTED]"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("refactored_context_processors")
+    async def test_compress_context_runs_offloader_ttl_before_compressor(self, session):
+        engine = ContextEngine(ContextEngineConfig(context_window_tokens=100))
+        context = await engine.create_context(
+            context_id="ctx",
+            session=session,
+            processors=[
+                (
+                    "MessageSummaryOffloader",
+                    MessageSummaryOffloaderConfig(
+                        add_message_threshold_ratio=10,
+                        ttl_seconds=10,
+                        ttl_context_occupancy_ratio=0.1,
+                        ttl_message_threshold_ratio=0.1,
+                    ),
+                ),
+                (
+                    "GetOnlyActiveCompressor",
+                    GetOnlyActiveCompressorConfig(replacement="[GET-COMPACTED]"),
+                ),
+            ],
+        )
+        await context.add_messages(
+            [
+                UserMessage(content="please inspect the large tool output"),
+                ToolMessage(content="tool output " * 80, tool_call_id="tc-compact-ttl"),
+            ]
+        )
+        context.set_last_context_window_access_at(time.time() - 20)
+
+        result = await engine.compress_context(context_id="ctx", session=session, return_state=True)
+
+        assert result["result"] == "compressed"
+        history = result["state"]
+        assert history["processor"] == "GetOnlyActiveCompressor"
+        state_history = context._processor_state_recorder.history()
+        assert any(
+            state["status"] == "completed" and state["processor"] == "MessageSummaryOffloader"
+            for state in state_history
+        )
+        assert context.get_messages()[0].content == "[GET-COMPACTED]"
+        assert context.get_messages()[0].content != "tool output " * 80
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("refactored_context_processors")
+    async def test_compress_context_skips_offloader_ttl_before_expiration(self, session):
+        engine = ContextEngine(ContextEngineConfig(context_window_tokens=100))
+        context = await engine.create_context(
+            context_id="ctx",
+            session=session,
+            processors=[
+                (
+                    "MessageSummaryOffloader",
+                    MessageSummaryOffloaderConfig(
+                        add_message_threshold_ratio=10,
+                        ttl_seconds=10,
+                        ttl_context_occupancy_ratio=0.1,
+                        ttl_message_threshold_ratio=0.1,
+                    ),
+                ),
+                (
+                    "GetOnlyActiveCompressor",
+                    GetOnlyActiveCompressorConfig(replacement="[GET-COMPACTED]"),
+                ),
+            ],
+        )
+        await context.add_messages(
+            [
+                UserMessage(content="please inspect the large tool output"),
+                ToolMessage(content="tool output " * 80, tool_call_id="tc-compact-ttl"),
+            ]
+        )
+        context.set_last_context_window_access_at(time.time())
+
+        result = await engine.compress_context(context_id="ctx", session=session, return_state=True)
+
+        assert result["result"] == "compressed"
+        state_history = context._processor_state_recorder.history()
+        assert not any(state["processor"] == "MessageSummaryOffloader" for state in state_history)
+        assert result["state"]["processor"] == "GetOnlyActiveCompressor"
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("refactored_context_processors")
+    async def test_compress_context_ttl_offloader_noops_without_processable_messages(self, session):
+        engine = ContextEngine(ContextEngineConfig(context_window_tokens=100))
+        context = await engine.create_context(
+            context_id="ctx",
+            session=session,
+            processors=[
+                (
+                    "MessageSummaryOffloader",
+                    MessageSummaryOffloaderConfig(
+                        add_message_threshold_ratio=10,
+                        ttl_seconds=10,
+                        ttl_context_occupancy_ratio=0.1,
+                        ttl_message_threshold_ratio=0.1,
+                    ),
+                ),
+            ],
+        )
+        await context.add_messages([UserMessage(content="plain user content " * 80)])
+        context.set_last_context_window_access_at(time.time() - 20)
+
+        result = await engine.compress_context(context_id="ctx", session=session, return_state=True)
+
+        assert result["result"] == "noop"
+        state_history = context._processor_state_recorder.history()
+        assert not any(
+            state["status"] == "completed" and state["processor"] == "MessageSummaryOffloader"
+            for state in state_history
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("refactored_context_processors")
+    async def test_compress_context_skips_dialogue_when_history_target_below_trigger(self, session):
+        engine = ContextEngine(ContextEngineConfig(context_window_tokens=100))
+        context = await engine.create_context(
+            context_id="ctx",
+            session=session,
+            processors=[(
+                "DialogueCompressor",
+                DialogueCompressorConfig(min_target_context_ratio=0.5),
+            )],
+        )
+        processor = context._processors[0]
+        processor._compression_executor = MagicMock()
+        processor._compression_executor.invoke = AsyncMock(
+            return_value=CompressionResult(AssistantMessage(content="historical compact state"))
+        )
+        await context.add_messages(
+            [
+                UserMessage(content="tiny history"),
+                UserMessage(content="Current task"),
+                AssistantMessage(content="protected current work " * 150),
+            ]
+        )
+
+        result = await engine.compress_context(
+            context_id="ctx",
+            session=session,
+            processor_types=["DialogueCompressor"],
+            return_state=True,
+        )
+
+        assert result["result"] == "noop"
+        assert not any(
+            state["status"] == "started" and state["processor"] == "DialogueCompressor"
+            for state in context._processor_state_recorder.history()
+        )
+        processor._compression_executor.invoke.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_compress_context_returns_busy_message_when_passive_compression_running(self, engine, session):
+        global _blocking_started, _blocking_release
+        _blocking_started = asyncio.Event()
+        _blocking_release = asyncio.Event()
+
+        context = await engine.create_context(
+            context_id="ctx",
+            session=session,
+            processors=[("BlockingCompressor", BlockingCompressorConfig())],
+        )
+
+        add_task = asyncio.create_task(context.add_messages([UserMessage(content="hello")]))
+        await _blocking_started.wait()
+
+        result = await engine.compress_context(context_id="ctx", session=session)
+
+        assert result == "busy"
+
+        _blocking_release.set()
+        await add_task
+        _blocking_started = None
+        _blocking_release = None
+
+    @pytest.mark.asyncio
+    async def test_add_messages_skips_passive_compression_when_active_compression_holds_lock(self, engine, session):
+        global _blocking_started, _blocking_release
+        _blocking_started = asyncio.Event()
+        _blocking_release = asyncio.Event()
+
+        context = await engine.create_context(
+            context_id="ctx",
+            session=session,
+            processors=[("BlockingCompressor", BlockingCompressorConfig())],
+        )
+
+        compress_task = asyncio.create_task(engine.compress_context(context_id="ctx", session=session))
+        await _blocking_started.wait()
+
+        added_messages = [UserMessage(content="hello during compact")]
+        result = await context.add_messages(added_messages)
+
+        assert result == added_messages
+        assert context.get_messages() == added_messages
+
+        _blocking_release.set()
+        await compress_task
+        _blocking_started = None
+        _blocking_release = None
+
+    @pytest.mark.asyncio
+    async def test_compress_context_returns_noop_when_requested_processors_do_not_match(self, engine, session):
+        await engine.create_context(
+            context_id="ctx",
+            session=session,
+            processors=[(
+                "ActiveCompactingCompressor",
+                ActiveCompactingCompressorConfig(),
+            )],
+        )
+
+        result = await engine.compress_context(
+            context_id="ctx",
+            session=session,
+            processor_types=["DialogueCompressor"],
+        )
+
+        assert result == "noop"
+
+    @pytest.mark.asyncio
+    async def test_compress_context_missing_context_raises(self, engine, session):
+        with pytest.raises(BaseError) as exc_info:
+            await engine.compress_context(context_id="missing", session=session)
+
+        assert exc_info.value.code == StatusCode.CONTEXT_EXECUTION_ERROR.code
+
+    # ---------- get_context supplements ----------
+    @pytest.mark.asyncio
+    async def test_get_context_returns_none_when_not_exists(self, engine, session):
+        assert engine.get_context(context_id="nonexistent", session_id=session.get_session_id()) is None
+
+    @pytest.mark.asyncio
+    async def test_get_context_with_dotted_context_id(self, engine, session):
+        await engine.create_context(context_id="x.y", session=session)
+        ctx = engine.get_context(context_id="x.y", session_id=session.get_session_id())
+        assert ctx is not None
+        assert ctx.context_id() == "x_y"
+
+    @pytest.mark.asyncio
+    async def test_get_context_default_params(self, engine):
+        ctx = await engine.create_context(context_id="default_context_id", session=None)
+        retrieved = engine.get_context()
+        assert retrieved is ctx
+
+    # ---------- clear_context supplements ----------
+    @pytest.mark.asyncio
+    async def test_clear_context_by_session_when_session_has_no_contexts(self, engine, session):
+        await engine.clear_context(session_id=session.get_session_id())
+        assert engine.get_context(context_id="any", session_id=session.get_session_id()) is None
+
+    @pytest.mark.asyncio
+    async def test_clear_context_by_session_and_context_when_context_not_exists(self, engine, session):
+        await engine.clear_context(session_id=session.get_session_id(), context_id="nonexistent")
+        assert engine.get_context(context_id="nonexistent", session_id=session.get_session_id()) is None
+
+    @pytest.mark.asyncio
+    async def test_clear_context_all_then_pool_empty(self, engine, session, another_session):
+        await engine.create_context(context_id="c1", session=session)
+        await engine.create_context(context_id="c2", session=another_session)
+        await engine.clear_context()
+        assert engine.get_context(context_id="c1", session_id=session.get_session_id()) is None
+        assert engine.get_context(context_id="c2", session_id=another_session.get_session_id()) is None
+
+    # ---------- save_contexts supplements ----------
+    @pytest.mark.asyncio
+    async def test_save_contexts_session_none_does_not_raise(self, engine):
+        await engine.save_contexts(session=None)
+
+    @pytest.mark.asyncio
+    async def test_save_contexts_partial_context_ids_missing_skipped(self, engine, session):
+        await engine.create_context(context_id="exists", session=session)
+        await engine.save_contexts(session=session, context_ids=["exists", "missing"])
+        session_id = session.get_session_id()
+        ctx = engine.get_context(context_id="exists", session_id=session_id)
+        assert ctx is not None
+
+    @pytest.mark.asyncio
+    async def test_save_contexts_context_ids_none_saves_all_for_session(self, engine, session):
+        await engine.create_context(context_id="c1", session=session)
+        await engine.create_context(context_id="c2", session=session)
+        await engine.save_contexts(session=session)
+        states = session.get_state("context")
+        assert states is not None
+        assert "c1" in states and "c2" in states
+
+    # ---------- config ----------
+    @pytest.mark.asyncio
+    async def test_engine_config_none_uses_default(self):
+        eng = ContextEngine(config=None)
+        ctx = await eng.create_context(context_id="ctx", session=None)
+        assert ctx is not None
+
+    @pytest.mark.asyncio
+    async def test_engine_custom_config_reflected_in_context(self, session):
+        config = ContextEngineConfig(default_window_message_num=10)
+        engine = ContextEngine(config=config)
+        context = await engine.create_context(context_id="ctx", session=session)
+        assert getattr(context, "_default_window_size") == 10
+
+    # ---------- register_processor ----------
+    @pytest.mark.asyncio
+    async def test_register_processor_registers_in_map(self):
+        from openjiuwen.core.context_engine.processor.compressor.current_round_compressor import (
+            CurrentRoundCompressor,
+        )
+        assert "CurrentRoundCompressor" in getattr(ContextEngine, "_PROCESSOR_MAP")
+        assert getattr(ContextEngine, "_PROCESSOR_MAP")["CurrentRoundCompressor"] is CurrentRoundCompressor
+
+    # ---------- multi session / multi context ----------
+    @pytest.mark.asyncio
+    async def test_multiple_sessions_and_contexts_isolated(self, engine, session, another_session):
+        c1 = await engine.create_context(context_id="ctx_a", session=session)
+        c2 = await engine.create_context(context_id="ctx_b", session=session)
+        c3 = await engine.create_context(context_id="ctx_a", session=another_session)
+        assert c1 is not c2
+        assert c1 is not c3
+        assert c2 is not c3
+        assert engine.get_context("ctx_a", session.get_session_id()) is c1
+        assert engine.get_context("ctx_b", session.get_session_id()) is c2
+        assert engine.get_context("ctx_a", another_session.get_session_id()) is c3
+
+    # ---------- save context supplements ----------
+    @pytest.mark.asyncio
+    async def test_save_context_001(self, session, request):
+        check_pointer = CheckpointerFactory.get_checkpointer()
+        await check_pointer.pre_agent_execute(
+            session=getattr(session, "_inner"), inputs=None
+        )
+        case_id = request.node.name
+
+        session = create_agent_session(session_id=case_id, card=AgentCard(id=case_id))
+
+        # Initialize engine, create a context below, perform message operations;
+        # save the context under this engine for persistence
+        engine = ContextEngine()
+        history = [SystemMessage(content="智能家具助手", name="first")]
+        context = await engine.create_context(context_id="ctx", session=session, history_messages=history)
+
+        messages = [
+            UserMessage(content="小智，明早6点帮我自动拉开窗帘", name="first"),
+            ToolMessage(content="调用智能窗帘，设置定时", tool_call_id=case_id, name="first"),
+            AssistantMessage(content="好的，已为您设置明早6点帮我自动拉开窗帘", name="first"),
+            UserMessage(content="小智，报时", name="second"),
+            AssistantMessage(content="好的，现在是2026年1月1日 18时15分24秒", name="second"),
+        ]
+        await context.add_messages(messages)
+        await engine.save_contexts(context_ids=["ctx"], session=session)
+
+        # Verify saved data: initialize engine1, create a context with the same id below,
+        # load persisted data
+        engine1 = ContextEngine()
+        context1 = await engine1.create_context(context_id="ctx", session=session)
+        assert context.get_messages() == context1.get_messages()
+
+        # 1) The persisted messages obtained when engine1 creates a context should exist in the form of history_message
+
+        assert context1.get_messages() == context1.get_messages()
+
+        # 2) When engine1 creates a context with its own history_messages,
+        # context1.get_messages() should get history_messages, not load persisted data.
+        engine2 = ContextEngine()
+        context2 = await engine2.create_context(context_id="ctx", session=session,
+                                                history_messages=[SystemMessage(content="1", name="first")])
+        assert context2.get_messages() == [SystemMessage(content="1", name="first", metadata=context2.get_messages()[0].metadata)]
+
+    @pytest.mark.asyncio
+    async def test_get_context_window(self, request):
+        case_id = request.node.name
+        engine = ContextEngine()
+        history = [
+            UserMessage(content="history_1", name="1"),
+            ToolMessage(content="history_2", tool_call_id=case_id, name="1"),
+            AssistantMessage(content="history_3", name="1"),
+            UserMessage(content="history_4", name="2"),
+            ToolMessage(content="history_5", tool_call_id=case_id, name="2"),
+        ]
+        context = await engine.create_context(context_id="ctx", session=create_workflow_session(session_id=case_id),
+                                              history_messages=history)
+        messages = [
+            UserMessage(content="message 1", name="1"),
+            ToolMessage(content="message 2", tool_call_id=case_id, name="1"),
+            AssistantMessage(content="message 3", name="1")
+        ]
+        await context.add_messages(messages)
+
+        messages1 = [
+            SystemMessage(content="system 1", name="1"),
+            UserMessage(content="system 2", name="1"),
+            ToolMessage(content="system 3", tool_call_id=case_id, name="1"),
+            ToolMessage(content="system 4", tool_call_id=case_id, name="1"),
+            AssistantMessage(content="system 5", name="1"),
+            BaseMessage(role="system", content="system 6", name="2"),
+            UserMessage(content="system 7", name="2"),
+            AssistantMessage(content="system 8", name="2"),
+        ]
+
+        # Scenario 1: get_context_window only receives system_messages
+        # => result: system_messages are the earliest messages in window
+        window = await context.get_context_window(system_messages=messages1)
+        assert window.get_messages() == messages1 + history + messages
+
+        # Scenario 2: get_context_window receives system_messages, combined with window_size and dialogue_round testing
+        # => result: returns the most recent 2 messages of system_messages data
+        window = await context.get_context_window(system_messages=messages1, window_size=2)
+        result = window.get_messages()
+        assert result == messages1[-2:]
+
+    # # Test for pop operation involving _history_messages_size update
+    @pytest.mark.asyncio
+    async def test_save_context_007(self, request):
+
+        case_id = request.node.name
+
+        session = create_agent_session(session_id=case_id, card=AgentCard(id=case_id))
+        check_pointer = CheckpointerFactory.get_checkpointer()
+        await check_pointer.pre_agent_execute(
+            session=getattr(session, "_inner"), inputs=None
+        )
+
+        engine = ContextEngine()
+        history = [SystemMessage(content="智能家具助手", name="first")]
+        context = await engine.create_context(context_id="ctx", session=session, history_messages=history)
+
+        messages = [
+            UserMessage(content="小智，明早6点帮我自动拉开窗帘", name="first"),
+            ToolMessage(content="调用智能窗帘，设置定时", tool_call_id=case_id, name="first"),
+            AssistantMessage(content="好的，已为您设置明早6点帮我自动拉开窗帘", name="first"),
+            UserMessage(content="小智，报时", name="second"),
+            AssistantMessage(content="好的，现在是2026年1月1日 18时15分24秒", name="second"),
+        ]
+        await context.add_messages(messages)
+        await engine.save_contexts(context_ids=["ctx"], session=session)
+        await session.post_run()
+
+        engine1 = ContextEngine()
+        context1 = await engine1.create_context(context_id="ctx", session=session)
+        assert context1.get_messages(with_history=False) == []
+        assert context1.get_messages() == history + messages
+
+        result = context1.pop_messages(with_history=True, size=1)
+        assert result == messages[-1:]
+        assert context1.get_messages() == history + messages[:-1]
+
+        result = context1.pop_messages(with_history=False, size=1)
+        assert len(result) == 0
+        assert context1.get_messages() == history + messages[:-1]
+
+        messages1 = [
+            UserMessage(content="message 1", name="1"),
+            AssistantMessage(content="message 2", name="1")
+        ]
+        context1.set_messages(messages=messages1, with_history=False)
+        assert context1.get_messages(with_history=False) == messages1
+        assert context1.get_messages() == history + messages[:-1] + messages1
+
+    @pytest.mark.asyncio
+    async def test_model_context_window_override_updates_cached_context(self, session):
+        engine = ContextEngine(
+            ContextEngineConfig(
+                model_name="model-a",
+                model_context_window_tokens_override=131072,
+            )
+        )
+        context = await engine.create_context(context_id="ctx", session=session)
+        assert context.context_window_tokens() == 131072
+
+        engine.update_model_context(model_name="model-b", context_window_tokens=262144)
+        assert context.context_window_tokens() == 262144
+
+    @pytest.mark.asyncio
+    async def test_global_context_window_stays_above_model_override(self, session):
+        engine = ContextEngine(
+            ContextEngineConfig(
+                context_window_tokens=65536,
+                model_name="model-a",
+                model_context_window_tokens_override=131072,
+            )
+        )
+        context = await engine.create_context(context_id="ctx", session=session)
+        assert context.context_window_tokens() == 65536
+
+        engine.update_model_context(model_name="model-b", context_window_tokens=262144)
+        assert context.context_window_tokens() == 65536

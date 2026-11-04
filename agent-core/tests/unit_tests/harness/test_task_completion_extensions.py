@@ -1,0 +1,556 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+"""Tests for task completion loop extension points."""
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, ToolCallInputs
+from openjiuwen.harness.goal.schema import (
+    GoalAssessment,
+    GoalAssessmentStatus,
+    GoalRecord,
+)
+from openjiuwen.harness.rails.task_completion_rail import (
+    TaskCompletionRail,
+    extract_promise_block,
+    promise_matches,
+)
+from openjiuwen.harness.schema.stop_condition import (
+    CompletionPromiseEvaluator,
+    StopEvaluationContext,
+)
+from openjiuwen.harness.task_loop.loop_queues import LoopQueues
+from openjiuwen.harness.task_loop.task_loop_controller import (
+    TaskLoopController,
+)
+
+
+class _Coordinator:
+    def __init__(self) -> None:
+        self.evaluator = CompletionPromiseEvaluator(
+            "all_tasks_completed"
+        )
+
+    def get_completion_promise_evaluator(
+        self,
+    ) -> CompletionPromiseEvaluator:
+        return self.evaluator
+
+
+def _ctx_with_output(output: str):
+    coordinator = _Coordinator()
+    agent = type(
+        "Agent",
+        (),
+        {"loop_coordinator": coordinator},
+    )()
+    inputs = type(
+        "Inputs",
+        (),
+        {"result": {"output": output}},
+    )()
+    ctx = type("Ctx", (), {"agent": agent, "inputs": inputs})()
+    return ctx, coordinator.evaluator
+
+
+def test_promise_block_can_include_evidence_lines() -> None:
+    """A promise block may start with the token and include details."""
+    text = """done
+<promise>all_tasks_completed
+Completed tasks:
+- created output
+</promise>
+"""
+    block = extract_promise_block(text)
+
+    assert block is not None
+    assert promise_matches(block, "all_tasks_completed")
+    assert not promise_matches(block, "different_token")
+
+
+@pytest.mark.asyncio
+async def test_task_completion_rail_rejects_details_by_default() -> None:
+    """Default behavior remains exact promise token matching."""
+    rail = TaskCompletionRail(
+        completion_promise="all_tasks_completed",
+    )
+    ctx, evaluator = _ctx_with_output(
+        """<promise>all_tasks_completed
+Completed tasks:
+- created output
+</promise>"""
+    )
+
+    await rail.after_task_iteration(ctx)
+
+    assert not evaluator.should_stop(StopEvaluationContext())
+
+
+@pytest.mark.asyncio
+async def test_task_completion_rail_accepts_details_when_enabled() -> None:
+    """Detailed promise blocks require an explicit opt-in."""
+    rail = TaskCompletionRail(
+        completion_promise="all_tasks_completed",
+        allow_promise_details=True,
+    )
+    ctx, evaluator = _ctx_with_output(
+        """<promise>all_tasks_completed
+Completed tasks:
+- created output
+</promise>"""
+    )
+
+    await rail.after_task_iteration(ctx)
+
+    assert evaluator.should_stop(StopEvaluationContext())
+
+
+def test_task_completion_rail_builds_multi_confirmation_evaluator() -> None:
+    """TaskCompletionRail forwards required confirmation count."""
+    rail = TaskCompletionRail(
+        completion_promise="all_tasks_completed",
+        required_confirmations=2,
+    )
+    evaluator = rail.build_evaluators()[0]
+
+    assert isinstance(evaluator, CompletionPromiseEvaluator)
+    evaluator.notify_fulfilled("all_tasks_completed")
+    assert not evaluator.should_stop(StopEvaluationContext())
+    evaluator.notify_fulfilled("all_tasks_completed")
+    assert evaluator.should_stop(StopEvaluationContext())
+
+
+@pytest.mark.asyncio
+async def test_submit_goal_report_does_not_force_finish() -> None:
+    """Accepted submit_goal_report must not terminate the attempt early.
+
+    Assessment runs in after_task_iteration via GoalReportSink; the tool
+    hook itself must leave the model a final-note / further-tool chance.
+    """
+    rail = TaskCompletionRail()
+    rail.set_goal_manager(object())
+    rail._is_goal_round = True
+    ctx = AgentCallbackContext(
+        agent=object(),
+        inputs=ToolCallInputs(
+            tool_name="submit_goal_report",
+            tool_result={"result": "report_accepted", "status": "continue"},
+        ),
+    )
+
+    await rail.after_tool_call(ctx)
+
+    assert ctx.consume_force_finish() is None
+
+
+@pytest.mark.asyncio
+async def test_tool_after_goal_report_is_allowed() -> None:
+    """A later tool call after an accepted report is not force-finished."""
+    rail = TaskCompletionRail()
+    rail.set_goal_manager(object())
+    rail._is_goal_round = True
+    ctx = AgentCallbackContext(
+        agent=object(),
+        inputs=ToolCallInputs(tool_name="write_file"),
+    )
+
+    await rail.before_tool_call(ctx)
+
+    assert ctx.consume_force_finish() is None
+
+
+@pytest.mark.asyncio
+async def test_goal_report_outside_goal_round_does_not_force_finish() -> None:
+    """submit_goal_report outside a goal round must not force-finish."""
+    rail = TaskCompletionRail()
+    rail.set_goal_manager(object())
+    ctx = AgentCallbackContext(
+        agent=object(),
+        inputs=ToolCallInputs(
+            tool_name="submit_goal_report",
+            tool_result={"result": "report_accepted", "status": "continue"},
+        ),
+    )
+
+    await rail.after_tool_call(ctx)
+
+    assert ctx.consume_force_finish() is None
+
+
+@pytest.mark.asyncio
+async def test_rejected_goal_report_does_not_force_finish() -> None:
+    """Malformed submit_goal_report must not terminate the attempt early."""
+    rail = TaskCompletionRail()
+    rail.set_goal_manager(object())
+    rail._is_goal_round = True
+    ctx = AgentCallbackContext(
+        agent=object(),
+        inputs=ToolCallInputs(
+            tool_name="submit_goal_report",
+            tool_result={"result": "report_rejected", "error": "missing status"},
+        ),
+    )
+
+    await rail.after_tool_call(ctx)
+
+    assert ctx.consume_force_finish() is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_goal_report_invokes_transcript_assessor(monkeypatch) -> None:
+    """HYBRID terminal reports must be verified by the transcript assessor."""
+    rail = TaskCompletionRail()
+    rail.set_goal_manager(object())
+    record = GoalRecord.create(session_id="s1", objective="查杭州天气")
+    report = GoalAssessment(
+        status=GoalAssessmentStatus.COMPLETE,
+        evidence="天气已查询并返回给用户",
+    )
+    calls = []
+
+    async def fake_invoke(record_arg, ctx):
+        calls.append((record_arg, ctx))
+        return '{"status":"complete","evidence":"verified"}'
+
+    monkeypatch.setattr(rail, "_invoke_transcript_assessor", fake_invoke)
+    ctx = AgentCallbackContext(agent=object(), inputs=object())
+
+    result = await rail._maybe_invoke_transcript_assessor(record, report, ctx)
+
+    assert result == '{"status":"complete","evidence":"verified"}'
+    assert len(calls) == 1
+    assert calls[0][0] is record
+    assert calls[0][1] is ctx
+
+
+@pytest.mark.asyncio
+async def test_continue_goal_report_does_not_invoke_transcript_by_default(monkeypatch) -> None:
+    """CONTINUE reports stay on the low-cost path unless spot-checking is configured."""
+    rail = TaskCompletionRail()
+    rail.set_goal_manager(object())
+    record = GoalRecord.create(session_id="s1", objective="完成任务")
+    report = GoalAssessment(
+        status=GoalAssessmentStatus.CONTINUE,
+        evidence="仍有剩余工作",
+    )
+    called = False
+
+    async def fake_invoke(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return '{"status":"complete","evidence":"verified"}'
+
+    monkeypatch.setattr(rail, "_invoke_transcript_assessor", fake_invoke)
+    ctx = AgentCallbackContext(agent=object(), inputs=object())
+
+    result = await rail._maybe_invoke_transcript_assessor(record, report, ctx)
+
+    assert result is None
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_attempt_context_uses_latest_model_window_without_duplication() -> None:
+    """Goal assessment uses the latest model window instead of accumulating copies."""
+    rail = TaskCompletionRail()
+    rail.set_goal_manager(object())
+    rail._is_goal_round = True
+
+    first_ctx = AgentCallbackContext(
+        agent=object(),
+        inputs=SimpleNamespace(
+            messages=[{"role": "user", "content": "old request"}],
+            response={"role": "assistant", "content": "old response"},
+        ),
+    )
+    await rail.after_model_call(first_ctx)
+
+    second_ctx = AgentCallbackContext(
+        agent=object(),
+        inputs=SimpleNamespace(
+            messages=[
+                {"role": "user", "content": "current weather request"},
+                {
+                    "role": "tool",
+                    "content": "Hangzhou weather: 36C cloudy humidity 53%",
+                },
+            ],
+            response={
+                "role": "assistant",
+                "content": "submitted complete goal report",
+            },
+        ),
+    )
+    await rail.after_model_call(second_ctx)
+
+    transcript = rail._extract_attempt_context(
+        AgentCallbackContext(agent=object(), inputs=object())
+    )
+
+    assert "Hangzhou weather: 36C" in transcript
+    assert "submitted complete goal report" in transcript
+    assert "old request" not in transcript
+    assert "old response" not in transcript
+
+
+def test_completion_promise_evaluator_requires_consecutive_confirmations() -> None:
+    """notify_absent resets the consecutive confirmation streak."""
+    evaluator = CompletionPromiseEvaluator(
+        "all_tasks_completed",
+        required_confirmations=2,
+    )
+
+    evaluator.notify_fulfilled("all_tasks_completed")
+    evaluator.notify_absent()
+    evaluator.notify_fulfilled("all_tasks_completed")
+    assert not evaluator.should_stop(StopEvaluationContext())
+
+    evaluator.notify_fulfilled("all_tasks_completed")
+    assert evaluator.should_stop(StopEvaluationContext())
+
+
+def test_completion_promise_evaluator_absent_clears_state() -> None:
+    """notify_absent clears fulfilled state and matched text."""
+    evaluator = CompletionPromiseEvaluator(
+        "all_tasks_completed",
+        required_confirmations=2,
+    )
+
+    evaluator.notify_fulfilled("all_tasks_completed")
+    evaluator.notify_fulfilled("all_tasks_completed")
+    assert evaluator.should_stop(StopEvaluationContext())
+
+    evaluator.notify_absent()
+    assert not evaluator.should_stop(StopEvaluationContext())
+    state = evaluator.get_state()
+    assert state is not None
+    assert state["confirmation_count"] == 0
+    assert state["matched_text"] == ""
+
+
+def test_task_loop_controller_can_enqueue_follow_up() -> None:
+    """Rails can enqueue follow-up messages through the controller."""
+    controller = TaskLoopController()
+    queues = LoopQueues()
+    handler = type(
+        "Handler",
+        (),
+        {"interaction_queues": queues},
+    )()
+    controller.set_event_handler(handler)
+
+    controller.enqueue_follow_up("confirm completion")
+
+    assert controller.has_follow_up()
+    assert controller.drain_follow_up() == ["confirm completion"]
+
+
+@pytest.mark.asyncio
+async def test_goal_round_error_blocks_instead_of_continue() -> None:
+    """Only when task-loop ctx.exception is set (invoke raised) → BLOCKED.
+
+    Soft result_type=error without exception must not block (retries that
+    succeeded never leave exception on this outer ctx).
+    """
+    from openjiuwen.harness.goal.schema import GoalStatus
+
+    record = GoalRecord.create(session_id="s1", objective="ship it")
+    assessments: list[GoalAssessment] = []
+
+    class _Store:
+        def load(self):
+            return record
+
+    class _Manager:
+        def get_store(self, session_id=None):
+            return _Store()
+
+        async def apply_assessment(self, *, goal_id, revision, assessment):
+            assessments.append(assessment)
+            record.status = GoalStatus.BLOCKED
+            record.last_assessment = assessment
+            return record
+
+    rail = TaskCompletionRail()
+    rail.set_goal_manager(_Manager())
+    rail._is_goal_round = True
+    rail._current_goal_id = record.goal_id
+    rail._current_revision = record.revision
+    rail._current_session_id = record.session_id
+
+    inputs = SimpleNamespace(
+        result={"result_type": "error", "error": "Invalid API Key"},
+        run_context={
+            "goal_id": record.goal_id,
+            "revision": record.revision,
+            "session_id": record.session_id,
+        },
+    )
+    ctx = AgentCallbackContext(agent=object(), inputs=inputs)
+    ctx.exception = RuntimeError("Invalid API Key")
+
+    await rail._do_goal_after_iteration(ctx)
+
+    assert len(assessments) == 1
+    assert assessments[0].status is GoalAssessmentStatus.BLOCKED
+    assert "Invalid API Key" in assessments[0].evidence
+    assert record.status is GoalStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_goal_interrupt_skips_assessment() -> None:
+    """HITL/permission interrupt must not run transcript assessor or apply_assessment."""
+    from openjiuwen.harness.goal.schema import GoalStatus
+
+    record = GoalRecord.create(session_id="s1", objective="ship it")
+    assessments: list[GoalAssessment] = []
+    assessor_calls = {"n": 0}
+
+    class _Store:
+        def load(self):
+            return record
+
+    class _Manager:
+        def get_store(self, session_id=None):
+            return _Store()
+
+        async def apply_assessment(self, *, goal_id, revision, assessment):
+            assessments.append(assessment)
+            return record
+
+    class _Evaluator:
+        strategy = None
+
+        def assess(self, **kwargs):
+            raise AssertionError("assess should not run on interrupt")
+
+    rail = TaskCompletionRail()
+    rail.set_goal_manager(_Manager())
+    rail._goal_evaluator = _Evaluator()
+    rail._is_goal_round = True
+    rail._current_goal_id = record.goal_id
+    rail._current_revision = record.revision
+    rail._current_session_id = record.session_id
+
+    async def _should_not_invoke(*args, **kwargs):
+        assessor_calls["n"] += 1
+        raise AssertionError("transcript assessor should not run on interrupt")
+
+    rail._maybe_invoke_transcript_assessor = _should_not_invoke  # type: ignore[method-assign]
+
+    inputs = SimpleNamespace(
+        result={"result_type": "interrupt", "component_ids": ["tool_1"]},
+        run_context={
+            "goal_id": record.goal_id,
+            "revision": record.revision,
+            "session_id": record.session_id,
+        },
+    )
+    ctx = AgentCallbackContext(agent=object(), inputs=inputs)
+
+    await rail._do_goal_after_iteration(ctx)
+
+    assert assessments == []
+    assert assessor_calls["n"] == 0
+    assert record.status is GoalStatus.ACTIVE
+
+
+def test_extract_goal_round_error_requires_thrown_exception() -> None:
+    ctx_exc = AgentCallbackContext(agent=object(), inputs=SimpleNamespace(result=None))
+    ctx_exc.exception = ValueError("token rejected")
+    assert TaskCompletionRail._extract_goal_round_error(ctx_exc) == "token rejected"
+
+    # result_type=error alone is not enough (could be soft return; retries OK).
+    ctx_result_only = AgentCallbackContext(
+        agent=object(),
+        inputs=SimpleNamespace(result={"result_type": "error", "error": "boom"}),
+    )
+    assert TaskCompletionRail._extract_goal_round_error(ctx_result_only) is None
+
+    ctx_ok = AgentCallbackContext(
+        agent=object(),
+        inputs=SimpleNamespace(result={"result_type": "answer", "output": "ok"}),
+    )
+    assert TaskCompletionRail._extract_goal_round_error(ctx_ok) is None
+
+
+def test_goal_language_zh_normalizes_to_cn() -> None:
+    rail = TaskCompletionRail(goal_language="zh")
+    assert rail._goal_language == "cn"
+
+
+def test_goal_task_query_follows_builder_language() -> None:
+    record = GoalRecord.create(
+        session_id="s1", objective="Help me check the weather in Hangzhou"
+    )
+
+    class _Store:
+        def load(self):
+            return record
+
+    class _Manager:
+        def get_store(self, session_id=None):
+            return _Store()
+
+    rail = TaskCompletionRail(goal_manager=_Manager())
+    inputs = SimpleNamespace(
+        query="original",
+        run_context={
+            "goal_id": record.goal_id,
+            "revision": record.revision,
+            "session_id": record.session_id,
+        },
+    )
+    ctx = AgentCallbackContext(
+        agent=SimpleNamespace(
+            system_prompt_builder=SimpleNamespace(language="en")
+        ),
+        inputs=inputs,
+    )
+
+    rail._do_goal_before_iteration(ctx)
+
+    assert "None. This is the first attempt." in inputs.query
+    assert "Prioritize completing the entire objective" in inputs.query
+    assert "无。这是第一次尝试。" not in inputs.query
+    assert rail._goal_language == "en"
+
+
+@pytest.mark.asyncio
+async def test_transcript_assessor_uses_builder_language() -> None:
+    from openjiuwen.harness.prompts.sections.goal import TRANSCRIPT_ASSESSOR_SYSTEM
+
+    record = GoalRecord.create(
+        session_id="s1", objective="Help me check the weather in Hangzhou"
+    )
+    captured: dict[str, object] = {}
+
+    class _Model:
+        async def invoke(self, messages, tools=None, **kwargs):
+            captured["messages"] = messages
+            return SimpleNamespace(
+                content='{"status":"complete","evidence":"ok"}'
+            )
+
+    rail = TaskCompletionRail()
+    ctx = AgentCallbackContext(
+        agent=SimpleNamespace(
+            system_prompt_builder=SimpleNamespace(language="en"),
+            deep_config=SimpleNamespace(model=_Model()),
+        ),
+        inputs=SimpleNamespace(),
+    )
+
+    result = await rail._invoke_transcript_assessor(record, ctx)
+
+    messages = captured["messages"]
+    system = messages[0].content
+    user = messages[1].content
+    assert result == '{"status":"complete","evidence":"ok"}'
+    assert system == TRANSCRIPT_ASSESSOR_SYSTEM["en"]
+    assert "You are a Goal completion assessor." in system
+    assert "你是 Goal 完成度评估器" not in system
+    assert "Prioritize completing the entire objective" in user

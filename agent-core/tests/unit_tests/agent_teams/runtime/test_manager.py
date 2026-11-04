@@ -1,0 +1,707 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Unit tests for TeamRuntimeManager.finalize_member."""
+
+from collections.abc import Awaitable, Callable
+from types import SimpleNamespace
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+)
+
+import pytest
+
+from openjiuwen.agent_teams import paths as apaths
+from openjiuwen.agent_teams.agent.member import TeamMember
+from openjiuwen.agent_teams.agent.team_agent import TeamAgent
+from openjiuwen.agent_teams.interaction import ExternalTeamEvent
+from openjiuwen.agent_teams.messager.inprocess import InProcessMessager, cleanup_inprocess_bus
+from openjiuwen.agent_teams.runtime.dispatch import RunAction, RunActionKind
+from openjiuwen.agent_teams.runtime.manager import TeamRuntimeManager
+from openjiuwen.agent_teams.runtime.pool import ActiveTeam, RuntimeState
+from openjiuwen.agent_teams.schema.events import EventMessage, TeamTopic
+from openjiuwen.agent_teams.schema.status import MemberStatus
+from openjiuwen.agent_teams.schema.stream import TeamOutputSchema
+from openjiuwen.agent_teams.team_workspace import (
+    MEMBER_MODE_DYNAMIC,
+    MEMBER_MODE_PREDEFINED,
+    MemberWorkspaceBinder,
+    TeamMemberBinding,
+)
+from openjiuwen.agent_teams.team_workspace.paths import member_real_dir
+
+
+class FakeTeamAgent:
+    """Minimal mock for finalize_member's agent argument."""
+
+    def __init__(
+        self,
+        member_name: str = "test_member",
+        team_member: TeamMember | MagicMock | None = None,
+    ) -> None:
+        self.member_name = member_name
+        self.team_member = team_member
+        self.stop_coordination_calls = 0
+        self.pause_coordination_calls = 0
+
+    async def stop_coordination(
+        self,
+        *,
+        on_quiesced: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        self.stop_coordination_calls += 1
+        if on_quiesced is not None:
+            await on_quiesced()
+
+    async def pause_coordination(self) -> None:
+        self.pause_coordination_calls += 1
+
+    async def resolve_retire_target(self, *, force: bool = False) -> MemberStatus:
+        return self.retire_target
+
+    retire_target: MemberStatus = MemberStatus.SHUTDOWN
+
+
+class FakeTeamMember:
+    """Mock TeamMember that tracks status updates."""
+
+    def __init__(self, initial_status: MemberStatus) -> None:
+        self._status = initial_status
+        self.update_status_calls: list[MemberStatus] = []
+
+    async def status(self) -> MemberStatus:
+        return self._status
+
+    async def update_status(self, new_status: MemberStatus) -> bool:
+        self.update_status_calls.append(new_status)
+        self._status = new_status
+        return True
+
+
+class TestFinalizeMember:
+    """Test TeamRuntimeManager.finalize_member lifecycle decisions."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_shutdown_requested_transitions_to_shutdown(self):
+        """SHUTDOWN_REQUESTED must be consumed and become SHUTDOWN.
+
+        This is the core bug fix: previously SHUTDOWN_REQUESTED was in
+        _MEMBER_FINALIZED_STATUSES and skipped, leaving members unable to
+        complete shutdown.
+        """
+        fake_member = FakeTeamMember(MemberStatus.SHUTDOWN_REQUESTED)
+        agent = FakeTeamAgent(team_member=fake_member)
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        assert agent.stop_coordination_calls == 1
+        assert agent.pause_coordination_calls == 0
+        assert fake_member.update_status_calls == [MemberStatus.SHUTDOWN]
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_shutdown_requested_settles_to_dormant_per_lifetime(self):
+        """F_118: the request is one status; the settle target follows the member's lifetime."""
+        fake_member = FakeTeamMember(MemberStatus.SHUTDOWN_REQUESTED)
+        agent = FakeTeamAgent(team_member=fake_member)
+        agent.retire_target = MemberStatus.DORMANT
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        assert agent.stop_coordination_calls == 1
+        assert fake_member.update_status_calls == [MemberStatus.DORMANT]
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_self_retired_member_tears_down_even_if_row_was_claimed_by_a_wake(self):
+        """shutdown_self recorded DORMANT; a wake has since CAS'd the row to RESTARTING.
+
+        The old run cycle must still stop (not pause + re-mark READY under the
+        new runtime), so finalize trusts the in-memory settle over the row.
+        """
+        fake_member = FakeTeamMember(MemberStatus.RESTARTING)
+        agent = FakeTeamAgent(team_member=fake_member)
+        agent.retired_status = MemberStatus.DORMANT
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        assert agent.stop_coordination_calls == 1
+        assert agent.pause_coordination_calls == 0
+        assert fake_member.update_status_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_already_dormant_skips_status_write(self):
+        """A DORMANT row was written by the member itself; finalize only closes the kernel."""
+        fake_member = FakeTeamMember(MemberStatus.DORMANT)
+        agent = FakeTeamAgent(team_member=fake_member)
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        assert agent.stop_coordination_calls == 1
+        assert agent.pause_coordination_calls == 0
+        assert fake_member.update_status_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_ready_pauses_and_marks_ready(self):
+        """READY status should pause the kernel and stay READY for next assignment."""
+        fake_member = FakeTeamMember(MemberStatus.READY)
+        agent = FakeTeamAgent(team_member=fake_member)
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        assert agent.stop_coordination_calls == 0
+        assert agent.pause_coordination_calls == 1
+        assert fake_member.update_status_calls == [MemberStatus.READY]
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_busy_pauses_and_marks_ready(self):
+        """BUSY status should pause and transition to READY."""
+        fake_member = FakeTeamMember(MemberStatus.BUSY)
+        agent = FakeTeamAgent(team_member=fake_member)
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        assert agent.stop_coordination_calls == 0
+        assert agent.pause_coordination_calls == 1
+        assert fake_member.update_status_calls == [MemberStatus.READY]
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_already_shutdown_skips_status_write(self):
+        """SHUTDOWN is a finalized status; only stop_coordination runs."""
+        fake_member = FakeTeamMember(MemberStatus.SHUTDOWN)
+        agent = FakeTeamAgent(team_member=fake_member)
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        assert agent.stop_coordination_calls == 1
+        assert agent.pause_coordination_calls == 0
+        assert fake_member.update_status_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_already_stopped_skips_status_write(self):
+        """STOPPED is a finalized status; only stop_coordination runs."""
+        fake_member = FakeTeamMember(MemberStatus.STOPPED)
+        agent = FakeTeamAgent(team_member=fake_member)
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        assert agent.stop_coordination_calls == 1
+        assert agent.pause_coordination_calls == 0
+        assert fake_member.update_status_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_already_paused_skips_status_write(self):
+        """PAUSED is a finalized status; only stop_coordination runs."""
+        fake_member = FakeTeamMember(MemberStatus.PAUSED)
+        agent = FakeTeamAgent(team_member=fake_member)
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        assert agent.stop_coordination_calls == 1
+        assert agent.pause_coordination_calls == 0
+        assert fake_member.update_status_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_no_team_member_pauses_default_path(self):
+        """When team_member is None, status cannot be read, so default is pause."""
+        agent = FakeTeamAgent(team_member=None)
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        # Without a team_member, status is None, so neither finalized nor
+        # SHUTDOWN_REQUESTED — the default path is pause.
+        assert agent.stop_coordination_calls == 0
+        assert agent.pause_coordination_calls == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_no_team_member_pauses_on_other_status(self):
+        """When team_member is None, default path pauses the kernel."""
+        agent = FakeTeamAgent(team_member=None)
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        assert agent.stop_coordination_calls == 0
+        assert agent.pause_coordination_calls == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_status_read_failure_falls_back_to_pause(self):
+        """If member.status() throws, fallback is pause + READY."""
+        failing_member = MagicMock()
+        failing_member.status = AsyncMock(side_effect=RuntimeError("db error"))
+        failing_member.update_status = AsyncMock(return_value=True)
+        agent = FakeTeamAgent(team_member=failing_member)
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        assert agent.stop_coordination_calls == 0
+        assert agent.pause_coordination_calls == 1
+        failing_member.update_status.assert_awaited_once_with(MemberStatus.READY)
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_unstarted_status_pauses_and_marks_ready(self):
+        """UNSTARTED should be treated as non-finalized and pause."""
+        fake_member = FakeTeamMember(MemberStatus.UNSTARTED)
+        agent = FakeTeamAgent(team_member=fake_member)
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        assert agent.stop_coordination_calls == 0
+        assert agent.pause_coordination_calls == 1
+        assert fake_member.update_status_calls == [MemberStatus.READY]
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_error_status_stops_and_preserves_error(self):
+        """ERROR is owned by the failure path and must survive finalization."""
+        fake_member = FakeTeamMember(MemberStatus.ERROR)
+        agent = FakeTeamAgent(team_member=fake_member)
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        assert agent.stop_coordination_calls == 1
+        assert agent.pause_coordination_calls == 0
+        assert fake_member.update_status_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_restarting_status_pauses_and_marks_ready(self):
+        """RESTARTING status should pause and become READY."""
+        fake_member = FakeTeamMember(MemberStatus.RESTARTING)
+        agent = FakeTeamAgent(team_member=fake_member)
+
+        await TeamRuntimeManager.finalize_member(agent)
+
+        assert agent.stop_coordination_calls == 0
+        assert agent.pause_coordination_calls == 1
+        assert fake_member.update_status_calls == [MemberStatus.READY]
+
+
+class TestExternalEventIngress:
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_routes_external_event_through_interact_to_local_bus(self):
+        cleanup_inprocess_bus()
+        manager = TeamRuntimeManager()
+        agent = MagicMock()
+        publisher = InProcessMessager()
+        agent.team_backend = SimpleNamespace(messager=publisher)
+        await manager.pool.add(
+            ActiveTeam(
+                team_name="alpha",
+                agent=agent,
+                current_session_id="session-1",
+                state=RuntimeState.RUNNING,
+            )
+        )
+        entry = await manager.pool.get("alpha")
+        assert entry is not None
+        await entry.interact_gate.close_and_drain()
+        received: list[EventMessage] = []
+
+        async def handler(message: EventMessage) -> None:
+            received.append(message)
+
+        topic = TeamTopic.MESSAGE.build("session-1", "alpha")
+        subscriber = InProcessMessager()
+        await subscriber.subscribe(topic, handler)
+        message = EventMessage(
+            event_type="message",
+            payload={
+                "team_name": "alpha",
+                "message_id": "message-1",
+                "from_member_name": "external-cli",
+                "to_member_name": "leader",
+            },
+            sender_id="external-cli",
+        )
+        external_event = ExternalTeamEvent(topic=TeamTopic.MESSAGE, event=message)
+
+        delivered = await manager.interact(
+            external_event.to_wire(),
+            team_name="alpha",
+            session_id="session-1",
+        )
+
+        assert delivered.ok is True
+        assert received == [message]
+        cleanup_inprocess_bus()
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_rejects_external_event_for_a_different_team(self):
+        manager = TeamRuntimeManager()
+        agent = MagicMock()
+        agent.team_backend = SimpleNamespace(messager=InProcessMessager())
+        await manager.pool.add(
+            ActiveTeam(
+                team_name="alpha",
+                agent=agent,
+                current_session_id="session-1",
+                state=RuntimeState.RUNNING,
+            )
+        )
+        result = await manager.interact(
+            ExternalTeamEvent(
+                topic=TeamTopic.MESSAGE,
+                event=EventMessage(
+                    event_type="message",
+                    payload={
+                        "team_name": "other",
+                        "message_id": "message-1",
+                        "from_member_name": "external-cli",
+                        "to_member_name": "leader",
+                    },
+                ),
+            ).to_wire(),
+            team_name="alpha",
+            session_id="session-1",
+        )
+
+        assert result.ok is False
+        assert result.reason == "external_event_team_mismatch"
+
+
+class TestDeleteTeamFilesystemCleanup:
+    """manager.delete_team runs block-C member cleanup before the rmtree."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_delete_team_releases_dynamic_real_dir(self, monkeypatch, tmp_path):
+        apaths.configure_openjiuwen_home(tmp_path / "oj-home")
+        try:
+            binder = MemberWorkspaceBinder()
+            binder.setup(TeamMemberBinding(team_name="teamA", member_name="worker", mode=MEMBER_MODE_DYNAMIC))
+            binder.setup(TeamMemberBinding(team_name="teamA", member_name="shared", mode=MEMBER_MODE_PREDEFINED))
+            worker_real = member_real_dir("teamA", "worker", MEMBER_MODE_DYNAMIC)
+            shared_real = apaths.get_agent_teams_home() / "jiuwen_team_members" / "shared"
+            assert worker_real.is_dir()
+
+            fake_db = SimpleNamespace(
+                initialize=AsyncMock(return_value=None),
+                team=SimpleNamespace(delete_team=AsyncMock(return_value=True)),
+            )
+            monkeypatch.setattr(
+                "openjiuwen.agent_teams.spawn.shared_resources.get_shared_db",
+                lambda _config: fake_db,
+            )
+            monkeypatch.setattr(
+                "openjiuwen.agent_teams.runtime.manager.CheckpointerFactory.get_checkpointer",
+                lambda: MagicMock(),
+            )
+
+            deleted = await TeamRuntimeManager().delete_team("teamA", [])
+
+            assert deleted is True
+            assert not worker_real.exists(), "dynamic real dir must be released"
+            assert shared_real.is_dir(), "predefined shared dir must be preserved"
+            assert not apaths.team_home("teamA").is_dir(), "team home must be removed"
+        finally:
+            apaths.reset_openjiuwen_home()
+
+
+@pytest.fixture(autouse=True)
+def mock_group_history_cleanup(monkeypatch):
+    # Archive cleanup has its own scope tests; lifecycle tests use fake storage.
+    monkeypatch.setattr(
+        "openjiuwen.agent_teams.group_chat.conversation.GroupConversationLog.delete_registered",
+        lambda *a: None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_cold_recovery_resets_leader_execution_before_activation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leader starts a new runtime only after the stale execution snapshot is reset."""
+    calls: list[str] = []
+
+    async def initialize() -> None:
+        calls.append("initialize")
+
+    async def reset_execution(team_name: str, member_names: tuple[str, ...]) -> int:
+        assert (team_name, member_names) == ("team", ("leader",))
+        calls.append("reset")
+        return 1
+
+    async def add_to_pool(entry: ActiveTeam) -> None:
+        assert entry.agent is agent
+        calls.append("activate")
+
+    backend = SimpleNamespace(
+        db=SimpleNamespace(
+            initialize=initialize,
+            member=SimpleNamespace(reset_cold_recovery_execution_status=reset_execution),
+        )
+    )
+    agent = SimpleNamespace(team_backend=backend, member_name="leader")
+    monkeypatch.setattr(TeamAgent, "recover_from_session", lambda *args, **kwargs: agent)
+    manager = TeamRuntimeManager()
+    monkeypatch.setattr(manager._pool, "add", add_to_pool)
+    session = SimpleNamespace(get_session_id=lambda: "session")
+    spec = SimpleNamespace(team_name="team")
+
+    await manager._apply_action(
+        RunAction(kind=RunActionKind.COLD_RECOVER, require_spec=False),
+        spec=spec,
+        team_session=session,
+        pool_entry=None,
+        inputs=None,
+    )
+
+    assert calls == ["initialize", "reset", "activate"]
+
+
+class TestRunOrganizationTurn:
+    @staticmethod
+    def _paused_entry(
+        *, team_name: str = "team-a", session_id: str = "session-1"
+    ) -> tuple[TeamRuntimeManager, ActiveTeam, AsyncMock]:
+        manager = TeamRuntimeManager()
+        agent = MagicMock()
+        agent.spec = MagicMock()
+        agent.invoke = AsyncMock()
+        entry = ActiveTeam(
+            team_name=team_name,
+            agent=agent,
+            current_session_id=session_id,
+            state=RuntimeState.PAUSED,
+        )
+        entry.interact_gate.close_and_drain = AsyncMock()
+        return manager, entry, agent
+
+    @pytest.mark.asyncio
+    async def test_reject_activation_skips_finalize_and_gate_drain(self):
+        from openjiuwen.agent_teams.runtime.dispatch import RunAction, RunActionKind
+        from openjiuwen.agent_teams.runtime.manager import TeamRuntimeActivation
+
+        manager, entry, agent = self._paused_entry()
+        await manager.pool.add(entry)
+        session = MagicMock()
+        session.post_run = AsyncMock()
+        manager.activate = AsyncMock(
+            return_value=TeamRuntimeActivation(
+                agent=agent,
+                session=session,
+                action=RunAction(kind=RunActionKind.REJECT_RUNNING, require_spec=False),
+            )
+        )
+        manager.finalize = AsyncMock()
+
+        result = await manager.run_organization_turn(
+            team_name="team-a",
+            session_id="session-1",
+            inputs={"query": "claim task"},
+        )
+
+        assert result is False
+        manager.finalize.assert_not_called()
+        entry.interact_gate.close_and_drain.assert_not_called()
+        session.post_run.assert_not_called()
+        agent.invoke.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_idle_marker_ends_turn_and_runs_finalize(self):
+        from openjiuwen.agent_teams.runtime.dispatch import RunAction, RunActionKind
+        from openjiuwen.agent_teams.runtime.manager import TeamRuntimeActivation
+
+        manager, entry, agent = self._paused_entry()
+        await manager.pool.add(entry)
+        chunks_consumed = []
+        lifecycle_events = []
+
+        async def stream(*_args, **_kwargs):
+            try:
+                chunks_consumed.append("content")
+                yield TeamOutputSchema(type="llm_output", index=0, payload={"content": "done"})
+                chunks_consumed.append("idle")
+                yield TeamOutputSchema(type="message", index=0, payload={"event_type": "team.idle"})
+                chunks_consumed.append("after-idle")
+                yield TeamOutputSchema(type="llm_output", index=1, payload={"content": "unexpected"})
+            finally:
+                lifecycle_events.append("stream_closed")
+
+        async def finalize(**_kwargs):
+            lifecycle_events.append("finalized")
+
+        agent.stream = MagicMock(side_effect=stream)
+        session = MagicMock()
+        session.post_run = AsyncMock()
+        manager.activate = AsyncMock(
+            return_value=TeamRuntimeActivation(
+                agent=agent,
+                session=session,
+                action=RunAction(kind=RunActionKind.RESUME_FROM_PAUSE, require_spec=False),
+            )
+        )
+        manager.finalize = AsyncMock(side_effect=finalize)
+
+        result = await manager.run_organization_turn(
+            team_name="team-a",
+            session_id="session-1",
+            inputs={"query": "claim task"},
+        )
+
+        assert result is True
+        agent.stream.assert_called_once()
+        agent.invoke.assert_not_awaited()
+        assert chunks_consumed == ["content", "idle"]
+        assert lifecycle_events == ["finalized", "stream_closed"]
+        manager.finalize.assert_awaited_once_with(team_name="team-a", session_id="session-1")
+        entry.interact_gate.close_and_drain.assert_awaited_once()
+        session.post_run.assert_awaited_once()
+
+
+class _OrganizationLeaderTurnHarness:
+    def __init__(self, runtime_manager: TeamRuntimeManager) -> None:
+        from openjiuwen.core.runner.team_runner import _TeamRunnerMixin
+
+        self._mixin = _TeamRunnerMixin()
+        self._mixin._team_runtime_manager = runtime_manager
+
+    async def run(self, team_name: str, session_id: str, inputs: object) -> bool:
+        self._mixin._resolve_team_agent_spec = AsyncMock(return_value=SimpleNamespace(team_name=team_name))
+        self._mixin._maybe_attach_observability = MagicMock()
+        return await self._mixin._run_organization_leader_turn(team_name, session_id, inputs)
+
+
+class TestRunOrganizationLeaderTurn:
+    @pytest.mark.asyncio
+    async def test_reject_activation_skips_finalize_and_post_run(self):
+        from openjiuwen.agent_teams.runtime.dispatch import RunAction, RunActionKind
+        from openjiuwen.agent_teams.runtime.manager import TeamRuntimeActivation
+
+        runtime_manager = TeamRuntimeManager()
+        agent = MagicMock()
+        agent.invoke = AsyncMock()
+        session = MagicMock()
+        session.get_session_id.return_value = "session-1"
+        session.post_run = AsyncMock()
+        runtime_manager.activate = AsyncMock(
+            return_value=TeamRuntimeActivation(
+                agent=agent,
+                session=session,
+                action=RunAction(kind=RunActionKind.REJECT_RUNNING, require_spec=False),
+            )
+        )
+        runtime_manager.finalize = AsyncMock()
+        runtime_manager.organization_runtime_manager.ensure_team_binding = AsyncMock()
+
+        harness = _OrganizationLeaderTurnHarness(runtime_manager)
+        result = await harness.run("team-a", "session-1", {"query": "review"})
+
+        assert result is False
+        runtime_manager.finalize.assert_not_called()
+        session.post_run.assert_not_called()
+        agent.invoke.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_successful_turn_runs_finalize_and_post_run(self):
+        from openjiuwen.agent_teams.runtime.dispatch import RunAction, RunActionKind
+        from openjiuwen.agent_teams.runtime.manager import TeamRuntimeActivation
+
+        runtime_manager = TeamRuntimeManager()
+        agent = MagicMock()
+        agent.invoke = AsyncMock(return_value=True)
+        session = MagicMock()
+        session.get_session_id.return_value = "session-1"
+        session.post_run = AsyncMock()
+        runtime_manager.activate = AsyncMock(
+            return_value=TeamRuntimeActivation(
+                agent=agent,
+                session=session,
+                action=RunAction(kind=RunActionKind.RESUME_FROM_PAUSE, require_spec=False),
+            )
+        )
+        runtime_manager.finalize = AsyncMock()
+        runtime_manager.organization_runtime_manager.ensure_team_binding = AsyncMock()
+
+        harness = _OrganizationLeaderTurnHarness(runtime_manager)
+        result = await harness.run("team-a", "session-1", {"query": "review"})
+
+        assert result is True
+        agent.invoke.assert_awaited_once()
+        harness._mixin._maybe_attach_observability.assert_called_once_with(agent, "session-1")
+        runtime_manager.finalize.assert_awaited_once_with(
+            team_name="team-a",
+            session_id="session-1",
+        )
+        session.post_run.assert_awaited_once()
+
+
+class TestActivatePausedModelSelection:
+    """A paused runtime is rebuilt only when the model selection really changed."""
+
+    class _StopAfterModelCheck(Exception):
+        """Raised by the stubbed session inspection to end ``activate`` early."""
+
+    @staticmethod
+    def _entry(*, client_id: str, api_key: str = "K") -> "ModelPoolEntry":
+        from openjiuwen.agent_teams.models.pool import ModelPoolEntry
+
+        return ModelPoolEntry(
+            model_name="deepseek-flash",
+            api_key=api_key,
+            api_base_url="https://api.deepseek.com",
+            api_provider="OpenAI",
+            metadata={"client": {"client_id": client_id, "timeout": 1800.0}},
+        )
+
+    async def _activate(self, monkeypatch, *, live_pool: list, requested_pool: list) -> AsyncMock:
+        manager = TeamRuntimeManager()
+        team_spec = SimpleNamespace(model_pool=live_pool, model_pool_strategy="by_model_name")
+        agent = SimpleNamespace(runtime_context=SimpleNamespace(team_spec=team_spec))
+        await manager.pool.add(
+            ActiveTeam(
+                team_name="team-a",
+                agent=agent,
+                current_session_id="session-1",
+                state=RuntimeState.PAUSED,
+            )
+        )
+        stop_team = AsyncMock()
+        monkeypatch.setattr(manager, "stop_team", stop_team)
+
+        async def _inspect(*_args, **_kwargs):
+            raise self._StopAfterModelCheck()
+
+        monkeypatch.setattr(manager, "_inspect_session", _inspect)
+        spec = SimpleNamespace(
+            team_name="team-a",
+            model_pool=requested_pool,
+            model_pool_strategy="by_model_name",
+        )
+        with pytest.raises(self._StopAfterModelCheck):
+            await manager.activate(spec, "session-1")
+        return stop_team
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_fresh_client_id_alone_keeps_the_paused_runtime(self, monkeypatch):
+        """Regression: every follow-up request rebuilt the team over a new uuid."""
+        stop_team = await self._activate(
+            monkeypatch,
+            live_pool=[self._entry(client_id="first-build")],
+            requested_pool=[self._entry(client_id="second-build")],
+        )
+        stop_team.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_real_config_change_still_rebuilds(self, monkeypatch):
+        stop_team = await self._activate(
+            monkeypatch,
+            live_pool=[self._entry(client_id="first-build", api_key="OLD")],
+            requested_pool=[self._entry(client_id="second-build", api_key="ROTATED")],
+        )
+        stop_team.assert_awaited_once_with(team_name="team-a", session_id="session-1")

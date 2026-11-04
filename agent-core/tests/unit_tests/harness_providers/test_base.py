@@ -1,0 +1,644 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Behavior tests for the shared serialized-turn harness skeleton."""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import pytest
+
+from openjiuwen.harness_protocol import (
+    AUTH_FALLBACK_EVENT_TYPE,
+    AUTH_FALLBACK_REQUEST_TYPE,
+    PROTOCOL_VERSION,
+    AbortMode,
+    CheckpointReason,
+    CheckpointSaveReceipt,
+    DeliveryMode,
+    DiagnosticEvent,
+    DiagnosticLevel,
+    HarnessCapability,
+    HarnessCard,
+    HarnessCheckpoint,
+    HarnessContext,
+    HarnessEvent,
+    HarnessInput,
+    HarnessModelControl,
+    HarnessProtocol,
+    HarnessState,
+    HarnessStateError,
+    HostCapability,
+    InteractionCancelReason,
+    InteractionResponseStatus,
+    ModelOption,
+    ModelSelection,
+    OutputEvent,
+    OutputKind,
+    OutputOperation,
+    ProviderEvent,
+    ProviderInteractionResponse,
+    StateChangedEvent,
+    TurnError,
+    TurnEventKind,
+    TurnLifecycleEvent,
+    TurnResult,
+    TurnStatus,
+    UnsupportedHarnessCapabilityError,
+    UserInputRequest,
+    UserInputResponse,
+)
+from openjiuwen.harness_providers.base import (
+    PendingTurn,
+    SerializedTurnHarness,
+    TurnTiming,
+    merge_model_selection,
+)
+from tests.test_logger import logger
+
+
+class _ScriptedHarness(SerializedTurnHarness):
+    """Provider whose turns are scripted from the outside."""
+
+    card = HarnessCard(
+        name="scripted",
+        implementation_version="1.0",
+        protocol_version=PROTOCOL_VERSION,
+        capabilities=frozenset({HarnessCapability.STEER, HarnessCapability.GRACEFUL_ABORT}),
+        optional_host_capabilities=frozenset({HostCapability.USER_INPUT, HostCapability.CHECKPOINT_SINK}),
+    )
+
+    def __init__(self) -> None:
+        super().__init__(event_buffer_capacity=64)
+        self.opened = 0
+        self.closed = 0
+        self.steered: list[str] = []
+        self.steered_message_ids: list[str] = []
+        self.interrupted: list[AbortMode] = []
+        self.release = asyncio.Event()
+        self.release.set()
+        self.crash_next = False
+        self.ask_user_next = False
+        self.responses: list[Any] = []
+
+    async def _open_session(self, context: HarnessContext) -> str | None:
+        _ = context
+        self.opened += 1
+        await self._publish_checkpoint({"cursor": 1}, reason=CheckpointReason.SESSION_ACTIVATED)
+        return "scripted-session"
+
+    async def _close_session(self) -> None:
+        self.closed += 1
+        self.release.set()
+
+    async def _execute_turn(self, turn: PendingTurn) -> tuple[TurnEventKind, TurnResult]:
+        timing = TurnTiming()
+        if self.crash_next:
+            self.crash_next = False
+            raise RuntimeError("boom")
+        if self.ask_user_next:
+            self.ask_user_next = False
+            response = await self._request_interaction(
+                UserInputRequest(request_id="ask-1", prompt="color?", turn_id=turn.turn_id)
+            )
+            self.responses.append(response)
+        await self._emit(
+            OutputEvent(output_id=f"{turn.turn_id}:answer", kind=OutputKind.TEXT, content="hi", operation=OutputOperation.DELTA),
+            turn=turn,
+        )
+        await self.release.wait()
+        if turn.abort_requested:
+            from openjiuwen.harness_providers.base import interrupted_result
+
+            return TurnEventKind.ABORTED, interrupted_result(turn, provider_name="scripted", timing=timing)
+        return TurnEventKind.FINISHED, TurnResult(
+            status=TurnStatus.COMPLETED,
+            final_output=f"done:{turn.content.content}",
+            started_at=timing.started_at,
+            completed_at=timing.completed_at(),
+            duration_ms=timing.duration_ms(),
+        )
+
+    async def _steer(self, turn: PendingTurn, content: HarnessInput, *, message_id: str) -> None:
+        self.steered.append(str(content.content))
+        self.steered_message_ids.append(message_id)
+
+    async def _interrupt_turn(self, turn: PendingTurn, mode: AbortMode) -> None:
+        self.interrupted.append(mode)
+        self.release.set()
+
+
+class _RecordingSink:
+    def __init__(self) -> None:
+        self.saved: list[tuple[HarnessCheckpoint, CheckpointReason]] = []
+
+    async def save(
+        self,
+        checkpoint: HarnessCheckpoint,
+        *,
+        reason: CheckpointReason,
+        expected_storage_revision: str | None = None,
+    ) -> CheckpointSaveReceipt:
+        _ = expected_storage_revision
+        self.saved.append((checkpoint, reason))
+        return CheckpointSaveReceipt(
+            checkpoint_id=checkpoint.checkpoint_id,
+            sequence=checkpoint.sequence,
+            storage_revision=f"rev-{len(self.saved)}",
+        )
+
+
+class _AnsweringHandler:
+    def __init__(self) -> None:
+        self.cancelled: list[tuple[str, InteractionCancelReason]] = []
+        self.block = asyncio.Event()
+        self.block.set()
+
+    async def handle(self, request: Any) -> Any:
+        await self.block.wait()
+        return UserInputResponse(request_id=request.request_id, status=InteractionResponseStatus.COMPLETED, content="teal")
+
+    async def cancel(self, request_id: str, *, reason: InteractionCancelReason = InteractionCancelReason.PROVIDER_WITHDREW) -> None:
+        self.cancelled.append((request_id, reason))
+        self.block.set()
+
+
+def _context(**overrides: Any) -> HarnessContext:
+    values: dict[str, Any] = {
+        "agent_name": "worker",
+        "agent_id": "agent-1",
+        "host_session_id": "host-1",
+        "system_prompt": "",
+    }
+    values.update(overrides)
+    return HarnessContext(**values)
+
+
+async def _collect_turn(harness: HarnessProtocol, turn_id: str) -> list[HarnessEvent]:
+    events: list[HarnessEvent] = []
+    async for event in harness.turn_events(turn_id):
+        events.append(event)
+    return events
+
+
+def _terminal(events: list[HarnessEvent]) -> TurnLifecycleEvent:
+    payload = events[-1].event
+    assert isinstance(payload, TurnLifecycleEvent)
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_start_settles_idle_and_publishes_checkpoint() -> None:
+    harness = _ScriptedHarness()
+    sink = _RecordingSink()
+    assert isinstance(harness, HarnessProtocol)
+    await harness.start(_context(checkpoint_sink=sink, host_capabilities=frozenset({HostCapability.CHECKPOINT_SINK})))
+
+    assert harness.state is HarnessState.IDLE
+    assert harness.provider_session_id == "scripted-session"
+    checkpoint = await harness.export_checkpoint()
+    assert checkpoint is not None and checkpoint.sequence == 1
+    assert [reason for _, reason in sink.saved] == [CheckpointReason.SESSION_ACTIVATED]
+    await harness.stop()
+    assert harness.state is HarnessState.TERMINATED
+    await harness.stop()
+    assert harness.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_turns_are_serialized_with_follow_up_receipts() -> None:
+    harness = _ScriptedHarness()
+    await harness.start(_context())
+    first = await harness.send(HarnessInput(content="one"))
+    second = await harness.send(HarnessInput(content="two"))
+    assert first.accepted_mode is DeliveryMode.AUTO
+    assert second.accepted_mode is DeliveryMode.FOLLOW_UP
+
+    first_events = await _collect_turn(harness, first.turn_id)
+    second_events = await _collect_turn(harness, second.turn_id)
+    assert _terminal(first_events).result.final_output == "done:one"
+    assert _terminal(second_events).result.final_output == "done:two"
+    assert [event.sequence for event in first_events] == sorted(event.sequence for event in first_events)
+    logger.info("serialized turn sequences: %s", [event.sequence for event in first_events + second_events])
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_steer_targets_the_active_turn_and_fails_when_idle() -> None:
+    harness = _ScriptedHarness()
+    await harness.start(_context())
+    with pytest.raises(HarnessStateError):
+        await harness.send(HarnessInput(content="early"), mode=DeliveryMode.STEER)
+    harness.release.clear()
+    receipt = await harness.send(HarnessInput(content="task"))
+    await asyncio.sleep(0)
+    steer = await harness.send(HarnessInput(content="also"), mode=DeliveryMode.STEER)
+    assert steer.turn_id == receipt.turn_id
+    assert steer.accepted_mode is DeliveryMode.STEER
+    assert harness.steered == ["also"]
+    # The hook sees the very id the receipt reports, so a provider can label
+    # its outbound message with it.
+    assert harness.steered_message_ids == [steer.message_id]
+    harness.release.set()
+    events = await _collect_turn(harness, receipt.turn_id)
+    assert _terminal(events).kind is TurnEventKind.FINISHED
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_abort_interrupts_and_cancels_pending_interactions() -> None:
+    harness = _ScriptedHarness()
+    handler = _AnsweringHandler()
+    handler.block.clear()
+    harness.ask_user_next = True
+    await harness.start(_context(interactions=handler, host_capabilities=frozenset({HostCapability.USER_INPUT})))
+    harness.release.clear()
+    receipt = await harness.send(HarnessInput(content="task"))
+    await asyncio.sleep(0.01)
+    await harness.abort(mode=AbortMode.GRACEFUL)
+    assert harness.interrupted == [AbortMode.GRACEFUL]
+    assert handler.cancelled == [("ask-1", InteractionCancelReason.TURN_ABORTED)]
+    events = await _collect_turn(harness, receipt.turn_id)
+    assert _terminal(events).kind is TurnEventKind.ABORTED
+    assert harness.state is HarnessState.IDLE
+    with pytest.raises(UnsupportedHarnessCapabilityError):
+        await harness.abort(mode=AbortMode.FORCE)
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_interaction_response_is_validated_and_delivered() -> None:
+    harness = _ScriptedHarness()
+    handler = _AnsweringHandler()
+    harness.ask_user_next = True
+    await harness.start(_context(interactions=handler, host_capabilities=frozenset({HostCapability.USER_INPUT})))
+    receipt = await harness.send(HarnessInput(content="task"))
+    events = await _collect_turn(harness, receipt.turn_id)
+    assert _terminal(events).kind is TurnEventKind.FINISHED
+    assert harness.responses[0].content == "teal"
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_aborts_queued_turns_and_closes_the_stream() -> None:
+    harness = _ScriptedHarness()
+    await harness.start(_context())
+    harness.release.clear()
+    active = await harness.send(HarnessInput(content="active"))
+    queued = await harness.send(HarnessInput(content="queued"))
+    await asyncio.sleep(0.01)
+    cursor = harness.events()
+    await harness.stop()
+    events = [event async for event in cursor]
+    terminals = {
+        event.turn_id: event.event.kind
+        for event in events
+        if isinstance(event.event, TurnLifecycleEvent) and event.event.kind is not TurnEventKind.STARTED
+    }
+    assert terminals == {active.turn_id: TurnEventKind.ABORTED, queued.turn_id: TurnEventKind.ABORTED}
+    assert isinstance(events[-1].event, StateChangedEvent) and events[-1].event.new is HarnessState.TERMINATED
+    with pytest.raises(HarnessStateError):
+        await harness.send(HarnessInput(content="late"))
+
+
+@pytest.mark.asyncio
+async def test_provider_crash_becomes_a_failed_turn() -> None:
+    harness = _ScriptedHarness()
+    await harness.start(_context())
+    harness.crash_next = True
+    receipt = await harness.send(HarnessInput(content="task"))
+    events = await _collect_turn(harness, receipt.turn_id)
+    terminal = _terminal(events)
+    assert terminal.kind is TurnEventKind.FAILED
+    assert terminal.result.error is not None and terminal.result.error.code == "RuntimeError"
+    assert harness.state is HarnessState.IDLE
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_single_consumer_lease_is_enforced() -> None:
+    harness = _ScriptedHarness()
+    await harness.start(_context())
+    cursor = harness.events()
+    with pytest.raises(HarnessStateError):
+        harness.events()
+    await cursor.aclose()
+    harness.events()
+    await harness.stop()
+
+
+class _SelectableHarness(_ScriptedHarness):
+    """Scripted provider that also declares model discovery and selection."""
+
+    card = HarnessCard(
+        name="selectable",
+        implementation_version="1.0",
+        protocol_version=PROTOCOL_VERSION,
+        capabilities=frozenset(
+            {HarnessCapability.STEER, HarnessCapability.MODEL_SELECTION, HarnessCapability.MODEL_DISCOVERY}
+        ),
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.applied: list[ModelSelection] = []
+        self.applied_before_turn: list[int] = []
+        self.fail_selection = False
+
+    async def _list_models(self) -> tuple[ModelOption, ...]:
+        return (ModelOption(model_id="small", efforts=("low", "high"), default_effort="low"),)
+
+    async def _apply_model_selection(self, selection: ModelSelection) -> None:
+        if self.fail_selection:
+            raise RuntimeError("switch refused")
+        self.applied.append(selection)
+
+    async def _execute_turn(self, turn: PendingTurn) -> tuple[TurnEventKind, TurnResult]:
+        self.applied_before_turn.append(len(self.applied))
+        return await super()._execute_turn(turn)
+
+
+def test_merge_model_selection_keeps_fields_the_update_leaves_unset() -> None:
+    merged = merge_model_selection(ModelSelection(model="a", effort="low"), ModelSelection(effort="high"))
+    assert merged == ModelSelection(model="a", effort="high")
+    assert merge_model_selection(None, ModelSelection(model="b")) == ModelSelection(model="b")
+
+
+@pytest.mark.asyncio
+async def test_model_control_requires_declared_capabilities() -> None:
+    harness = _ScriptedHarness()
+    await harness.start(_context())
+    with pytest.raises(UnsupportedHarnessCapabilityError):
+        await harness.list_models()
+    with pytest.raises(UnsupportedHarnessCapabilityError):
+        await harness.set_model(ModelSelection(model="x"))
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_idle_selection_applies_immediately_and_stopped_harness_rejects_it() -> None:
+    harness = _SelectableHarness()
+    assert isinstance(harness, HarnessModelControl)
+    with pytest.raises(HarnessStateError):
+        await harness.set_model(ModelSelection(model="small"))
+    assert [option.model_id for option in await harness.list_models()] == ["small"]
+
+    await harness.start(_context())
+    await harness.set_model(ModelSelection(model="small", effort="low"))
+    assert harness.applied == [ModelSelection(model="small", effort="low")]
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_selection_during_a_turn_is_merged_and_applied_before_the_next_turn() -> None:
+    harness = _SelectableHarness()
+    await harness.start(_context())
+    harness.release.clear()
+    first = await harness.send(HarnessInput(content="one"))
+    await asyncio.sleep(0)
+    await harness.set_model(ModelSelection(model="small"))
+    await harness.set_model(ModelSelection(effort="high"))
+    assert harness.applied == [], "a running turn keeps its model"
+    second = await harness.send(HarnessInput(content="two"))
+    harness.release.set()
+
+    await _collect_turn(harness, first.turn_id)
+    await _collect_turn(harness, second.turn_id)
+    assert harness.applied == [ModelSelection(model="small", effort="high")]
+    assert harness.applied_before_turn == [0, 1]
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_idle_selection_supersedes_one_left_pending_by_a_finished_turn() -> None:
+    harness = _SelectableHarness()
+    await harness.start(_context())
+    harness.release.clear()
+    first = await harness.send(HarnessInput(content="one"))
+    await asyncio.sleep(0)
+    await harness.set_model(ModelSelection(model="small", effort="low"))
+    harness.release.set()
+    await _collect_turn(harness, first.turn_id)
+
+    await harness.set_model(ModelSelection(effort="high"))
+    assert harness.applied == [ModelSelection(model="small", effort="high")]
+    second = await harness.send(HarnessInput(content="two"))
+    await _collect_turn(harness, second.turn_id)
+    assert harness.applied == [ModelSelection(model="small", effort="high")], "no stale re-apply"
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_deferred_selection_warns_and_keeps_the_turn_running() -> None:
+    harness = _SelectableHarness()
+    await harness.start(_context())
+    harness.release.clear()
+    first = await harness.send(HarnessInput(content="one"))
+    await asyncio.sleep(0)
+    harness.fail_selection = True
+    await harness.set_model(ModelSelection(model="small"))
+    second = await harness.send(HarnessInput(content="two"))
+    harness.release.set()
+
+    await _collect_turn(harness, first.turn_id)
+    events = await _collect_turn(harness, second.turn_id)
+    warnings = [event.event for event in events if isinstance(event.event, DiagnosticEvent)]
+    assert len(warnings) == 1 and warnings[0].level is DiagnosticLevel.WARNING
+    assert warnings[0].data["model"] == "small"
+    assert _terminal(events).kind is TurnEventKind.FINISHED
+    logger.info("deferred selection warning: %s", warnings[0].message)
+    await harness.stop()
+
+
+class _FallbackHarness(SerializedTurnHarness):
+    """Provider whose login fails authentication until it moves to the fallback."""
+
+    card = HarnessCard(
+        name="fallbacking",
+        implementation_version="1.0",
+        protocol_version=PROTOCOL_VERSION,
+        capabilities=frozenset({HarnessCapability.AUTH_FALLBACK}),
+    )
+
+    def __init__(self, *, reconnect_fails: bool = False) -> None:
+        super().__init__(event_buffer_capacity=64)
+        self.on_fallback = False
+        self.reconnects: list[bool] = []
+        self.changes: list[bool] = []
+        self.reconnect_fails = reconnect_fails
+        self.executions = 0
+
+    async def _open_session(self, context: HarnessContext) -> str | None:
+        _ = context
+        return "fallback-session"
+
+    async def _close_session(self) -> None:
+        return None
+
+    async def _execute_turn(self, turn: PendingTurn) -> tuple[TurnEventKind, TurnResult]:
+        _ = turn
+        self.executions += 1
+        if self.on_fallback:
+            return TurnEventKind.FINISHED, TurnResult(status=TurnStatus.COMPLETED, final_output="fallback ok")
+        error = TurnError(message="401", code="401", category="auth_required")
+        return TurnEventKind.FAILED, TurnResult(status=TurnStatus.FAILED, error=error)
+
+    def _auth_fallback_payload(self) -> dict[str, Any]:
+        return {"model": "pool-model", "api_base": "https://pool"}
+
+    async def _reconnect_for_auth(self, *, fallback: bool) -> None:
+        self.reconnects.append(fallback)
+        if self.reconnect_fails:
+            raise RuntimeError("endpoint unreachable")
+        self.on_fallback = fallback
+
+    async def _on_auth_endpoint_changed(self, *, fallback: bool) -> None:
+        self.changes.append(fallback)
+
+
+class _Ratifier:
+    def __init__(self, status: InteractionResponseStatus) -> None:
+        self.status = status
+        self.requests: list[Any] = []
+
+    async def handle(self, request: Any) -> Any:
+        self.requests.append(request)
+        return ProviderInteractionResponse(request_id=request.request_id, status=self.status)
+
+    async def cancel(
+        self,
+        request_id: str,
+        *,
+        reason: InteractionCancelReason = InteractionCancelReason.PROVIDER_WITHDREW,
+    ) -> None:
+        _ = request_id, reason
+
+
+async def _fallback_turn(
+    harness: _FallbackHarness,
+    status: InteractionResponseStatus,
+) -> tuple[_Ratifier, list[HarnessEvent]]:
+    ratifier = _Ratifier(status)
+    await harness.start(
+        _context(interactions=ratifier, host_capabilities=frozenset({HostCapability.PROVIDER_INTERACTION}))
+    )
+    receipt = await harness.send(HarnessInput(content="hi"))
+    return ratifier, await _collect_turn(harness, receipt.turn_id)
+
+
+@pytest.mark.asyncio
+async def test_auth_failure_switches_once_to_the_ratified_fallback_and_replays() -> None:
+    harness = _FallbackHarness()
+    ratifier, events = await _fallback_turn(harness, InteractionResponseStatus.COMPLETED)
+
+    assert _terminal(events).result.final_output == "fallback ok"
+    assert harness.fallback_activated
+    assert (harness.reconnects, harness.changes, harness.executions) == ([True], [True], 2)
+    assert [request.request_type for request in ratifier.requests] == [AUTH_FALLBACK_REQUEST_TYPE]
+    activations = [event.event for event in events if isinstance(event.event, ProviderEvent)]
+    assert [(event.event_type, dict(event.payload)) for event in activations] == [
+        (AUTH_FALLBACK_EVENT_TYPE, {"model": "pool-model", "api_base": "https://pool"})
+    ]
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_declined_fallback_restores_the_primary_and_keeps_the_failure() -> None:
+    harness = _FallbackHarness()
+    _, events = await _fallback_turn(harness, InteractionResponseStatus.DECLINED)
+
+    assert _terminal(events).result.error.category == "auth_required"
+    assert not harness.fallback_activated
+    assert (harness.reconnects, harness.changes, harness.executions) == ([True, False], [False], 1)
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_fallback_switch_is_tried_once_per_turn() -> None:
+    harness = _FallbackHarness(reconnect_fails=True)
+    ratifier, events = await _fallback_turn(harness, InteractionResponseStatus.COMPLETED)
+
+    assert _terminal(events).result.error.category == "auth_required"
+    assert harness.reconnects == [True]
+    assert ratifier.requests == []
+    # The next turn may try again: the login might still fail and the endpoint recover.
+    receipt = await harness.send(HarnessInput(content="again"))
+    await _collect_turn(harness, receipt.turn_id)
+    assert harness.reconnects == [True, True]
+    await harness.stop()
+
+
+class _BrokenRatifier:
+    """Host whose ratification raises or answers out of protocol."""
+
+    def __init__(self, *, mismatched: bool) -> None:
+        self.mismatched = mismatched
+
+    async def handle(self, request: Any) -> Any:
+        if self.mismatched:
+            return ProviderInteractionResponse(request_id="someone-else", status=InteractionResponseStatus.COMPLETED)
+        raise RuntimeError("promotion store unavailable")
+
+    async def cancel(
+        self,
+        request_id: str,
+        *,
+        reason: InteractionCancelReason = InteractionCancelReason.PROVIDER_WITHDREW,
+    ) -> None:
+        _ = request_id, reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatched", [False, True])
+async def test_broken_ratification_restores_the_primary_and_ends_the_turn(mismatched: bool) -> None:
+    harness = _FallbackHarness()
+    await harness.start(
+        _context(
+            interactions=_BrokenRatifier(mismatched=mismatched),
+            host_capabilities=frozenset({HostCapability.PROVIDER_INTERACTION}),
+        )
+    )
+    receipt = await harness.send(HarnessInput(content="hi"))
+    events = await asyncio.wait_for(_collect_turn(harness, receipt.turn_id), 5)
+
+    assert _terminal(events).result.error.category == "auth_required"
+    assert not harness.fallback_activated
+    assert harness.reconnects == [True, False], "the unratified fallback is left for the primary"
+    assert harness.state is HarnessState.IDLE
+    assert harness.active_turn is None
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_fallback_bookkeeping_still_replays_the_ratified_turn() -> None:
+    harness = _FallbackHarness()
+
+    async def broken_change(*, fallback: bool) -> None:
+        _ = fallback
+        raise RuntimeError("checkpoint store unavailable")
+
+    harness._on_auth_endpoint_changed = broken_change
+    _, events = await _fallback_turn(harness, InteractionResponseStatus.COMPLETED)
+
+    assert _terminal(events).result.final_output == "fallback ok", "the host already persisted the switch"
+    assert harness.fallback_activated
+    assert any(isinstance(event.event, ProviderEvent) for event in events)
+    assert harness.state is HarnessState.IDLE
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_breaking_fallback_hook_still_ends_the_turn() -> None:
+    harness = _FallbackHarness()
+
+    def broken_payload() -> dict[str, Any]:
+        raise RuntimeError("payload unavailable")
+
+    harness._auth_fallback_payload = broken_payload
+    _, events = await _fallback_turn(harness, InteractionResponseStatus.COMPLETED)
+
+    assert _terminal(events).kind is TurnEventKind.FAILED
+    assert harness.state is HarnessState.IDLE
+    await harness.stop()

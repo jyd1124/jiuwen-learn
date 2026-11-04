@@ -1,0 +1,988 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Launch a third-party CLI as a subprocess and wrap it in a runtime.
+
+Builds the team-join descriptor from the member's runtime context, launches
+the CLI with that descriptor in its environment (so a team-member MCP server
+the CLI spawns inherits it), and returns a CLI member runtime.
+
+An external CLI member runs in a separate process. Its MCP server writes the
+shared file-backed sqlite database directly and publishes runtime events via
+either the configured team messenger or a Gateway WebSocket relay.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import uuid
+from typing import Any, AsyncIterator, Awaitable, Callable
+
+from openjiuwen.agent_teams.context import get_session_id
+from openjiuwen.agent_teams.external.cli_agent import TEAM_MCP_SERVER_NAME
+from openjiuwen.agent_teams.external.cli_agent.adapters import CliAgentAdapter, build_adapter
+from openjiuwen.agent_teams.external.cli_agent.backends import _SDK_BACKENDS, backend_for
+from openjiuwen.agent_teams.external.cli_agent.injector import StdinPipeInjector
+from openjiuwen.agent_teams.external.cli_agent.transport.base import StreamReaderLike
+from openjiuwen.agent_teams.external.cli_agent.transport.local import LocalTransport
+from openjiuwen.agent_teams.external.descriptor import MCP_SERVER_ENV_VARS, OPENJIUWEN_HOME_ENV, TeamJoinDescriptor
+from openjiuwen.agent_teams.external.member_runtime import ExternalHarnessMemberRuntime
+from openjiuwen.agent_teams.external.runtime import CliRuntimeBase, ExternalCliRuntime, ReinvokeCliRuntime
+from openjiuwen.agent_teams.messager.base import MessagerTransportConfig
+from openjiuwen.agent_teams.paths import get_openjiuwen_home, team_workspace_dir
+from openjiuwen.agent_teams.schema.ssh_transport import SshTransportConfig
+from openjiuwen.agent_teams.schema.team import ExternalCliAgentSpec, ExternalCliModelConfig, TeamRuntimeContext
+from openjiuwen.agent_teams.team_workspace.models import TeamWorkspaceConfig
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import raise_error
+from openjiuwen.core.common.logging import team_logger
+from openjiuwen.harness_protocol import (
+    HarnessCapability,
+    HarnessContext,
+    McpServerConfig,
+    McpTransport,
+    ModelChoice,
+    ModelEndpoint,
+)
+from openjiuwen.harness_providers.skills import normalize_skills
+from openjiuwen.harness_providers.claudecode import (
+    DEFAULT_CLAUDE_MAX_BUFFER_SIZE,
+    ClaudeCodeHarness,
+    ClaudeCodeHarnessConfig,
+    ClaudeModelConfig,
+)
+from openjiuwen.harness_providers.claudecode.options import strip_parent_claude_env
+from openjiuwen.harness_providers.codex import CodexHarness, CodexHarnessConfig, CodexModelConfig
+from openjiuwen.harness_providers.factory import provider_model_config, resolve_provider
+from openjiuwen.harness_providers.skills import SkillSource
+
+MemberRuntimeLike = CliRuntimeBase | ExternalHarnessMemberRuntime
+
+
+def _with_home_env(env: dict[str, str]) -> dict[str, str]:
+    """Ensure the runtime home travels into the CLI subprocess.
+
+    The host platform configures the home via ``configure_openjiuwen_home``
+    (a process-global module variable), which does not cross process
+    boundaries. A spawned CLI (and the MCP server it in turn spawns) would
+    otherwise resolve the default ``~/.openjiuwen`` and miss session spill
+    files written under the configured root. Propagate the resolved home as
+    ``OPENJIUWEN_HOME`` so :func:`get_openjiuwen_home` (env fallback) and
+    Codex's ``mcp_servers.<key>.env_vars`` allow-list (which carries it one
+    hop further into the MCP server) keep the paths aligned.
+    """
+    env.setdefault(OPENJIUWEN_HOME_ENV, str(get_openjiuwen_home()))
+    return env
+
+
+def descriptor_from_context(ctx: TeamRuntimeContext) -> TeamJoinDescriptor:
+    """Build a join descriptor an external CLI member uses to reach the team."""
+    member_name = ctx.member_name
+    if not member_name:
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason="external CLI member requires a member_name in its runtime context",
+        )
+    team_spec = ctx.team_spec
+    if team_spec is None or not team_spec.team_name:
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason="external CLI member requires a team spec with team_name",
+        )
+    team_name = team_spec.team_name
+    language = team_spec.language or "cn"
+    dispatch_mode = team_spec.dispatch_mode or "autonomous"
+    teammate_mode = team_spec.teammate_mode or "build_mode"
+    session_id = get_session_id()
+    if not session_id:
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason="external CLI member requires an active team session_id",
+        )
+    transport = team_spec.external_messager_config or ctx.messager_config or MessagerTransportConfig()
+    transport_updates = {"team_name": team_name, "node_id": member_name}
+    if transport.backend == "pyzmq" and transport.direct_addr:
+        transport_updates["direct_addr"] = "tcp://127.0.0.1:*"
+    transport = transport.model_copy(update=transport_updates)
+
+    workspace_config = None
+    if team_spec.workspace:
+        candidate_workspace = TeamWorkspaceConfig.model_validate(team_spec.workspace)
+        if candidate_workspace.enabled:
+            workspace_config = candidate_workspace
+    workspace_path = None
+    if workspace_config is not None:
+        workspace_path = workspace_config.root_path or str(team_workspace_dir(team_name))
+
+    return TeamJoinDescriptor(
+        session_id=session_id,
+        team_name=team_name,
+        member_name=member_name,
+        role=ctx.role.value,
+        # A spawned third-party CLI is a first-class team member, not an
+        # external operator: it gets the native teammate tool set and its
+        # team system prompt is injected here at spawn time.
+        scope="member",
+        language=language,
+        # Tool assembly and system-prompt rendering are separate chains.
+        # They must resolve against the same mode axes or the member gets a
+        # prompt describing tools it does not have.
+        dispatch_mode=dispatch_mode,
+        enable_member_messaging=team_spec.enable_member_messaging,
+        max_subtask_depth=team_spec.max_subtask_depth,
+        teammate_mode=teammate_mode,
+        db_config=ctx.db_config,
+        transport_config=transport,
+        workspace_config=workspace_config,
+        workspace_path=workspace_path,
+    )
+
+
+async def _aiter_stdout(stream: StreamReaderLike) -> AsyncIterator[str]:
+    """Yield decoded, newline-stripped stdout lines until the stream ends."""
+    while True:
+        raw = await stream.readline()
+        if not raw:
+            return
+        yield raw.decode("utf-8", errors="replace").rstrip("\n")
+
+
+async def _register_mcp_out_of_band(
+    adapter: CliAgentAdapter,
+    *,
+    server_name: str,
+    server_command: tuple[str, ...],
+    env: dict[str, str],
+    cwd: str | None,
+    member_name: str,
+) -> None:
+    """Register the team MCP server with a CLI that has no launch-inject flag.
+
+    Some CLIs (gemini, hermes) register MCP servers via a subcommand that
+    persists to their own config rather than a launch flag. Runs that command
+    once (best-effort) so the member still gets team tools. When the adapter
+    has no registration mechanism either, logs a loud warning instead of
+    silently leaving the member without team tools.
+    """
+    register_cmd = adapter.mcp_register_command(server_name=server_name, server_command=server_command)
+    if register_cmd is None:
+        team_logger.warning(
+            "[external-cli] {} cannot auto-inject the team MCP server (no launch flag or "
+            "registration command); member {} will lack team tools unless registered out of band",
+            adapter.name,
+            member_name,
+        )
+        return
+    team_logger.info("[external-cli] registering team MCP for member {} via {}", member_name, register_cmd)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *register_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            cwd=cwd,
+        )
+        _, stderr = await proc.communicate()
+    except (OSError, ValueError) as exc:
+        team_logger.warning("[external-cli] team MCP registration for {} failed to launch: {}", adapter.name, exc)
+        return
+    if proc.returncode != 0:
+        tail = stderr.decode("utf-8", errors="replace")[-500:]
+        team_logger.warning(
+            "[external-cli] team MCP registration for {} exited {}: {}",
+            adapter.name,
+            proc.returncode,
+            tail,
+        )
+
+
+async def build_cli_runtime(
+    ctx: TeamRuntimeContext,
+    *,
+    cwd: str | None = None,
+    add_dirs: tuple[str, ...] = (),
+    command_override: tuple[str, ...] | None = None,
+    cli_path: str | None = None,
+    codex_bin: str | None = None,
+    inject_mcp: bool = True,
+    mcp_server_name: str = TEAM_MCP_SERVER_NAME,
+    mcp_server_command: tuple[str, ...] = ("openjiuwen-team-mcp",),
+    mcp_default_tools_approval_mode: str | None = None,
+    codex_bypass_approvals_and_sandbox: bool = True,
+    codex_turn_idle_timeout_s: float | None = None,
+    codex_turn_idle_retries: int | None = None,
+    claude_turn_idle_timeout_s: float | None = None,
+    claude_max_buffer_size: int | None = None,
+    external_model_config: ExternalCliModelConfig | None = None,
+    fallback_external_model_config: ExternalCliModelConfig | None = None,
+    promote_fallback_model: Callable[[], Awaitable[bool]] | None = None,
+    system_prompt: str | None = None,
+    system_prompt_mode: str | None = None,
+    skills: tuple[SkillSource, ...] = (),
+    skill_conflict: str = "skip",
+    extra_env: dict[str, str] | None = None,
+    ssh_transport: SshTransportConfig | None = None,
+    resume_external_backend: bool = False,
+    member_agent_id: str | None = None,
+    team_context_tracker: Any = None,
+) -> MemberRuntimeLike:
+    """Build the member runtime for ``ctx.cli_agent``.
+
+    Claude and Codex are handled by their dedicated SDK backends. Other CLI agents are
+    picked by the adapter's ``supports_stdin_injection``: streaming CLIs launch
+    one long-lived subprocess and return an :class:`ExternalCliRuntime`;
+    one-shot CLIs (openclaw / hermes) return a :class:`ReinvokeCliRuntime` that
+    launches a fresh subprocess per turn. The returned runtime owns its
+    subprocess(es); ``aclose`` tears down.
+
+    Args:
+        ctx: Member runtime context; ``ctx.cli_agent`` names the backend.
+        cwd: Working directory for the subprocess(es).
+        add_dirs: Extra directories exposed to SDK backends that support them.
+        command_override: Optional full launch argv (e.g. an absolute path).
+            Adapter backends only; Codex accepts ``codex_bin`` instead.
+        cli_path: Optional executable path for SDK-backed CLIs. Claude passes
+            this to ``ClaudeAgentOptions.cli_path``; Codex maps it to
+            ``CodexConfig.codex_bin``.
+        codex_bin: Optional Codex executable path. The SDK constructs all
+            app-server arguments around this binary.
+        inject_mcp: When True (default), configure the backend to register the
+            team MCP server so the CLI gets the team collaboration tools.
+            Adapter-backed CLIs without an injection strategy ignore this.
+            Only the streaming adapter path injects at launch; one-shot CLIs
+            register their MCP server out of band.
+        mcp_server_name: Logical name the CLI registers the MCP server under.
+        mcp_server_command: Launch argv for the team MCP stdio server.
+        mcp_default_tools_approval_mode: Optional Codex-only approval policy
+            scoped to tools from the injected team MCP server.
+        codex_bypass_approvals_and_sandbox: Codex-only switch that disables
+            approval prompts and the SDK sandbox by default. Set to ``False``
+            to restore Codex approval and sandbox handling.
+        codex_turn_idle_timeout_s: Optional Codex-only inactivity ceiling for
+            one SDK turn. Every received SDK notification refreshes it.
+        codex_turn_idle_retries: Optional number of same-thread retries when a
+            stalled turn emitted no SDK notifications and was interrupted.
+        claude_turn_idle_timeout_s: Optional Claude-only inactivity ceiling for
+            one SDK turn. Every received SDK message refreshes it.
+        claude_max_buffer_size: Optional Claude-only per-line stdout buffer
+            ceiling (bytes) for the SDK transport. ``None`` keeps the
+            :class:`ClaudeCodeHarnessConfig` default.
+        external_model_config: Optional model endpoint config translated into
+            backend-specific SDK options.
+        fallback_external_model_config: Optional endpoint used only after an
+            explicit native authentication failure.
+        promote_fallback_model: Callback persisting the fallback as active.
+        skills: Skill bundles copied into the local CLI project before startup.
+        skill_conflict: Skip or replace an existing project skill with the same name.
+        system_prompt_mode: Claude/Codex append or replace policy; None uses the provider default.
+        system_prompt: The member's team-rail system prompt. Claude receives it
+            through SDK options, Codex through SDK thread options, and other CLIs
+            may receive it as a launch arg.
+            CLIs without a flag get it prepended to their first user message by
+            the caller, so it is ignored here for them.
+        extra_env: Extra environment merged over the inherited env + the
+            team-join descriptor (descriptor wins is not desired, so this is
+            applied last only for non-descriptor keys).
+        ssh_transport: Optional ssh endpoint config. Currently supported only
+            by the Claude SDK backend.
+        resume_external_backend: When True, resume the derived backend session
+            instead of starting it as a fresh session.
+        member_agent_id: Stable TeamAgent card id used to address this
+            external member's own AgentSession checkpoint.
+        team_context_tracker: Tracker deciding which team state this member has
+            not been told about yet; the runtime folds its output into the next
+            message it sends to the CLI. ``None`` disables team-state delivery.
+    """
+    if not ctx.cli_agent:
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason="build_cli_runtime called without ctx.cli_agent set",
+        )
+    descriptor = descriptor_from_context(ctx)
+    if not descriptor.session_id:
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason="external CLI runtime requires session_id in context",
+        )
+    if ctx.cli_agent == "claude":
+        if codex_bin is not None:
+            raise_error(
+                StatusCode.AGENT_TEAM_CONFIG_INVALID,
+                reason="codex_bin is only supported for Codex SDK members",
+            )
+        if command_override is not None:
+            raise_error(
+                StatusCode.AGENT_TEAM_CONFIG_INVALID,
+                reason="Claude SDK members do not support command_override; configure cli_path instead",
+            )
+        if codex_turn_idle_timeout_s is not None:
+            raise_error(
+                StatusCode.AGENT_TEAM_CONFIG_INVALID,
+                reason="codex_turn_idle_timeout_s is only supported for Codex SDK members",
+            )
+        if codex_turn_idle_retries is not None:
+            raise_error(
+                StatusCode.AGENT_TEAM_CONFIG_INVALID,
+                reason="codex_turn_idle_retries is only supported for Codex SDK members",
+            )
+        return await _build_claude_member_runtime(
+            ctx,
+            descriptor,
+            cwd=cwd,
+            add_dirs=add_dirs,
+            cli_path=cli_path,
+            inject_mcp=inject_mcp,
+            mcp_server_name=mcp_server_name,
+            max_buffer_size=claude_max_buffer_size,
+            external_model_config=external_model_config,
+            fallback_external_model_config=fallback_external_model_config,
+            promote_fallback_model=promote_fallback_model,
+            system_prompt=system_prompt,
+            system_prompt_mode=system_prompt_mode,
+            skills=skills,
+            skill_conflict=skill_conflict,
+            extra_env=extra_env,
+            ssh_transport=ssh_transport,
+            resume_external_backend=resume_external_backend,
+            member_agent_id=member_agent_id,
+            team_context_tracker=team_context_tracker,
+        )
+    if ctx.cli_agent == "codex":
+        if command_override is not None:
+            raise_error(
+                StatusCode.AGENT_TEAM_CONFIG_INVALID,
+                reason="Codex SDK members do not support command_override; configure cli_path instead",
+            )
+        if claude_turn_idle_timeout_s is not None:
+            raise_error(
+                StatusCode.AGENT_TEAM_CONFIG_INVALID,
+                reason="claude_turn_idle_timeout_s is only supported for Claude SDK members",
+            )
+        if claude_max_buffer_size is not None:
+            raise_error(
+                StatusCode.AGENT_TEAM_CONFIG_INVALID,
+                reason="claude_max_buffer_size is only supported for Claude SDK members",
+            )
+        if ssh_transport is not None:
+            raise_error(
+                StatusCode.AGENT_TEAM_CONFIG_INVALID,
+                reason="ssh transport is not yet supported for Codex SDK members",
+            )
+        if not member_agent_id:
+            raise_error(
+                StatusCode.AGENT_TEAM_CONFIG_INVALID,
+                reason=f"Codex SDK member '{ctx.member_name}' requires a stable member_agent_id",
+            )
+        if add_dirs:
+            team_logger.debug(
+                "[external-cli] codex member {} uses cwd {}; extra add_dirs are not supported by the Codex SDK",
+                ctx.member_name,
+                cwd,
+            )
+        return await _build_codex_member_runtime(
+            ctx,
+            descriptor,
+            cwd=cwd,
+            codex_bin=cli_path or codex_bin,
+            inject_mcp=inject_mcp,
+            mcp_default_tools_approval_mode=mcp_default_tools_approval_mode,
+            bypass_approvals_and_sandbox=codex_bypass_approvals_and_sandbox,
+            turn_idle_timeout_s=codex_turn_idle_timeout_s,
+            turn_idle_retries=codex_turn_idle_retries,
+            external_model_config=external_model_config,
+            fallback_external_model_config=fallback_external_model_config,
+            promote_fallback_model=promote_fallback_model,
+            system_prompt=system_prompt,
+            system_prompt_mode=system_prompt_mode,
+            skills=skills,
+            skill_conflict=skill_conflict,
+            extra_env=extra_env,
+            resume_external_backend=resume_external_backend,
+            member_agent_id=member_agent_id,
+            team_context_tracker=team_context_tracker,
+        )
+    backend = backend_for(ctx.cli_agent)
+    if backend is not None and backend.kind == "provider":
+        unsupported = {
+            "command_override": command_override,
+            "codex_bin": codex_bin,
+            "ssh_transport": ssh_transport,
+            "claude_turn_idle_timeout_s": claude_turn_idle_timeout_s,
+            "claude_max_buffer_size": claude_max_buffer_size,
+            "codex_turn_idle_timeout_s": codex_turn_idle_timeout_s,
+            "codex_turn_idle_retries": codex_turn_idle_retries,
+        }
+        configured = sorted(name for name, value in unsupported.items() if value is not None)
+        if configured:
+            raise_error(
+                StatusCode.AGENT_TEAM_CONFIG_INVALID,
+                reason=f"harness provider member '{ctx.cli_agent}' does not support: {', '.join(configured)}",
+            )
+        return _build_provider_member_runtime(
+            ctx,
+            descriptor,
+            cwd=cwd,
+            cli_path=cli_path,
+            inject_mcp=inject_mcp,
+            mcp_server_name=mcp_server_name,
+            mcp_server_command=mcp_server_command,
+            external_model_config=external_model_config,
+            fallback_external_model_config=fallback_external_model_config,
+            promote_fallback_model=promote_fallback_model,
+            system_prompt=system_prompt,
+            system_prompt_mode=system_prompt_mode,
+            skills=skills,
+            skill_conflict=skill_conflict,
+            extra_env=extra_env,
+            resume_external_backend=resume_external_backend,
+            member_agent_id=member_agent_id,
+            team_context_tracker=team_context_tracker,
+        )
+    if ssh_transport is not None:
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason="ssh transport is only supported for claude SDK external CLI members",
+        )
+    if codex_bin is not None:
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason="codex_bin is only supported for Codex SDK members",
+        )
+    if cli_path is not None:
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason="cli_path is only supported for Claude and Codex SDK members",
+        )
+    if claude_turn_idle_timeout_s is not None:
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason="claude_turn_idle_timeout_s is only supported for Claude SDK members",
+        )
+    if claude_max_buffer_size is not None:
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason="claude_max_buffer_size is only supported for Claude SDK members",
+        )
+
+    adapter: CliAgentAdapter = build_adapter(ctx.cli_agent, command_override=command_override)
+    # Start from the inherited environment minus any parent agent-session
+    # markers declared by the adapter. The descriptor env is authoritative for
+    # team identity, so it is applied last — a misconfigured extra_env cannot
+    # shadow the join.
+    base_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not any(key.startswith(prefix) for prefix in adapter.env_strip_prefixes)
+    }
+    env = _with_home_env({**base_env, **(extra_env or {}), **descriptor.to_env()})
+
+    # System prompt as a launch arg. CLIs without a flag return [] here and get
+    # the prompt prepended to their first user message by the caller instead.
+    sp_args = tuple(adapter.system_prompt_args(system_prompt or ""))
+
+    mcp_args: tuple[str, ...] = ()
+    if inject_mcp:
+        mcp_args = tuple(adapter.mcp_launch_args(server_name=mcp_server_name, server_command=mcp_server_command))
+        if not mcp_args:
+            # No launch-injection flag for this CLI: register the team MCP
+            # server out of band (e.g. `gemini mcp add`) so the member still
+            # gets team tools, or warn loudly when nothing can register it.
+            await _register_mcp_out_of_band(
+                adapter,
+                server_name=mcp_server_name,
+                server_command=mcp_server_command,
+                env=env,
+                cwd=cwd,
+                member_name=ctx.member_name or "",
+            )
+
+    launch_extra_args = mcp_args + sp_args
+
+    if not adapter.supports_stdin_injection:
+        # One-shot CLI: no eager launch; the runtime spawns per turn and adds
+        # the MCP-registration args to each invocation. A canonical UUID is the
+        # member's stable session id across turns (CLIs that resume by id, e.g.
+        # gemini ``--session-id`` / ``--resume``, require a real UUID).
+        return ReinvokeCliRuntime(
+            member_name=ctx.member_name or "",
+            adapter=adapter,
+            env=env,
+            cwd=cwd,
+            cli_session_id=str(uuid.uuid4()),
+            launch_extra_args=launch_extra_args,
+            member_agent_id=member_agent_id,
+            team_context_tracker=team_context_tracker,
+        )
+
+    command = adapter.build_command(extra_args=launch_extra_args)
+    team_logger.info("[external-cli] launching {} for member {}", command, ctx.member_name)
+    transport = LocalTransport()
+    process = await transport.run(tuple(command), env=env, cwd=cwd)
+    if process.stdin is None or process.stdout is None:
+        raise_error(
+            StatusCode.AGENT_TEAM_EXECUTION_ERROR,
+            error_msg=f"external CLI '{ctx.cli_agent}' did not expose stdin/stdout pipes",
+        )
+
+    return ExternalCliRuntime(
+        member_name=ctx.member_name or "",
+        adapter=adapter,
+        injector=StdinPipeInjector(process.stdin),
+        output_lines=_aiter_stdout(process.stdout),
+        process=process,
+        transport=transport,
+        member_agent_id=member_agent_id,
+        team_context_tracker=team_context_tracker,
+    )
+
+
+async def build_cli_workflow_runtime(
+    *,
+    cli_agent: str,
+    entry: "ExternalCliAgentSpec",
+    member_name: str,
+    member_agent_id: str,
+    session_id: str,
+    team_name: str,
+    system_prompt: str,
+    cwd: str | None,
+    model_config: ExternalCliModelConfig | None = None,
+    resume_external_backend: bool = False,
+    require_checkpoint: bool = False,
+    seed_checkpoint: dict | None = None,
+) -> ExternalHarnessMemberRuntime:
+    """Build a Claude Code / Codex runtime for a swarmflow worker or session.
+
+    A workflow member is driven by the script alone: it gets no team-join
+    descriptor in its environment, no team MCP server and no team system
+    prompt — those exist so a teammate can talk back to the team, which a
+    dispatched worker never does. Everything launch-related (cli path, skills,
+    model, env, idle timeouts) still comes from the team's declared entry.
+
+    Args:
+        cli_agent: ``"claude"`` or ``"codex"`` (SDK backends only).
+        entry: The team's ``external_cli_agents`` entry for this kind.
+        member_name: Minted swarmflow member identity.
+        member_agent_id: Stable id for the member's child session (checkpoints).
+        session_id: Host team session id.
+        team_name: Team name (context metadata only).
+        system_prompt: The swarmflow worker / session prompt.
+        cwd: Working directory (worktree when isolated).
+        model_config: Resolved model options for this call; ``None`` leaves the
+            model to the CLI's own default on its own login. Callers resolve
+            the entry's declared config first — there is no entry-level default
+            here.
+        resume_external_backend: Resume the CLI session from the checkpoint pointer.
+        require_checkpoint: With resume, refuse to start when no pointer is stored.
+    """
+    backend = backend_for(cli_agent)
+    if backend is None or backend.kind != "sdk":
+        raise ValueError(
+            f"agent_type {cli_agent!r} is not an SDK backend; workflow members support: "
+            f"{', '.join(sorted(_SDK_BACKENDS))}"
+        )
+    skills = normalize_skills(entry.skills, entry.skill_conflict)
+    context = HarnessContext(
+        agent_name=member_name,
+        agent_id=member_agent_id,
+        host_session_id=session_id,
+        system_prompt=system_prompt,
+        cwd=cwd,
+        metadata={"team_name": team_name, "role": "worker"},
+    )
+    if cli_agent == "claude":
+        env = _claude_process_env(extra_env=entry.env or None, join_env={}, ssh_transport=entry.ssh_transport)
+        config = ClaudeCodeHarnessConfig(
+            skills=skills,
+            skill_conflict=entry.skill_conflict,
+            system_prompt_mode=entry.system_prompt_mode or "append",
+            cwd=cwd,
+            env=env,
+            inherit_process_env=False,
+            cli_path=entry.cli_path,
+            model=ClaudeModelConfig.from_mapping(_member_model_config("claudecode", model_config, None).get("model")),
+            max_buffer_size=entry.claude_max_buffer_size or DEFAULT_CLAUDE_MAX_BUFFER_SIZE,
+        )
+        harness = ClaudeCodeHarness(config)
+        agent_kind, cli_path = "claude", entry.cli_path
+    else:
+        env = _codex_process_env(extra_env=entry.env or None, join_env={})
+        config_kwargs: dict[str, Any] = {
+            "skills": skills,
+            "skill_conflict": entry.skill_conflict,
+            "system_prompt_mode": entry.system_prompt_mode or "replace",
+            "cwd": cwd,
+            "env": env,
+            "inherit_process_env": False,
+            "codex_bin": entry.codex_bin or entry.cli_path,
+            "model": CodexModelConfig.from_mapping(_member_model_config("codex", model_config, None).get("model")),
+            "bypass_approvals_and_sandbox": entry.codex_bypass_approvals_and_sandbox,
+            "client_name": "openjiuwen_swarmflow",
+            "client_title": f"OpenJiuwen Swarmflow Member {member_name}",
+        }
+        if entry.codex_turn_idle_timeout_s is not None:
+            config_kwargs["turn_idle_timeout_s"] = entry.codex_turn_idle_timeout_s
+        if entry.codex_turn_idle_retries is not None:
+            config_kwargs["turn_idle_retries"] = entry.codex_turn_idle_retries
+        # notification_observer stays at its default (no OTel bridge for workflow members)
+        harness = CodexHarness(CodexHarnessConfig(**config_kwargs))
+        agent_kind, cli_path = "codex", entry.codex_bin or entry.cli_path
+    team_logger.info(
+        "[swarmflow] external member {} provider={} cwd={} resume={} require_checkpoint={}",
+        member_name,
+        cli_agent,
+        cwd,
+        resume_external_backend,
+        require_checkpoint,
+    )
+    return ExternalHarnessMemberRuntime(
+        harness=harness,
+        context=context,
+        resume_external_backend=resume_external_backend,
+        require_checkpoint=require_checkpoint,
+        seed_checkpoint=seed_checkpoint,
+        agent_kind=agent_kind,
+        cli_path=cli_path,
+        inject_mcp=False,
+    )
+
+
+def _member_context(
+    ctx: TeamRuntimeContext,
+    descriptor: TeamJoinDescriptor,
+    *,
+    member_agent_id: str | None,
+    system_prompt: str | None,
+    cwd: str | None,
+) -> HarnessContext:
+    """Build the provider-neutral start context for an external SDK member."""
+    member_name = ctx.member_name or ""
+    return HarnessContext(
+        agent_name=member_name,
+        agent_id=member_agent_id or f"{descriptor.team_name}_{member_name}",
+        host_session_id=descriptor.session_id,
+        system_prompt=system_prompt or "",
+        cwd=cwd,
+        metadata={"team_name": descriptor.team_name, "role": ctx.role.value},
+    )
+
+
+def _is_native_endpoint(config: ExternalCliModelConfig | None) -> bool:
+    """Return whether the member runs on the CLI's own login.
+
+    Only such a member takes the auth fallback: one already on an endpoint
+    (pool allocation or static endpoint config) has nothing to fall back from.
+    A built-in model choice carries neither ``api_base`` nor ``provider``.
+    """
+    return config is None or (config.api_base is None and config.provider is None)
+
+
+def model_choice(config: ExternalCliModelConfig | None) -> ModelChoice | None:
+    """Translate the team's model config into the provider-neutral ``ModelChoice``.
+
+    A config with neither ``api_base`` nor ``provider`` names a built-in
+    model (the CLI's own login); otherwise it is served by that endpoint.
+    """
+    if config is None:
+        return None
+    endpoint = None
+    if not _is_native_endpoint(config):
+        endpoint = ModelEndpoint(api_base=config.api_base, api_key=config.api_key, provider=config.provider)
+    return ModelChoice(model=config.model, effort=config.effort, endpoint=endpoint)
+
+
+def _member_model_config(
+    provider_name: str,
+    primary: ExternalCliModelConfig | None,
+    fallback: ExternalCliModelConfig | None,
+) -> dict[str, Any]:
+    """Map a member's model (and authentication fallback) through its provider.
+
+    The fallback only guards a member on the CLI's own login: one already on
+    an endpoint has nothing to fall back from, so it is dropped there.
+
+    Raises:
+        BaseError: ``AGENT_TEAM_CONFIG_INVALID`` when the provider cannot run
+            the model.
+    """
+    choice = model_choice(primary)
+    fallback_choice = model_choice(fallback) if _is_native_endpoint(primary) else None
+    if choice is None and fallback_choice is None:
+        return {}
+    try:
+        mapped = provider_model_config(provider_name, choice or ModelChoice(), fallback=fallback_choice)
+    except ValueError as exc:
+        raise_error(StatusCode.AGENT_TEAM_CONFIG_INVALID, reason=str(exc), cause=exc)
+    if choice is None:
+        # Only the fallback was chosen: the member keeps the CLI's default model.
+        mapped.pop("model", None)
+    return mapped
+
+
+def _claude_process_env(
+    *, extra_env: dict[str, str] | None, join_env: dict[str, str], ssh_transport: SshTransportConfig | None
+) -> dict[str, str]:
+    """Process env for a Claude subprocess; ``join_env`` is empty for workflow members."""
+    base_env = strip_parent_claude_env(dict(os.environ)) if ssh_transport is None else {}
+    return _with_home_env({**base_env, **(extra_env or {}), **join_env})
+
+
+def _codex_process_env(*, extra_env: dict[str, str] | None, join_env: dict[str, str]) -> dict[str, str]:
+    """Process env for a Codex subprocess; ``join_env`` is empty for workflow members."""
+    return _with_home_env({**dict(os.environ), **(extra_env or {}), **join_env})
+
+
+async def _build_claude_member_runtime(
+    ctx: TeamRuntimeContext,
+    descriptor: TeamJoinDescriptor,
+    *,
+    cwd: str | None,
+    add_dirs: tuple[str, ...],
+    cli_path: str | None,
+    inject_mcp: bool,
+    mcp_server_name: str,
+    max_buffer_size: int | None = DEFAULT_CLAUDE_MAX_BUFFER_SIZE,
+    external_model_config: ExternalCliModelConfig | None,
+    fallback_external_model_config: ExternalCliModelConfig | None,
+    promote_fallback_model: Callable[[], Awaitable[bool]] | None,
+    system_prompt: str | None,
+    system_prompt_mode: str | None,
+    skills: tuple[SkillSource, ...],
+    skill_conflict: str,
+    extra_env: dict[str, str] | None,
+    ssh_transport: SshTransportConfig | None,
+    resume_external_backend: bool,
+    member_agent_id: str | None,
+    team_context_tracker: Any,
+) -> ExternalHarnessMemberRuntime:
+    """Build a Claude Code member runtime on the protocol harness."""
+    if max_buffer_size is None:
+        # An explicit None must not fall back to the SDK's 1 MiB default —
+        # a single large tool result (e.g. a base64 image) would kill the turn.
+        max_buffer_size = DEFAULT_CLAUDE_MAX_BUFFER_SIZE
+    env = _claude_process_env(extra_env=extra_env, join_env=descriptor.to_env(), ssh_transport=ssh_transport)
+    team_logger.info(
+        "[external-cli] preparing claude member {} cwd={} cli_path_configured={} inject_mcp={} "
+        "mcp_server_name={} team_join_env_present={} ssh_transport_configured={}",
+        ctx.member_name,
+        cwd,
+        cli_path is not None,
+        inject_mcp,
+        mcp_server_name,
+        "OPENJIUWEN_TEAM_JOIN" in env,
+        ssh_transport is not None,
+    )
+    model = _member_model_config("claudecode", external_model_config, fallback_external_model_config)
+    config = ClaudeCodeHarnessConfig(
+        skills=skills,
+        skill_conflict=skill_conflict,
+        system_prompt_mode=system_prompt_mode or "append",
+        cwd=cwd,
+        add_dirs=add_dirs,
+        env=env,
+        inherit_process_env=False,
+        cli_path=cli_path,
+        model=ClaudeModelConfig.from_mapping(model.get("model")),
+        fallback_model=ClaudeModelConfig.from_mapping(model.get("fallback_model")),
+        max_buffer_size=max_buffer_size,
+    )
+    transport_factory = None
+    if ssh_transport is not None:
+        from openjiuwen.agent_teams.external.cli_agent.claude.ssh_transport import build_claude_sdk_ssh_transport
+
+        team_logger.info("[external-cli] using claude sdk ssh transport for member {}", ctx.member_name)
+
+        def transport_factory(options: Any) -> Any:
+            return build_claude_sdk_ssh_transport(prompt=_empty_prompt(), options=options, config=ssh_transport)
+
+    harness = ClaudeCodeHarness(config, transport_factory=transport_factory)
+    runtime = ExternalHarnessMemberRuntime(
+        harness=harness,
+        context=_member_context(ctx, descriptor, member_agent_id=member_agent_id, system_prompt=system_prompt, cwd=cwd),
+        team_context_tracker=team_context_tracker,
+        resume_external_backend=resume_external_backend,
+        agent_kind="claude",
+        cli_path=cli_path,
+        inject_mcp=inject_mcp,
+        mcp_server_name=mcp_server_name,
+    )
+    runtime.bind_fallback_promotion(promote_fallback_model)
+    return runtime
+
+
+async def _empty_prompt() -> AsyncIterator[dict[str, Any]]:
+    """Provide an empty streaming prompt for SDK transport construction."""
+    return
+    yield {}  # type: ignore[unreachable]
+
+
+async def _build_codex_member_runtime(
+    ctx: TeamRuntimeContext,
+    descriptor: TeamJoinDescriptor,
+    *,
+    cwd: str | None,
+    codex_bin: str | None,
+    inject_mcp: bool,
+    mcp_default_tools_approval_mode: str | None,
+    bypass_approvals_and_sandbox: bool,
+    turn_idle_timeout_s: float | None,
+    turn_idle_retries: int | None,
+    external_model_config: ExternalCliModelConfig | None,
+    fallback_external_model_config: ExternalCliModelConfig | None,
+    promote_fallback_model: Callable[[], Awaitable[bool]] | None,
+    system_prompt: str | None,
+    system_prompt_mode: str | None,
+    skills: tuple[SkillSource, ...],
+    skill_conflict: str,
+    extra_env: dict[str, str] | None,
+    resume_external_backend: bool,
+    member_agent_id: str,
+    team_context_tracker: Any,
+) -> ExternalHarnessMemberRuntime:
+    """Build a Codex member runtime on the protocol harness."""
+    member_name = ctx.member_name or ""
+    env = _codex_process_env(extra_env=extra_env, join_env=descriptor.to_env())
+    team_logger.info(
+        "[external-cli] preparing codex member {} cwd={} codex_bin_configured={} "
+        "inject_mcp={} team_join_env_present={}",
+        member_name,
+        cwd,
+        codex_bin is not None,
+        inject_mcp,
+        "OPENJIUWEN_TEAM_JOIN" in env,
+    )
+    model = _member_model_config("codex", external_model_config, fallback_external_model_config)
+    config_kwargs: dict[str, Any] = {
+        "skills": skills,
+        "skill_conflict": skill_conflict,
+        "system_prompt_mode": system_prompt_mode or "replace",
+        "cwd": cwd,
+        "env": env,
+        "inherit_process_env": False,
+        "codex_bin": codex_bin,
+        "model": CodexModelConfig.from_mapping(model.get("model")),
+        "fallback_model": CodexModelConfig.from_mapping(model.get("fallback_model")),
+        "bypass_approvals_and_sandbox": bypass_approvals_and_sandbox,
+        "mcp_env_passthrough": tuple(MCP_SERVER_ENV_VARS),
+        "mcp_default_tools_approval_mode": mcp_default_tools_approval_mode,
+        "client_name": "openjiuwen_agent_team",
+        "client_title": f"OpenJiuwen Team Member {member_name}",
+    }
+    if turn_idle_timeout_s is not None:
+        config_kwargs["turn_idle_timeout_s"] = turn_idle_timeout_s
+    if turn_idle_retries is not None:
+        config_kwargs["turn_idle_retries"] = turn_idle_retries
+    config = CodexHarnessConfig(**config_kwargs)
+    harness = CodexHarness(config)
+    runtime = ExternalHarnessMemberRuntime(
+        harness=harness,
+        context=_member_context(
+            ctx,
+            descriptor,
+            member_agent_id=member_agent_id,
+            system_prompt=system_prompt,
+            cwd=cwd,
+        ),
+        team_context_tracker=team_context_tracker,
+        resume_external_backend=resume_external_backend,
+        agent_kind="codex",
+        cli_path=codex_bin,
+        inject_mcp=inject_mcp,
+    )
+    runtime.bind_fallback_promotion(promote_fallback_model)
+    return runtime
+
+
+def _build_provider_member_runtime(
+    ctx: TeamRuntimeContext,
+    descriptor: TeamJoinDescriptor,
+    *,
+    cwd: str | None,
+    cli_path: str | None,
+    inject_mcp: bool,
+    mcp_server_name: str,
+    mcp_server_command: tuple[str, ...],
+    external_model_config: ExternalCliModelConfig | None,
+    fallback_external_model_config: ExternalCliModelConfig | None,
+    promote_fallback_model: Callable[[], Awaitable[bool]] | None,
+    system_prompt: str | None,
+    system_prompt_mode: str | None,
+    skills: tuple[SkillSource, ...],
+    skill_conflict: str,
+    extra_env: dict[str, str] | None,
+    resume_external_backend: bool,
+    member_agent_id: str | None,
+    team_context_tracker: Any,
+) -> ExternalHarnessMemberRuntime:
+    """Build a member runtime on a third-party harness provider.
+
+    The member's model reaches the provider like Claude's and Codex's: as a
+    ``ModelChoice`` mapped by the provider's ``model_config``. The spawn path
+    only hands over an endpoint model when the card declares
+    ``ENDPOINT_MODELS``, and the authentication fallback only when it also
+    declares ``AUTH_FALLBACK``; the switch is persisted like Claude's and Codex's.
+
+    The provider receives only the configuration keys every generated
+    provider package shares (``cwd`` / ``env`` / ``inherit_process_env`` /
+    ``skills`` / ``skill_conflict``), plus ``cli_path`` and
+    ``system_prompt_mode`` when the team configured them. Team tools reach the
+    member through the ``openjiuwen-team-mcp`` stdio server, which inherits
+    the team-join descriptor from its environment; providers whose card does
+    not declare MCP tools run without them.
+    """
+    provider_name = ctx.cli_agent or ""
+    env = _with_home_env({**dict(os.environ), **(extra_env or {}), **descriptor.to_env()})
+    config: dict[str, Any] = {
+        "cwd": cwd,
+        "env": env,
+        "inherit_process_env": False,
+        "skills": skills,
+        "skill_conflict": skill_conflict,
+    }
+    if cli_path is not None:
+        config["cli_path"] = cli_path
+    if system_prompt_mode is not None:
+        config["system_prompt_mode"] = system_prompt_mode
+    config.update(_member_model_config(provider_name, external_model_config, fallback_external_model_config))
+    harness = resolve_provider(provider_name).create(config)
+    team_logger.info(
+        "[external-cli] preparing provider member {} provider={} cwd={} cli_path_configured={} inject_mcp={}",
+        ctx.member_name,
+        provider_name,
+        cwd,
+        cli_path is not None,
+        inject_mcp,
+    )
+    runtime = ExternalHarnessMemberRuntime(
+        harness=harness,
+        context=_member_context(ctx, descriptor, member_agent_id=member_agent_id, system_prompt=system_prompt, cwd=cwd),
+        team_context_tracker=team_context_tracker,
+        resume_external_backend=resume_external_backend,
+        agent_kind=provider_name,
+        cli_path=cli_path,
+        inject_mcp=inject_mcp,
+        mcp_server_name=mcp_server_name,
+    )
+    runtime.bind_fallback_promotion(promote_fallback_model)
+    if inject_mcp and harness.card.supports(HarnessCapability.MCP_TOOLS):
+        runtime.bind_mcp_servers(
+            [
+                McpServerConfig(
+                    name=mcp_server_name,
+                    transport=McpTransport.STDIO,
+                    command=mcp_server_command,
+                    env={key: env[key] for key in MCP_SERVER_ENV_VARS if key in env},
+                )
+            ]
+        )
+    elif inject_mcp:
+        team_logger.warning(
+            "[external-cli] provider {} declares no MCP tools; member {} runs without team tools",
+            provider_name,
+            ctx.member_name,
+        )
+    return runtime
+
+
+__all__ = ["MemberRuntimeLike", "build_cli_runtime", "build_cli_workflow_runtime", "descriptor_from_context"]
