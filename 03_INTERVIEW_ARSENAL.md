@@ -5,7 +5,7 @@
 
 ## 0. 使用守则（先读，否则会在追问里翻车）
 
-1. **量化指标全部是占位符 `【…】`**。本仓库没有任何压测、线上监控数据，这份文档不编造数字。每个占位符旁边写了"怎么测"，请用你真实做过的数据填，没测过就换成定性描述。Staff 面试官最擅长的就是追问"这个 40% 是怎么测的、基线是什么、P50 还是 P99"。
+1. **量化指标已替换为本地受控微基准实测值**（`scripts_diag/repro_and_bench.py`，结果见 `scripts_diag/results/bench_results.md`，补丁见 `patches/`）。口径一律说"本地受控微基准：真实仓库类、Mock LLM、localhost"，**不要说成线上数据**。只有线上才能测的指标（MTTD、每周 OOM 次数、事故率）已改为定性描述——如果你手里有真实线上数据，再替换进去。
 2. **"我修复了 X" 只能写你真正做过的**。02 文档里的修复补丁是**设计草案，未在仓库中实现**。War Stories 按"你亲手定位并落地"的口径写，请按实际参与程度改成"我主导 / 我参与 / 我提出方案"，未落地就说"方案已评审，待排期"——这在面试中同样加分，而且经得起背调。
 3. **术语以源码为准**。需求里有几个说法和源码对不上，面试里用错会直接暴露没读过代码：
 
@@ -119,35 +119,35 @@
 
 ## 2. 简历黄金 Bullet Points（STAR + 量化占位）
 
-> 格式：一行动词开头的总结 + 2–3 行要点。`【…】` 处填你的真实数据，旁边是测量方法。没做过的条目请删除或降级为"参与 / 设计"。
+> 格式：一行动词开头的总结 + 2–3 行要点。R 部分数字均为本地受控微基准实测，括号内注明场景与口径。没做过的条目请删除或降级为"参与 / 设计"。
 
 ### Bullet 1 · 高并发 / 高可靠 Runtime 底座改造
 
-**主导 Agent 运行时的资源生命周期治理，消除 Split-Process 架构下的后台协程泄漏与会话表无界增长，Worker 长稳运行时长从【X 小时】提升到【Y 天】。**
+**主导 Agent 运行时的资源生命周期治理，消除 Split-Process 架构下的后台协程泄漏与会话表无界增长，已关闭会话的稳态内存保留斜率从 1095 KB/千会话降到 2.4 KB/千会话（−99.8%）。**
 - **S/T**：Runtime Worker 在长时间运行后内存线性上涨，最终被 OOM 杀掉后触发守护重启；客户端断开后，后台子代理仍在占用沙箱和模型配额。
 - **A**：用自研的 asyncio Task 聚合转储探针（按协程名统计增量），定位到多处 `asyncio.create_task` 不持有引用、不可取消（记忆抽取、dreaming、code-agent 后台子代理），以及 `RuntimeSessionCoordinator` 关闭会话时只置 CLOSED、从不移除 `_sessions/_generations`。设计 session 级后台任务注册表（`add_done_callback` 自动摘除 + 关闭时 cancel 并 gather），并在协调器中做 CLOSED 后回收。
-- **R**：RSS 斜率从【__ MB/h】降到【__ MB/h】（**测法**：固定 QPS 压测 24h，看 RSS 线性回归斜率）；断连后沙箱释放时间 P99【__ s】（**测法**：注入客户端断连，统计 jiuwenbox 沙箱存活时长）；OOM 重启次数【__ → 0 /周】。
+- **R**：2000 个会话连续创建 / 运行 / 关闭，tracemalloc 稳态斜率 1095.3 → 2.4 KB/千会话，残留会话记录 2001 → 512（有界），generation 单调性与旧代际拒绝语义全部保持（本地受控微基准：真实仓库类 + 真实补丁，无 LLM / 无网络，`scripts_diag/repro_and_bench.py`）。断连后沙箱释放属于后续工作：源码审计确认 `SandboxGatewayClient.release` 无调用方（04 文档 §1），已列入治理路线。
 
 ### Bullet 2 · 分布式消息底座可靠性
 
-**重构基于 PyZMQ 的跨进程 / 跨节点 Agent 消息总线，把投递语义从"静默 at-most-once"升级为"至少一次 + 幂等去重"，团队任务因消息丢失卡死的比例下降【__%】。**
+**重构基于 PyZMQ 的跨进程 / 跨节点 Agent 消息总线，把投递语义从"静默 at-most-once"升级为"至少一次 + 幂等去重"，慢 handler 场景下 ACK 超时从 51/51 降到 0。**
 - **S/T**：P2P 接收循环先同步执行 handler 再回 ACK：慢 handler 造成队头阻塞，发送方 10s 超时重试导致重复投递；handler 异常被 `contextlib.suppress` 吞掉后照样回 ACK，消息丢失且无日志。
 - **A**：改为"收到即 ACK + 有界并发异步执行 handler + 基于消息 id 的 `_seen_ids` 去重（原字段已声明但未接线）"，为接收循环增加错误日志与指数退避；并保留"先写 DB、再发只带 id 的事件、POLL 兜底"的最终一致设计。
-- **R**：消息处理 P99 延迟【__ → __ ms】，重复投递率【__ → __】（**测法**：混沌注入慢 handler 和网络闪断，对比收发计数）。
+- **R**：1 条 2s 慢消息 + 50 条并发快消息：快消息 handler 启动 P99 1953 ms → 8.8 ms，ACK 超时 51/51 → 0；handler 异常静默丢失 5 → 0（全部记录 exception 日志）；接收出错时 300ms 内事件循环空转 661,654 次 → 3 次（带退避）（本地受控微基准：真实仓库类 + 真实补丁，无 LLM / 无网络，`scripts_diag/repro_and_bench.py`）。同时修复了排查中新发现的 DEALER routing id 冲突导致并发发送被 ROUTER 静默丢弃的问题。
 
 ### Bullet 3 · 多智能体协同与确定性编排引擎（SwarmFlow）
 
-**参与设计确定性多智能体编排引擎 SwarmFlow，用调用路径键 + SHA-256 内容签名实现 Journal 断点续跑，并补齐副作用幂等与 WAL 损坏容错，长流程重跑的 Token 成本降低【__%】。**
+**参与设计确定性多智能体编排引擎 SwarmFlow，用调用路径键 + SHA-256 内容签名实现 Journal 断点续跑，并补齐副作用幂等与 WAL 损坏容错，WAL 撕裂后的续跑缓存命中率从 0% 恢复到 99.5%，16 并发分支的预算超支从 230% 压到 5%。**
 - **S/T**：长 SwarmFlow 中断后需整体重跑，Token 成本高；同时发现三类重放陷阱：pause 窗口内已完成的调用被丢弃后重跑，造成 `git commit` 这类副作用重复；WAL 半行（尤其中文多字节截断）导致 resume 崩溃；缓存命中时 `model_validate` 未保护，schema 漂移即失败。
 - **A**：引入副作用工具的 intent / done 两阶段记录（resume 遇到"有 intent 无 done"时转人工确认）；WAL 追加前补齐尾部换行、关键记录 fsync、按字节逐行解析容错；缓存命中校验失败降级为 CACHE_MISS；journal 记录加 `schema_version`，签名纳入外部依赖指纹。
-- **R**：中断后续跑的缓存命中率【__%】，重跑 Token 节省【__%】（**测法**：同一 workflow 在随机位置中断 N 次，统计重放消耗 / 全量消耗）；副作用重复事故【__ → 0】。
+- **R**：200 步含中文的真实 `run_workflow`，WAL 末尾截断半个 UTF-8 字符：修复前 `Journal.load` 抛 `UnicodeDecodeError`、命中率 0%，修复后恢复 199/200 条、续跑命中率 99.5%（第二次 100%）；fsync 代价 +0.8 ms/调用（可关）。16 并发分支、上限 10k token：超支 230% → 5%，耗尽后仍发起的调用 15 → 0（本地受控微基准：真实仓库类 + 真实补丁，无 LLM / 无网络，`scripts_diag/repro_and_bench.py`）。intent/done 两阶段副作用保护为设计方案，未在补丁中实现。
 
 ### Bullet 4 · 基于 Rails 的自演进与可观测性治理
 
-**主导 Agent 护栏切面（Rails）与自演进管线的可观测性和韧性治理，建设一键注入诊断探针，线上疑难问题平均定位时间（MTTD）从【__ h】缩短到【__ min】。**
+**主导 Agent 护栏切面（Rails）与自演进管线的可观测性和韧性治理，建设一键注入诊断探针，挂起 Rail 从卡死主循环（≥5s 观测上限）变为 0.5s 熔断。**
 - **S/T**：Rail 回调串行 await 且无超时，慢 hook 阻塞推理主循环，而"slow callback"日志要等 hook 返回才输出，悬挂场景完全不可见；Rail 异常被吞掉，安全 / 预算类 Rail 静默 fail-open；自演进存储的 `evolutions.json` 一旦损坏会被空日志覆盖，演进历史清空。
 - **A**：为 Rail 分发引入按 Rail 声明的超时与 fail-open / fail-close 策略；开发非侵入式诊断探针（Monkey-patch `AgentCallbackManager.execute`、`ReActAgent._call_model`、`ReActAgent._execute_tool_call` 等，输出进行中的悬挂调用、Task await 链、session 内存、队列积压、`BudgetLedger` 水位、事件循环阻塞告警）；演进存储加跨进程文件锁，损坏文件隔离为 `.corrupt` 而不是覆盖。
-- **R**：MTTD【__ → __】（**测法**：对比引入前后同类工单的定位耗时）；Rail 导致的推理卡死【__ → 0】；演进数据丢失事故【__ → 0】。
+- **R**：挂起 hook（timeout=0.5s）：`trigger()` 从 ≥5.0s 不返回 → 0.502s 熔断并继续执行后续 Rail；2s 慢 hook（timeout=0.2s）P99 2.004s → 0.202s；新增可选 fail-close（本地受控微基准：真实仓库类 + 真实补丁，无 LLM / 无网络，`scripts_diag/repro_and_bench.py`）。诊断探针已在仓库依赖下验证 5 个 patch 点全部命中。MTTD 需要线上工单数据，此处不报数字；演进存储的跨进程锁与损坏隔离为设计方案。
 
 > **简历排版建议**：顶部写一句项目定位（"面向生产的多智能体协同框架，覆盖 Runtime / 单 Agent 引擎 / 团队编排三层"），4 条 bullet 按"Runtime → 消息 → 编排 → 治理"排序，每条不超过 3 行，技术名词保留源码真名（面试官可能真的去读代码）。
 
@@ -155,12 +155,12 @@
 
 ## 3. 三个深水区实战故事（Interview War Stories）
 
-> 讲述结构：**现象 → 影响 → 定位（工具 + 证据链 + 精确到行）→ 方案 A vs B → 落地 + 收益 → 反思**。每个故事控制在 4–6 分钟口述。`【】` 处填真实数据。
+> 讲述结构：**现象 → 影响 → 定位（工具 + 证据链 + 精确到行）→ 方案 A vs B → 落地 + 收益 → 反思**。每个故事控制在 4–6 分钟口述。收益数字均为本地受控微基准实测；"现象"里的线上频率用定性描述，有真实数据再替换。
 
 ### Story 1 · "断连之后还在跑的 Agent"：Split-Process 下的后台协程泄漏与会话表膨胀
 
 **现象与影响**
-- Runtime Worker 的 RSS 随运行时间近似线性上涨，约【__ 天】触发一次 OOM，被 `RuntimeSupervisor` 判死后替换。
+- Runtime Worker 的 RSS 随运行时间近似线性上涨，长时间运行后触发 OOM，被 `RuntimeSupervisor` 判死后替换。
 - 替换的瞬间所有在途会话断流；虽然有 `sequence` 重放，正在跑的推理还是丢了。
 - 同时，模型配额在用户已经离开的时段仍在消耗。
 
@@ -188,7 +188,7 @@
   - 自定义 lint 规则，禁止裸 `asyncio.create_task`，必须经 `spawn_bg(session_id, coro, ttl=…)`；
   - 给"允许跨请求存活"的任务设置 TTL 上限，超时强制取消。
 - 协调器在 CLOSED 且无引用时回收条目。
-- 收益：RSS 斜率【__ → __】，OOM【__ → 0】，断连后配额浪费【__%↓】。
+- 收益：协调器部分已做成补丁 `0004` 并实测——2000 会话稳态斜率 1095.3 → 2.4 KB/千会话，残留记录 2001 → 512（本地受控微基准：真实仓库类 + 真实补丁，无 LLM / 无网络，`scripts_diag/repro_and_bench.py`）；后台任务注册表与沙箱 lease 释放为下一步。
 
 **反思（Staff 加分点）**：真正的根因不是某一行代码，而是**缺少"会话作用域"这个一等公民**。异步系统里每个 `create_task` 都应该回答"谁拥有它、谁来取消它"。我还把"客户端断开 → Gateway → Front → Worker → DeepAgent 的取消逐跳传播"列成混沌测试用例，因为这条链路在原代码里**没有端到端验证过**。
 
@@ -199,7 +199,7 @@
 **现象与影响**
 - Team 模式下，某个 Teammate 偶发"永久转圈"：没有报错，也没有流式输出，其他成员正常，Leader 也显示空闲。
 - 用户只能重开会话，任务进度全部丢失。
-- 发生率【__%】，集中在"配置了 `approval_required_tools`"的团队。
+- 偶发，集中在"配置了 `approval_required_tools`"的团队。
 
 **定位过程**
 1. **先看日志**：`team` logger 中卡住成员的最后一条是 `dropping stale interrupt resume input`，之后每条新消息都打 `deferring mailbox message`。说明成员一直处于"有待处理中断"的状态，所有后续输入都被延后。
@@ -228,7 +228,7 @@
 - 审批超时默认 fail-close，并通知用户，打破循环等待。
 - 补上"无人可审批"的配置校验：挂了审批 Rail 就必须存在审批方，否则启动失败。
 - 多进程部署时，`update_task*` 改为条件 UPDATE（版本号 CAS），并加 `retry_on_locked`。
-- 收益：Team 卡死工单【__ → __】，审批平均耗时可观测（新增 `approval.request_sent → approval.resolved` 延迟指标）。
+- 收益：方案 A 已做成补丁 `0001` 并实测——1000 次兜底审批，丢弃率 100% → 0%，恢复成功率 0% → 100%，卡住的中断 1000 → 0（本地受控微基准：真实仓库类 + 真实补丁，无 LLM / 无网络，`scripts_diag/repro_and_bench.py`）；方案 B（审批落库 + 超时）为演进设计。
 
 **反思**：分布式系统里，**任何"必须送达"的语义都不能只靠消息**。这个项目自己在任务分配上已经做对了（DB 是事实来源，消息只是唤醒），审批却没有遵循同一原则。我做的事情本质上是把审批对齐到同一套一致性模型。
 
@@ -236,8 +236,8 @@
 
 **现象与影响**
 - 一个代码类 SwarmFlow 在 `human()` 卡点被暂停，第二天恢复后，仓库里出现了**两个一模一样的 commit**。
-- 另一个 workflow 恢复时直接报错，用户只能放弃缓存全量重跑，消耗【__】Token。
-- 预算设置了上限，账单仍然**超出【__%】**。
+- 另一个 workflow 恢复时直接报错，用户只能放弃缓存全量重跑（复现中 200 步全部作废，命中率 0%）。
+- 预算设置了上限，账单仍然**超出 230%**（复现：16 并发分支、上限 10k、每次 1500 token，最终花费 33,000）。
 
 **定位过程（三条线）**
 1. **重复副作用**：`runner` 日志显示该步骤在恢复时是 `CACHE_MISS`。为什么上次完成了却没记录？读 `AT/workflow/engine/primitives.py:711-713`：调用完成后**先检查 abort，再写 journal**。pause 的三段式中止（设置 abort_event → `abort_all` 取消 future → cancel 任务）恰好落在两者之间，已完成的结果被丢弃，副作用却已经发生。崩溃落在 WAL 写入前也是同样结果。journal 里**没有 intent 记录，也没有幂等键**。
@@ -262,7 +262,7 @@
 - **WAL**：追加前补齐尾部 `\n`；intent 和 done 记录 fsync；读取按字节逐行解析，坏行告警计数后跳过。
 - **签名**：纳入 `schema_version`、validator 源码哈希、外部依赖指纹（文件内容哈希 / git HEAD）；缓存命中校验失败降级为 CACHE_MISS 并告警，不再让整个 workflow 失败。
 - **可观测**：SwarmFlow 原来**没有独立的 OTEL span**，缓存命中的调用也不产生 span。补上 `swarmflow.step{ks, cache=hit|miss}` span 之后，TUI `/swarmflows` 之外也能看到命中率。
-- 收益：重复副作用【__ → 0】，恢复失败率【__ → __】，预算超支从【__%】收敛到【≤ 预估误差】。
+- 收益（补丁 `0005` / `0006` 实测（本地受控微基准：真实仓库类 + 真实补丁，无 LLM / 无网络，`scripts_diag/repro_and_bench.py`））：多字节截断的 WAL 从无法加载 → 恢复 199/200、续跑命中率 99.5%；预算超支 230% → 5%，耗尽后仍发起的调用 15 → 0。intent/done 防重复副作用为设计方案，尚未实现，面试时请如实说明。
 
 **反思**：Journal Replay 的本质是 **event sourcing + 确定性重放**。它对纯函数步骤天然成立，对副作用步骤必须引入两阶段语义。这和 Temporal 把 Activity 与 Workflow 分离、LangGraph 要求把副作用包进 `@task`，是同一个工程原理。能把我们的方案放进这个谱系里讲，比单讲修了哪几行更有说服力。
 
@@ -406,7 +406,7 @@
 
 ## 附：面试前 48 小时检查清单
 
-- [ ] 把所有 `【…】` 换成真实数据，或者改写成定性描述；删掉没参与过的 bullet。
+- [ ] 背熟实测数字及其口径（本地受控微基准）；有线上数据再补充；删掉没参与过的 bullet。
 - [ ] 能脱稿画出三张图：三进程拓扑、Inner / Outer Loop 状态机、权限审批闭环（参考 01 文档）。
 - [ ] 背熟 10 个"源码真名"：`DeepAgent._run_task_loop`、`ReActAgent._inner_invoke`、`AgentRail`、`AgentCallbackManager.execute`、`TeamAgentSpec.build`、`TeamAgent`、`BudgetLedger`、`OnlineEvolutionOrchestrator.evolve`、`append_record_transactional`、`RuntimeSupervisor`。
 - [ ] 每个 War Story 准备一个"如果重来会怎么做"。

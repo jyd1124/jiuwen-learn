@@ -20,11 +20,11 @@
 | 8 | `PyZmqMessager` | `AT/messager/pyzmq_backend.py:372` | 跨进程 / 跨节点通知总线：ROUTER/DEALER 点对点 + XPUB/XSUB 广播 | 先跑 handler 再 ACK（队头阻塞）+ 吞异常照样 ACK + DEALER routing id 固定导致并发发送被丢。**实测** 51/51 ACK 超时 → 0（0003） |
 | 9 | `TaskDao` | `AT/tools/database/task_dao.py:452` | Team DB 事实来源：`claim_task`（`:906`）用 `WHERE assignee IS NULL AND status=pending` 做 CAS | `update_task*` 先 SELECT 再改，写锁只在进程内；跨进程部署会 Lost Update |
 | 10 | `TeamScheduler` | `AT/agent/scheduling/scheduler.py:107` | `dispatch_mode="scheduled"` 时的强调度：五个幂等扫描阶段 + 评审投票（全员投票、单票否决、inspector 均分 ≥0.85、最多 3 轮） | 没有失败重派；reviewer 任务 `create_task` 不留引用（`:766`），Leader 暂停后仍在投票 |
-| 11 | `Journal` | `AT/workflow/engine/journal.py:105` | SwarmFlow 断点续跑：`位置键 ks + SHA-256 内容签名 + run_id` 命中缓存；WAL 追加 + `os.replace` 快照 | 签名不含外部状态；WAL 不 fsync；严格 utf-8 读取，半个中文字符就让 resume 崩溃（0005） |
-| 12 | `BudgetLedger` | `AT/workflow/engine/budget.py:23` | SwarmFlow Token 账本：`spent += n` + 入口 `_check_budget` 抛 `BudgetExhausted` | 先检查后扣费：并发分支同时过检，超支约 = 并发度 × 单次消耗；问题不在锁（0006 改为预留制） |
+| 11 | `Journal` | `AT/workflow/engine/journal.py:105` | SwarmFlow 断点续跑：`位置键 ks + SHA-256 内容签名 + run_id` 命中缓存；WAL 追加 + `os.replace` 快照 | 签名不含外部状态；WAL 不 fsync；严格 utf-8 读取，半个中文字符就让 resume 崩溃。**实测**命中率 0% → 99.5%（0005） |
+| 12 | `BudgetLedger` | `AT/workflow/engine/budget.py:23` | SwarmFlow Token 账本：`spent += n` + 入口 `_check_budget` 抛 `BudgetExhausted` | 先检查后扣费：并发分支同时过检，问题不在锁。**实测** 16 并发超支 230% → 预留制 5%（0006） |
 | 13 | `EvolutionRail` | `AC/harness/rails/evolution/evolution_rail.py:241` | 自演进入口：after_invoke → 后台 `_trigger_evolution`（600s / 团队 720s）→ 打分 `0.5E+0.3U+0.2F` → 审批 → `append_record_transactional` | `evolutions.json` 解析失败返回空日志，下次写入覆盖、历史清空；锁只在进程内 |
 | 14 | `RuntimeSupervisor` | `JS/server/supervisor/runtime_supervisor.py:85` | Front 侧守护 Worker：Unix socket 帧协议、10s 心跳 / 30s 判死、循环停滞超过 180s 替换；流式帧由 `WorkerEventStore`（`JS/server/worker/event_store.py:74`）编号缓存，支持重放 | Front 断连不向 Worker 发任何帧；`KIND_CANCEL` 只有消费端（`JS/server/worker/dispatcher.py:188`），没有发送方 |
-| 15 | `RuntimeSessionCoordinator` | `JS/runtime/session/coordinator.py:73` | 会话注册、generation、执行句柄、取消（`cancel_execution` 对 handle 调 `task.cancel()`） | 关闭只置 CLOSED，`_sessions/_generations` 永不 pop。**实测**稳态斜率 1095 KB/1000 会话 → 2.3 KB（0004） |
+| 15 | `RuntimeSessionCoordinator` | `JS/runtime/session/coordinator.py:73` | 会话注册、generation、执行句柄、取消（`cancel_execution` 对 handle 调 `task.cancel()`） | 关闭只置 CLOSED，`_sessions/_generations` 永不 pop。**实测**稳态斜率 1095 KB/1000 会话 → 2.4 KB（0004） |
 
 > 第 16 个备用：`SandboxGatewayClient`（`AC/core/sys_operation/sandbox/gateway/gateway_client.py:11`）—— `release()`（`:60`）生产代码**无调用方**，沙箱 lease 从不释放，idle 回收两层默认关闭。
 
@@ -112,7 +112,7 @@ stateDiagram-v2
 | 3 | Front ⇄ Worker 为什么不用 gRPC？ | 同机走 Unix socket，延迟最低、免服务发现；长度前缀 JSON 方便调试 | `kind` 多路复用 `32MiB 帧上限` | ✦ "跨机时这一跳可以一一映射到 gRPC streaming，协议语义不变。" |
 | 4 | 断线后流式输出怎么不丢？ | Worker 侧给每帧分配单调递增序号并缓存，重连后按 after 重放 | `WorkerEventStore` `execution.subscribe{after}` | ✦ "把流当成日志，就能用偏移量做断点续传。" |
 | 5 | 客户端断开会停止推理吗？ | Web 关 tab 不会（有意设计）；显式中断会，但靠消息而不是 CancelledError；沙箱 exec 停不下来 | `chat.interrupt` `KIND_CANCEL 无发送方` | ✦ "取消必须是一等协议，而不是寄希望于异常一路冒泡。" |
-| 6 | 会话怎么回收？ | 惰性回收，只在请求路径的 finally 里执行，TTL 2h；协调器以前只增不删 | `AgentManager` `_retire_closed_session`（0004） | ✦ "实测稳态斜率 1095 KB → 2.3 KB / 千会话，靠的是有界历史加单调 generation 下限。" |
+| 6 | 会话怎么回收？ | 惰性回收，只在请求路径的 finally 里执行，TTL 2h；协调器以前只增不删 | `AgentManager` `_retire_closed_session`（0004） | ✦ "实测稳态斜率 1095 KB → 2.4 KB / 千会话，靠的是有界历史加单调 generation 下限。" |
 | 7 | Rails 和普通 callback 区别？ | Rails 能控制流程，不只是观察；按事件分流挂到内层或外层 | `_register_rail_selective` `push_steering` | ✦ "切面的价值在于把护栏从业务代码里剥离出来。" |
 | 8 | Rail 卡住或抛异常会怎样？ | 卡住会阻塞主循环，抛异常会被静默吞掉，两者都是隐患 | `framework.py:1129` `AbortError` | ✦ "实测：挂起的 hook 原来卡 ≥5s，补丁后 0.50s 熔断；fail-open 还是 fail-close 应该由 Rail 自己声明。" |
 | 9 | 上下文压缩怎么做？ | 先卸载超大工具输出（规则压缩、原文落盘），占用到 80% 再用 LLM 压缩；溢出时压缩后重试一次 | `MessageSummaryOffloader` `recover_from_model_exception` | ✦ "压缩的第一原则是可召回，所以留 `[[OFFLOAD:]]` 句柄而不是直接删。" |
@@ -124,7 +124,7 @@ stateDiagram-v2
 | 15 | SwarmFlow 怎么抑制误差累积？ | 结构化输出加 schema 校验重试，失败隔离为 None，verify 一票否决 | `coerce` `verify()` | ✦ "N 跳串联的成功率按指数衰减，必须让每一跳都可验证。" |
 | 16 | Journal Replay 遇到非幂等 API？ | 现在保证不了：结果先检查 abort 再写日志，副作用可能重复 | `primitives.py:711-713` `intent/done` | ✦ "和 Temporal 的 Activity 是同一个道理：副作用必须显式声明边界。" |
 | 17 | `human()` 卡点释放资源吗？ | 不释放：在内存 Future 上等待，默认 600s；释放资源靠 pause 后用同一个 run_id 重放 | `wait_for` `_seal_guard` | ✦ "等人不应占着协程，回复应该落盘。" |
-| 18 | 预算熔断精确吗？ | 不精确：单事件循环下加法没有竞争，问题在先检查后扣费 | `BudgetLedger:23` `_check_budget` | ✦ "加锁救不了检查与执行之间的时间差，预留制才能把超支上界与并发度解耦。" |
+| 18 | 预算熔断精确吗？ | 不精确：单事件循环下加法没有竞争，问题在先检查后扣费 | `BudgetLedger:23` `_check_budget` | ✦ "实测 16 并发超支 230% → 5%：加锁救不了检查与执行之间的时间差，预留制才能把超支上界与并发度解耦。" |
 | 19 | 自演进怎么防越改越差？ | LLM 只能 append/skip，加人审、平滑打分和事务回滚；但缺离线评估门禁 | `append_record_transactional` `score=0.5E+0.3U+0.2F` | ✦ "演进要像模型发布一样：影子评估、灰度、自动回滚。" |
 | 20 | 重新设计你改哪三件事？ | 统一一致性模型；工具声明副作用级别；会话作用域成为一等公民 | `SessionScope` `side_effect` | ✦ "Agent 的不确定性已经来自模型本身了，工程层不要再额外制造不确定性。" |
 
@@ -135,10 +135,10 @@ stateDiagram-v2
 | 场景 | 修复前 | 修复后 | 补丁 |
 |---|---|---|---|
 | S1 审批兜底（N=1000） | 丢弃率 100%（1000 条全部已读且丢失） | 恢复成功率 100% | 0001 |
-| S2 会话保留（2000 会话） | 稳态 1095.3 KB / 千会话，残留 2001 条 | 2.29 KB / 千会话，残留 512 条（有界） | 0004 |
-| S3 ZMQ 队头阻塞（1 个 2s 慢消息 + 50 个快消息） | ACK 超时 51/51；快消息 handler 启动 P99 1953 ms；接收出错时 300ms 内空转 631,855 次 | 超时 0；P99 7.2 ms；同等时间仅 3 次（带退避） | 0003 |
+| S2 会话保留（2000 会话） | 稳态 1095.3 KB / 千会话，残留 2001 条 | 2.4 KB / 千会话，残留 512 条（有界） | 0004 |
+| S3 ZMQ 队头阻塞（1 个 2s 慢消息 + 50 个快消息） | ACK 超时 51/51；快消息 handler 启动 P99 1953 ms；接收出错时 300ms 内空转 661,654 次 | 超时 0；P99 8.8 ms；同等时间仅 3 次（带退避） | 0003 |
 | S4 Rail 串行超时 | 挂起的 hook 卡住 ≥5.0s（达到观测上限）；2s hook P99 2.004s | 0.502s 熔断；P99 0.202s | 0002 |
-| S5 WAL 撕裂行 | 实测进行中 | — | 0005 |
-| S6 16 并发预算超支 | 实测进行中 | — | 0006 |
+| S5 WAL 撕裂行（200 步中文 workflow） | 末尾截断半个 UTF-8 字符：`UnicodeDecodeError`，续跑命中率 0% | 恢复 199/200，命中率 99.5%（第二次 100%）；fsync +0.8 ms/调用 | 0005 |
+| S6 16 并发预算超支（上限 10k，1500/调用） | 超支 230%，耗尽后仍发起 15 次调用 | 超支 5%，耗尽后发起 0 次 | 0006 |
 
 > 面试话术模板："在本地受控微基准下（真实仓库类，无 LLM，2000 会话 / 50 条并发消息），A 指标从 X 降到 Y；线上收益我们用 Z 指标跟踪。"——**线上数据只说你真实有的。**

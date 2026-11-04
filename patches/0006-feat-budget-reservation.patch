@@ -1,0 +1,367 @@
+diff --git a/agent-core/openjiuwen/agent_teams/workflow/engine/budget.py b/agent-core/openjiuwen/agent_teams/workflow/engine/budget.py
+index 7a31e7a..db47895 100644
+--- a/agent-core/openjiuwen/agent_teams/workflow/engine/budget.py
++++ b/agent-core/openjiuwen/agent_teams/workflow/engine/budget.py
+@@ -16,8 +16,13 @@ advisory. The ledger is business-agnostic (a counter and a ceiling, no
+ """
+ from __future__ import annotations
+ 
++import asyncio
+ from dataclasses import dataclass, field
+ 
++#: Reservation for a call before any call of the run has reported its real
++#: cost: the prompt's own estimate plus this much completion headroom.
++DEFAULT_COMPLETION_RESERVE = 1024
++
+ 
+ @dataclass
+ class BudgetLedger:
+@@ -33,11 +38,30 @@ class BudgetLedger:
+             most (``BudgetExhausted.top_phases``). Only meaningful on the
+             per-run ledger (``workflow_budget``); the shared session ledger
+             keeps it empty.
++        reserved: Tokens held by calls that passed admission but have not
++            reported yet (see :meth:`reserve`). ``spent`` never includes them.
++
++    Reservations close the window the entry gate alone leaves open: N
++    concurrent calls all see ``spent < total`` before any of them returns, so
++    without a hold every one of them is admitted and the run overshoots by up
++    to N calls. :meth:`reserve` admits a call only while ``spent + reserved``
++    leaves room for its estimate, so the overshoot is bounded by the estimate
++    error of the calls in flight (plus, as before, the one call admitted when
++    nothing is in flight and ``spent < total``).
+     """
+ 
+     total: int | None = None
+     spent: int = 0
+     phase_tokens: dict[str, int] = field(default_factory=dict)
++    reserved: int = field(default=0, compare=False)
++    default_completion_reserve: int = field(default=DEFAULT_COMPLETION_RESERVE, compare=False, repr=False)
++    _observed_calls: int = field(default=0, init=False, compare=False, repr=False)
++    _observed_tokens: int = field(default=0, init=False, compare=False, repr=False)
++    # (loop, event) woken by the next commit/release; loop-tagged because a
++    # session ledger outlives any one event loop (e.g. back-to-back asyncio.run).
++    _release_event: "tuple[asyncio.AbstractEventLoop, asyncio.Event] | None" = field(
++        default=None, init=False, compare=False, repr=False,
++    )
+ 
+     def add(self, tokens: int) -> None:
+         """Report ``tokens`` consumed. Non-positive values are ignored."""
+@@ -68,5 +92,76 @@ class BudgetLedger:
+         """Whether the ceiling is reached (always ``False`` when unbounded)."""
+         return self.total is not None and self.spent >= self.total
+ 
++    # --- reservations (admission control for concurrent calls) ---
++
++    def available(self) -> int | None:
++        """Tokens neither spent nor reserved, or ``None`` when unbounded."""
++        if self.total is None:
++            return None
++        return max(0, self.total - self.spent - self.reserved)
++
++    def estimate(self, prompt_tokens: int = 0) -> int:
++        """Reservation estimate for one call.
++
++        The mean real cost of this ledger's committed calls once any exist
++        (never below the prompt's own size), else the prompt plus
++        ``default_completion_reserve``.
++        """
++        prompt_tokens = max(0, int(prompt_tokens))
++        if self._observed_calls:
++            mean = -(-self._observed_tokens // self._observed_calls)  # ceil
++            return max(prompt_tokens, mean, 1)
++        return max(1, prompt_tokens + self.default_completion_reserve)
++
++    def reserve(self, tokens: int) -> bool:
++        """Hold ``tokens`` for a call about to start; ``False`` = do not start it.
++
++        Admitted when nothing is reserved and ``spent < total`` (the legacy
++        entry-gate rule, so a sequential run behaves exactly as before), or when
++        ``spent + reserved + tokens <= total``. Unbounded ledgers always admit
++        (the hold is still tracked). Every ``True`` must be paired with exactly
++        one :meth:`commit` or :meth:`release` of the same amount.
++        """
++        tokens = max(0, int(tokens))
++        if self.total is not None:
++            committed = self.spent + self.reserved
++            if committed >= self.total:
++                return False
++            if self.reserved > 0 and committed + tokens > self.total:
++                return False
++        self.reserved += tokens
++        return True
++
++    def release(self, reserved: int) -> None:
++        """Drop a hold without billing (the call failed or never ran)."""
++        self.reserved = max(0, self.reserved - max(0, int(reserved)))
++        pending, self._release_event = self._release_event, None
++        if pending is not None:
++            pending[1].set()
++
++    def commit(self, reserved: int, actual: int | None, *, bill: bool = True) -> None:
++        """Settle a hold with the call's real cost.
++
++        Releases ``reserved`` and feeds ``actual`` to :meth:`estimate`. With
++        ``bill=True`` the cost is also added to ``spent`` (like :meth:`add`);
++        pass ``bill=False`` when the backend already reported it (the engine's
++        case — backends are the ledger's writers, see ``bind_budget``).
++        """
++        if actual is not None and actual > 0:
++            self._observed_calls += 1
++            self._observed_tokens += actual
++            if bill:
++                self.add(actual)
++        self.release(reserved)
++
++    async def wait_release(self) -> None:
++        """Wait until some hold is committed / released (returns at once if none)."""
++        if self.reserved <= 0:
++            return
++        loop = asyncio.get_running_loop()
++        if self._release_event is None or self._release_event[0] is not loop:
++            self._release_event = (loop, asyncio.Event())
++        await self._release_event[1].wait()
++
+ 
+ __all__ = ["BudgetLedger"]
+diff --git a/agent-core/openjiuwen/agent_teams/workflow/engine/primitives.py b/agent-core/openjiuwen/agent_teams/workflow/engine/primitives.py
+index a7c9f74..49badee 100644
+--- a/agent-core/openjiuwen/agent_teams/workflow/engine/primitives.py
++++ b/agent-core/openjiuwen/agent_teams/workflow/engine/primitives.py
+@@ -332,6 +332,70 @@ def _deepest_branch_i(path: tuple) -> int | None:
+     return i
+ 
+ 
++#: Upper bound on one wait for an in-flight hold to settle before the
++#: reservation loop re-checks the ledgers (guards against a missed wake-up).
++_RESERVE_POLL_S = 1.0
++
++
++def _reservation_ledgers(rt) -> list:
++    """The run's ledgers that support reservations (per-run, session), de-duplicated."""
++    out: list = []
++    for ledger in (rt.workflow_budget, rt.budget):
++        if hasattr(ledger, "reserve") and all(ledger is not o for o in out):
++            out.append(ledger)
++    return out
++
++
++async def _reserve_call_budget(rt, prompt: str) -> int:
++    """Hold an estimated cost on every ledger before a call reaches the backend.
++
++    The entry gate (``_check_budget``) only sees tokens already reported, so N
++    concurrent calls all pass it before the first one returns. Here each call
++    must also fit next to the holds of the calls still in flight; one that does
++    not waits for an in-flight call to settle and re-checks — it then either
++    fits, or the ledger is genuinely spent and ``_check_budget`` raises
++    ``BudgetExhausted``. With nothing in flight the legacy rule applies
++    (admitted while ``spent < total``), so sequential runs are unchanged.
++
++    Returns the per-ledger hold, to be passed to :func:`_settle_call_budget`.
++    """
++    ledgers = _reservation_ledgers(rt)
++    if not ledgers:
++        return 0
++    while True:
++        _check_abort(rt)
++        _check_budget(rt)
++        # The most conservative ledger's estimate (each learns from the calls
++        # committed into it; the session ledger also remembers earlier runs).
++        est = max(ledger.estimate(len(prompt) // 4) for ledger in ledgers)
++        held: list = []
++        blocker = None
++        for ledger in ledgers:
++            if ledger.reserve(est):
++                held.append(ledger)
++            else:
++                blocker = ledger
++                break
++        if blocker is None:
++            return est
++        for ledger in held:
++            ledger.release(est)
++        try:
++            await asyncio.wait_for(blocker.wait_release(), _RESERVE_POLL_S)
++        except TimeoutError:
++            pass
++
++
++def _settle_call_budget(rt, reserved: int, actual: int | None) -> None:
++    """Release a call's holds, feeding its real cost to the estimator.
++
++    Never bills: the backend already reported the real usage into the ledgers
++    (``AgentBackend.bind_budget``), so ``commit`` runs with ``bill=False``.
++    """
++    for ledger in _reservation_ledgers(rt):
++        ledger.commit(reserved, actual, bill=False)
++
++
+ def _budget_snapshot(ledger, scope: str = "session") -> dict:
+     """Freeze a ``BudgetLedger`` into the wire shape ``{total, spent, remaining, scope, exhausted}``.
+ 
+@@ -677,22 +741,30 @@ async def agent(
+     gate = _resolve_agent_gate(rt)
+ 
+     async with gate.acquire():
++        # Hold the call's estimated cost before it starts, so concurrent calls
++        # cannot all pass the entry gate on the same stale ``spent``.
++        reserved = await _reserve_call_budget(rt, prompt)
+         rt.spawn_count += 1
+-        # ``ks`` (the journal key) rides into the spec twice: as ``agent_id`` so
+-        # the backend can tag live activity events, and as ``call_key`` so
+-        # backend-side per-call identity (worker member names) is deterministic
+-        # across replays.
+-        call_result = await _call_backend(
+-            rt,
+-            _BackendCallSpec(
+-                prompt=prompt,
+-                opts=opts,
+-                json_schema=json_schema,
+-                model=model_cls,
+-                agent_id=ks,
+-                call_key=ks,
+-            ),
+-        )
++        actual: int | None = None
++        try:
++            # ``ks`` (the journal key) rides into the spec twice: as ``agent_id`` so
++            # the backend can tag live activity events, and as ``call_key`` so
++            # backend-side per-call identity (worker member names) is deterministic
++            # across replays.
++            call_result = await _call_backend(
++                rt,
++                _BackendCallSpec(
++                    prompt=prompt,
++                    opts=opts,
++                    json_schema=json_schema,
++                    model=model_cls,
++                    agent_id=ks,
++                    call_key=ks,
++                ),
++            )
++            actual = call_result.tokens
++        finally:
++            _settle_call_budget(rt, reserved, actual)
+ 
+     if not call_result.succeeded:
+         label = opts.get("label") or "agent"
+@@ -1751,8 +1823,15 @@ class AgentSession:
+             return _BackendCallResult(result=None, succeeded=False, error_detail=detail)
+         gate = _resolve_agent_gate(rt)
+         async with gate.acquire():
+-            await self._ensure_open(rt, req.opts)
+-            return await self._turn(rt, req)
++            reserved = await _reserve_call_budget(rt, req.prompt)
++            actual: int | None = None
++            try:
++                await self._ensure_open(rt, req.opts)
++                res = await self._turn(rt, req)
++                actual = res.tokens
++                return res
++            finally:
++                _settle_call_budget(rt, reserved, actual)
+ 
+     async def _turn(self, rt, req: _TurnRequest):
+         """Run one ``send_turn`` (the prior history is what the backend may replay)."""
+diff --git a/agent-core/tests/unit_tests/agent_teams/workflow/test_budget.py b/agent-core/tests/unit_tests/agent_teams/workflow/test_budget.py
+index 1aa5497..98eb79c 100644
+--- a/agent-core/tests/unit_tests/agent_teams/workflow/test_budget.py
++++ b/agent-core/tests/unit_tests/agent_teams/workflow/test_budget.py
+@@ -911,3 +911,97 @@ def test_budget_rail_bill_carries_the_usage_split():
+     assert rail.call_output_tokens == 601
+     assert rail.call_cache_tokens == 10624
+ 
++
++
++# ---------------------------------------------------------------- reservations
++
++_FANOUT_SCRIPT = '''
++from swarmflow import agent, parallel
++
++META = {"name": "fanout", "description": "16 concurrent calls on one ceiling", "phases": []}
++
++async def run(args):
++    return await parallel([lambda i=i: agent(f"task {i}", label=f"b{i}") for i in range(16)])
++'''
++
++
++class _SlowFixedCostBackend(_FixedCostBackend):
++    """Fixed cost billed only after a delay, so concurrent calls overlap in flight."""
++
++    def __init__(self, cost: int) -> None:
++        super().__init__(cost)
++        self.in_flight = 0
++        self.max_in_flight = 0
++
++    async def run(
++        self, prompt: str, opts: dict, schema_json: dict | None, *, call_key: str | None = None
++    ) -> AgentResult:
++        self.in_flight += 1
++        self.max_in_flight = max(self.max_in_flight, self.in_flight)
++        try:
++            await asyncio.sleep(0.01)
++            return await super().run(prompt, opts, schema_json, call_key=call_key)
++        finally:
++            self.in_flight -= 1
++
++
++def test_reserve_admits_while_holds_fit_and_legacy_rule_when_idle():
++    """reserve() counts in-flight holds; with none held it keeps the old spent<total rule."""
++    ledger = BudgetLedger(total=100)
++    assert ledger.reserve(60) and ledger.reserved == 60
++    assert not ledger.reserve(60)  # 60 held + 60 > 100
++    assert ledger.reserve(40) and ledger.available() == 0
++    ledger.commit(60, 70, bill=True)
++    assert (ledger.spent, ledger.reserved) == (70, 40)
++    ledger.release(40)
++    assert ledger.reserved == 0
++    assert ledger.reserve(500)  # idle and spent < total: legacy admission
++    ledger.release(500)
++    ledger.add(30)
++    assert not ledger.reserve(1)  # spent >= total
++    assert BudgetLedger().reserve(10**9)  # unbounded always admits
++
++
++def test_estimate_learns_from_committed_calls():
++    """Before any commit: prompt + default completion reserve; after: mean real cost."""
++    ledger = BudgetLedger(total=10_000, default_completion_reserve=100)
++    assert ledger.estimate(20) == 120
++    ledger.commit(0, 300, bill=False)
++    ledger.commit(0, 500, bill=False)
++    assert ledger.spent == 0  # bill=False leaves billing to the backend
++    assert ledger.estimate(20) == 400
++
++
++def test_add_is_unchanged_by_reservations():
++    """add() still bills directly and ignores holds (backward compatible)."""
++    ledger = BudgetLedger(total=100)
++    ledger.reserve(50)
++    ledger.add(30)
++    assert (ledger.spent, ledger.reserved, ledger.remaining()) == (30, 50, 70)
++
++
++def test_parallel_fanout_overrun_is_bounded_by_reservations(tmp_path):
++    """16 concurrent 1500-token calls on a 10k ceiling no longer all start.
++
++    Without holds every branch passes the entry gate on spent=0 (24 000 billed).
++    With them, the in-flight holds cap admission; the residual overshoot is the
++    estimate error plus at most the one call admitted on an idle ledger.
++    """
++    # Accurate estimate (prompt + 1500 reserve ~ real cost): overshoot <= one call.
++    backend = _SlowFixedCostBackend(cost=1500)
++    ledger = BudgetLedger(total=10_000, default_completion_reserve=1500)
++    with pytest.raises(BudgetExhausted):
++        asyncio.run(run_workflow(_write(tmp_path, _FANOUT_SCRIPT), backend=backend, budget=ledger, cap=16))
++    assert ledger.spent <= 10_000 + 1500
++    assert backend.max_in_flight < 16
++    assert ledger.reserved == 0  # every hold was settled
++
++    # Under-estimate (default 1024 reserve): the overshoot grows by the estimate
++    # error of the first wave only, still far below the unreserved 16 x 1500.
++    backend = _SlowFixedCostBackend(cost=1500)
++    ledger = BudgetLedger(total=10_000)
++    with pytest.raises(BudgetExhausted):
++        asyncio.run(run_workflow(_write(tmp_path, _FANOUT_SCRIPT), backend=backend, budget=ledger, cap=16))
++    # ~1025-token holds admit at most 9 calls (9 x 1025 <= 10 000) in the first wave.
++    assert ledger.spent <= 10 * 1500
++    assert ledger.reserved == 0

@@ -1,0 +1,253 @@
+diff --git a/agent-core/openjiuwen/agent_teams/workflow/engine/journal.py b/agent-core/openjiuwen/agent_teams/workflow/engine/journal.py
+index abc8576..9dc4ca8 100644
+--- a/agent-core/openjiuwen/agent_teams/workflow/engine/journal.py
++++ b/agent-core/openjiuwen/agent_teams/workflow/engine/journal.py
+@@ -21,12 +21,19 @@ from __future__ import annotations
+ import asyncio
+ import hashlib
+ import json
++import logging
+ import os
+ from pathlib import Path
+ from typing import Sequence
+ 
+ import aiofiles
+ 
++_logger = logging.getLogger(__name__)
++
++#: ``fsync`` the WAL after each append (power-loss durability). On by default;
++#: ``JIUWEN_WAL_FSYNC=0`` (or ``Journal(fsync=False)``) trades it for latency.
++_WAL_FSYNC_DEFAULT = os.getenv("JIUWEN_WAL_FSYNC", "1").strip().lower() not in ("0", "false", "no", "off")
++
+ 
+ def key_str(key: tuple) -> str:
+     """Serialise a structural path tuple to a stable string."""
+@@ -124,7 +131,14 @@ class Journal:
+     rolling policy may retire old WAL files by age/size, never by run state.
+     """
+ 
+-    def __init__(self, prior: dict[str, dict] | None = None, wal_path: str | None = None) -> None:
++    def __init__(
++        self,
++        prior: dict[str, dict] | None = None,
++        wal_path: str | None = None,
++        *,
++        fsync: bool | None = None,
++        load_stats: dict[str, int] | None = None,
++    ) -> None:
+         self.prior = prior or {}
+         # Records actually used this run (cache-hit -> reused prior; miss -> fresh).
+         self.used: dict[str, dict] = {}
+@@ -136,6 +150,13 @@ class Journal:
+         # never interleave on disk; held across the aiofiles write, so the event
+         # loop stays free while one append runs.
+         self._wal_lock = asyncio.Lock()
++        # fsync each WAL append (None -> process default, see _WAL_FSYNC_DEFAULT).
++        self._fsync = _WAL_FSYNC_DEFAULT if fsync is None else fsync
++        # The WAL tail is checked (and a torn last line terminated) once, before
++        # this journal's first append; every append after that ends in "\n".
++        self._wal_tail_checked = False
++        # What ``load`` had to skip: ``{"bad_utf8": n, "bad_json": n, "repaired_tail": n}``.
++        self.load_stats: dict[str, int] = dict(load_stats or {})
+ 
+     @property
+     def wal_path(self) -> str | None:
+@@ -143,23 +164,39 @@ class Journal:
+         return self._wal_path
+ 
+     @staticmethod
+-    def _parse_records(text: str) -> "list[dict]":
+-        """Parse JSONL into records, tolerating a torn trailing line.
++    def _parse_records(text: "str | bytes", stats: dict[str, int] | None = None) -> "list[dict]":
++        """Parse JSONL into records, tolerating torn / corrupt lines.
+ 
+         A crash mid WAL-append can leave a partial final record; that line fails to
+         parse and is skipped — its call simply re-executes on the next run.
++        ``text`` may be raw ``bytes``: each line is then decoded on its own, so a
++        record torn inside a multi-byte UTF-8 character costs only that line
++        instead of failing the whole file's decode. Skipped lines are counted
++        into ``stats`` (``bad_utf8`` / ``bad_json``) when given.
+         Accepts both call records (keyed by structural path) and run-level
+         records (``pause`` / ``seal``), which carry a synthetic key of the form
+         ``__run__:{type}:{run_id}`` so they round-trip through ``load``.
+         """
+         records: list[dict] = []
+-        for line in text.splitlines():
++        raw_lines = text.split(b"\n") if isinstance(text, (bytes, bytearray)) else text.splitlines()
++        for raw in raw_lines:
++            if isinstance(raw, (bytes, bytearray)):
++                try:
++                    line = raw.decode("utf-8")
++                except UnicodeDecodeError:
++                    if stats is not None:
++                        stats["bad_utf8"] = stats.get("bad_utf8", 0) + 1
++                    continue
++            else:
++                line = raw
+             line = line.strip()
+             if not line:
+                 continue
+             try:
+                 rec = json.loads(line)
+             except json.JSONDecodeError:
++                if stats is not None:
++                    stats["bad_json"] = stats.get("bad_json", 0) + 1
+                 continue
+             if isinstance(rec, dict) and "key" in rec:
+                 records.append(rec)
+@@ -184,19 +221,32 @@ class Journal:
+         (``aiofiles``) so they never stall the shared event loop. The WAL
+         itself is left untouched: it is an append-only log that is never
+         actively cleaned (see the class docstring).
++
++        Each file is read as bytes and decoded line by line, so a torn or
++        corrupt line (bad UTF-8 or bad JSON) is skipped, counted in
++        ``load_stats`` and logged as a warning instead of aborting the load.
+         """
+         legacy_sources: tuple[str, ...] = ()
+         if legacy_path:
+             legacy_sources = (legacy_path, f"{legacy_path}.wal")
+         prior: dict[str, dict] = {}
++        totals: dict[str, int] = {}
+         for src in (*legacy_sources, path, wal_path):
+             if not (src and Path(src).exists()):
+                 continue
+-            async with aiofiles.open(src, "r", encoding="utf-8") as f:
+-                text = await f.read()
+-            for rec in cls._parse_records(text):
++            async with aiofiles.open(src, "rb") as f:
++                data = await f.read()
++            stats: dict[str, int] = {}
++            for rec in cls._parse_records(data, stats):
+                 prior[rec["key"]] = rec  # last record wins (WAL overlays journal)
+-        return cls(prior, wal_path=wal_path)
++            if stats:
++                _logger.warning(
++                    "journal %s: skipped %d undecodable (UTF-8) and %d unparseable (JSON) line(s); "
++                    "their calls re-execute on resume", src, stats.get("bad_utf8", 0), stats.get("bad_json", 0),
++                )
++                for k, v in stats.items():
++                    totals[k] = totals.get(k, 0) + v
++        return cls(prior, wal_path=wal_path, load_stats=totals)
+ 
+     def get_cached(self, ks: str, sig: str, run_id: str | None = None) -> dict | None:
+         """Return the cached record if both ``sig`` and ``run_id`` match.
+@@ -272,14 +322,40 @@ class Journal:
+         Async file I/O (``aiofiles``) keeps the write off the event loop; the lock
+         serialises concurrent appends so parallel()/pipeline() completions never
+         interleave on disk.
++
++        Before this journal's first append, a WAL whose last line is torn (no
++        trailing ``"\\n"`` — a crash mid-append) is terminated with a newline,
++        so the new record starts on its own line instead of being glued onto
++        the torn bytes (which would make *both* unparseable and silently lose
++        the new record). Each append is ``fsync``-ed unless disabled.
+         """
+         if not self._wal_path:
+             return
+-        line = json.dumps(record, ensure_ascii=False) + "\n"
++        line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+         async with self._wal_lock:
+-            async with aiofiles.open(self._wal_path, "a", encoding="utf-8") as f:
++            async with aiofiles.open(self._wal_path, "ab") as f:
++                if not self._wal_tail_checked:
++                    self._wal_tail_checked = True
++                    if await self._wal_tail_is_torn():
++                        line = b"\n" + line
++                        self.load_stats["repaired_tail"] = self.load_stats.get("repaired_tail", 0) + 1
++                        _logger.warning("journal WAL %s: torn last line terminated before append", self._wal_path)
+                 await f.write(line)
+                 await f.flush()
++                if self._fsync:
++                    await asyncio.to_thread(os.fsync, f.fileno())
++
++    async def _wal_tail_is_torn(self) -> bool:
++        """True when the WAL is non-empty and does not end with a newline."""
++        try:
++            async with aiofiles.open(self._wal_path, "rb") as rf:
++                end = await rf.seek(0, os.SEEK_END)
++                if not end:
++                    return False
++                await rf.seek(end - 1)
++                return (await rf.read(1)) != b"\n"
++        except FileNotFoundError:
++            return False
+ 
+     async def save(self, path: str) -> None:
+         """Atomically write the program-ordered journal snapshot (does NOT touch the WAL).
+diff --git a/agent-core/openjiuwen/agent_teams/workflow/engine/runner.py b/agent-core/openjiuwen/agent_teams/workflow/engine/runner.py
+index a4d1332..331f18e 100644
+--- a/agent-core/openjiuwen/agent_teams/workflow/engine/runner.py
++++ b/agent-core/openjiuwen/agent_teams/workflow/engine/runner.py
+@@ -374,6 +374,11 @@ async def run_workflow(
+         wal_path = f"{journal_path}.wal"
+     journal = await Journal.load(resume, wal_path=wal_path, legacy_path=legacy_resume)
+     log(f"[wf] journal loaded: prior_records={len(journal.prior)} path={resume} wal={wal_path}")
++    skipped = getattr(journal, "load_stats", None) or {}
++    if skipped:
++        # Torn / corrupt lines were dropped (their calls re-run): surface the
++        # count so an operator can tell a crash-torn tail from silent cache loss.
++        log(f"[wf] journal load skipped corrupt lines: {skipped}")
+     # Cold-start resume recovers the launch args: the advisory template carries
+     # resume_id + script_path but no args, so a resume would otherwise run
+     # ``run(args=None)`` — a different path than the first run, defeating the
+diff --git a/agent-core/tests/unit_tests/agent_teams/workflow/test_journal.py b/agent-core/tests/unit_tests/agent_teams/workflow/test_journal.py
+index faa9e02..3f8a986 100644
+--- a/agent-core/tests/unit_tests/agent_teams/workflow/test_journal.py
++++ b/agent-core/tests/unit_tests/agent_teams/workflow/test_journal.py
+@@ -604,3 +604,55 @@ def test_call_signature_folds_agent_template_when_set():
+         "prompt", {**base, "agent_template": "scene"}, None
+     )
+     assert call_signature("prompt", {**base, "agent_template": None}, None) == legacy
++
++
++def test_load_tolerates_wal_torn_inside_multibyte_char(tmp_path):
++    """A WAL torn mid UTF-8 character loses only that line, not the whole file."""
++    wal = tmp_path / "run.wal"
++    good = json.dumps({"key": key_str([["call", 0]]), "sig": "s", "result": "中文结论"}, ensure_ascii=False)
++    torn = json.dumps({"key": key_str([["call", 1]]), "sig": "s", "result": "中文结论"}, ensure_ascii=False)
++    torn_bytes = torn.encode("utf-8")
++    cut = torn_bytes.index("结".encode("utf-8")) + 1  # keep only the lead byte of a 3-byte char
++    wal.write_bytes(good.encode("utf-8") + b"\n" + torn_bytes[:cut])
++
++    j = asyncio.run(Journal.load(None, wal_path=str(wal)))
++    assert set(j.prior) == {key_str([["call", 0]])}
++    assert j.load_stats == {"bad_utf8": 1}
++
++
++def test_append_after_torn_tail_starts_a_new_line(tmp_path):
++    """A fresh record appended after a torn last line survives the next load."""
++    wal = tmp_path / "run.wal"
++    good = json.dumps({"key": key_str([["call", 0]]), "sig": "s", "result": {"v": "ok"}})
++    wal.write_text(good + "\n" + '{"key": "[[\\"call\\", 1]]", "sig": "s", "resu', encoding="utf-8")
++
++    async def _resume_and_append():
++        j = await Journal.load(None, wal_path=str(wal))
++        assert j.load_stats == {"bad_json": 1}
++        rec = _rec([["call", 1]])
++        await j.use(rec["key"], rec)
++        assert j.load_stats.get("repaired_tail") == 1
++        return await Journal.load(None, wal_path=str(wal))
++
++    j2 = asyncio.run(_resume_and_append())
++    assert set(j2.prior) == {key_str([["call", 0]]), key_str([["call", 1]])}
++    assert wal.read_bytes().endswith(b"\n")
++
++
++def test_wal_append_fsync_is_configurable(tmp_path, monkeypatch):
++    """fsync runs after each append by default and can be switched off."""
++    import os as _os
++
++    calls: list[int] = []
++    real_fsync = _os.fsync
++    monkeypatch.setattr(_os, "fsync", lambda fd: (calls.append(fd), real_fsync(fd))[1])
++
++    async def _append(fsync):
++        j = Journal(wal_path=str(tmp_path / f"{fsync}.wal"), fsync=fsync)
++        rec = _rec([["call", 0]])
++        await j.use(rec["key"], rec)
++
++    asyncio.run(_append(True))
++    assert len(calls) == 1
++    asyncio.run(_append(False))
++    assert len(calls) == 1
