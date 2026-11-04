@@ -1,0 +1,219 @@
+diff --git a/agent-core/openjiuwen/agent_teams/messager/pyzmq_backend.py b/agent-core/openjiuwen/agent_teams/messager/pyzmq_backend.py
+index f0e2bba..8fccdc5 100644
+--- a/agent-core/openjiuwen/agent_teams/messager/pyzmq_backend.py
++++ b/agent-core/openjiuwen/agent_teams/messager/pyzmq_backend.py
+@@ -9,6 +9,7 @@ import asyncio
+ import contextlib
+ import json
+ import uuid
++from collections import OrderedDict
+ from typing import Optional
+ 
+ from openjiuwen.agent_teams.messager.base import (
+@@ -30,6 +31,14 @@ except ImportError:  # pragma: no cover
+     zmq = None
+ 
+ 
++# Defaults for the P2P receive path; overridable via ``MessagerTransportConfig.metadata``.
++_DEFAULT_P2P_MAX_CONCURRENCY = 32
++_DEFAULT_P2P_DEDUPE_SIZE = 10_000
++# Backoff applied when a recv loop hits an unexpected socket error (seconds).
++_RECV_ERROR_BACKOFF_MIN = 0.05
++_RECV_ERROR_BACKOFF_MAX = 1.0
++
++
+ # ----------------------------------------------------------
+ # P2P layer: ROUTER/DEALER direct messaging
+ # ----------------------------------------------------------
+@@ -51,6 +60,13 @@ class _P2PLayer:
+             p.agent_id: p for p in config.bootstrap_peers + config.known_peers
+         }
+         self._handlers: dict[str, MessagerHandler] = {}
++        metadata = config.metadata or {}
++        self._max_concurrency = max(1, int(metadata.get("p2p_max_concurrency", _DEFAULT_P2P_MAX_CONCURRENCY)))
++        self._dedupe_size = max(0, int(metadata.get("p2p_dedupe_size", _DEFAULT_P2P_DEDUPE_SIZE)))
++        self._dispatch_sem: Optional[asyncio.Semaphore] = None
++        self._handler_tasks: set[asyncio.Task] = set()
++        # Bounded LRU of already-dispatched (recipient, event_type, message_id) keys.
++        self._seen_ids: OrderedDict[tuple[str, str, str], None] = OrderedDict()
+ 
+     def register_peer(
+         self,
+@@ -65,6 +81,7 @@ class _P2PLayer:
+         if self._running:
+             return
+         self._ctx = ctx
++        self._dispatch_sem = asyncio.Semaphore(self._max_concurrency)
+         self._router = ctx.socket(zmq.ROUTER)
+         if self._config.direct_addr:
+             self._router.bind(self._config.direct_addr)
+@@ -81,6 +98,12 @@ class _P2PLayer:
+             self._router_task.cancel()
+             with contextlib.suppress(asyncio.CancelledError):
+                 await self._router_task
++        handler_tasks = list(self._handler_tasks)
++        for task in handler_tasks:
++            task.cancel()
++        if handler_tasks:
++            await asyncio.gather(*handler_tasks, return_exceptions=True)
++        self._handler_tasks.clear()
+         if self._router is not None:
+             self._router.close(linger=0)
+         self._router_task = None
+@@ -96,9 +119,12 @@ class _P2PLayer:
+         node_id = self._config.node_id or str(uuid.uuid4())
+         team_logger.debug("P2P sending {} bytes to agent {} via {}", len(payload_bytes), agent_id, peer.addrs[0])
+         dealer = self._ctx.socket(zmq.DEALER)
++        # Unique routing id per request: a ROUTER silently drops a second connection that reuses a
++        # routing id still known to it, so concurrent (or rapid back-to-back) sends from one node
++        # would otherwise be lost and surface only as ACK timeouts.
+         dealer.setsockopt(
+             zmq.IDENTITY,
+-            node_id.encode("utf-8"),
++            f"{node_id}:{uuid.uuid4().hex}".encode("utf-8"),
+         )
+         dealer.connect(peer.addrs[0])
+         try:
+@@ -124,13 +150,18 @@ class _P2PLayer:
+     # -- internals --
+ 
+     async def _recv_loop(self) -> None:
++        backoff = _RECV_ERROR_BACKOFF_MIN
+         while self._running and self._router is not None:
+             try:
+                 frames = await self._router.recv_multipart()
+             except Exception:
+                 if not self._running:
+                     break
++                team_logger.exception("P2P recv loop error, retrying in {}s", backoff)
++                await asyncio.sleep(backoff)
++                backoff = min(backoff * 2, _RECV_ERROR_BACKOFF_MAX)
+                 continue
++            backoff = _RECV_ERROR_BACKOFF_MIN
+             if len(frames) < 2:
+                 continue
+             identity, payload = frames[0], frames[-1]
+@@ -141,6 +172,16 @@ class _P2PLayer:
+         identity: bytes,
+         payload: bytes,
+     ) -> None:
++        """Decode, ACK on receipt, then dispatch the handler concurrently.
++
++        The ACK only confirms the message was received and decoded; handler
++        execution is decoupled so one slow handler cannot block other messages
++        (head-of-line blocking) or push their senders past ``request_timeout``.
++        """
++        handler: Optional[MessagerHandler] = None
++        message: Optional[EventMessage] = None
++        recipient_id = ""
++        dedupe_key: Optional[tuple[str, str, str]] = None
+         try:
+             data = json.loads(payload)
+             recipient_id = data.get("_recipient_id", "")
+@@ -151,16 +192,69 @@ class _P2PLayer:
+                     "P2P received message for {}: event_type={}",
+                     recipient_id, message.event_type,
+                 )
+-                with contextlib.suppress(Exception):
+-                    await handler(message)
++                dedupe_key = self._dedupe_key(recipient_id, message, data)
+             else:
+                 team_logger.debug("P2P no handler for recipient {}, ignoring", recipient_id)
+         except Exception:
+             team_logger.warning("P2P failed to parse incoming request")
+-        # Always send ACK
++            handler = None
++        # ACK on receipt (after decoding), before running the handler.
+         await self._router.send_multipart(
+             [identity, b"ok"],
+         )
++        if handler is None or message is None:
++            return
++        if dedupe_key is not None:
++            if dedupe_key in self._seen_ids:
++                self._seen_ids.move_to_end(dedupe_key)
++                team_logger.info(
++                    "P2P dropping duplicate message for {}: event_type={} message_id={}",
++                    recipient_id, message.event_type, dedupe_key[2],
++                )
++                return
++            if self._dedupe_size:
++                self._seen_ids[dedupe_key] = None
++                while len(self._seen_ids) > self._dedupe_size:
++                    self._seen_ids.popitem(last=False)
++        # Bounded concurrency: when saturated, the recv loop waits here (backpressure).
++        await self._dispatch_sem.acquire()
++        task = asyncio.create_task(self._run_handler(handler, message, recipient_id))
++        self._handler_tasks.add(task)
++        task.add_done_callback(self._on_handler_done)
++
++    async def _run_handler(
++        self,
++        handler: MessagerHandler,
++        message: EventMessage,
++        recipient_id: str,
++    ) -> None:
++        try:
++            await handler(message)
++        except asyncio.CancelledError:
++            raise
++        except Exception:
++            team_logger.exception(
++                "P2P handler failed for recipient {}: event_type={}",
++                recipient_id, message.event_type,
++            )
++
++    def _on_handler_done(self, task: asyncio.Task) -> None:
++        self._handler_tasks.discard(task)
++        if self._dispatch_sem is not None:
++            self._dispatch_sem.release()
++
++    @staticmethod
++    def _dedupe_key(
++        recipient_id: str,
++        message: EventMessage,
++        data: dict,
++    ) -> Optional[tuple[str, str, str]]:
++        message_id = data.get("_message_id")
++        if not message_id and isinstance(message.payload, dict):
++            message_id = message.payload.get("message_id")
++        if not message_id or not isinstance(message_id, str):
++            return None
++        return recipient_id, message.event_type, message_id
+ 
+     def _resolve_peer(
+         self,
+@@ -316,13 +410,18 @@ class _PubSubLayer:
+     # -- internals --
+ 
+     async def _recv_loop(self) -> None:
++        backoff = _RECV_ERROR_BACKOFF_MIN
+         while self._running and self._sub is not None:
+             try:
+                 topic_frame, payload_frame = await self._sub.recv_multipart()
+             except Exception:
+                 if not self._running:
+                     break
++                team_logger.exception("pubsub recv loop error, retrying in {}s", backoff)
++                await asyncio.sleep(backoff)
++                backoff = min(backoff * 2, _RECV_ERROR_BACKOFF_MAX)
+                 continue
++            backoff = _RECV_ERROR_BACKOFF_MIN
+             topic = topic_frame.decode("utf-8")
+             try:
+                 event_message = EventMessage.deserialize(payload_frame)
+@@ -335,8 +434,13 @@ class _PubSubLayer:
+                     "received pubsub message on topic {}: event_type={}, sender={}",
+                     topic, event_message.event_type, event_message.sender_id,
+                 )
+-                with contextlib.suppress(Exception):
++                try:
+                     await handler(event_message)
++                except Exception:
++                    team_logger.exception(
++                        "pubsub handler failed on topic {}: event_type={}",
++                        topic, event_message.event_type,
++                    )
+             else:
+                 team_logger.debug("no handler for pubsub topic {}, ignoring", topic)
+ 
